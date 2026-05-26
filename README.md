@@ -1,5 +1,7 @@
 # 📡 Py-APRS
 
+![Downloads](https://img.shields.io/github/downloads/LesF4/py-aprs/total?label=DOWNLOADS&style=for-the-badge&color=brightgreen)
+
 Station APRS web complète — interface Flask + backend Dire Wolf.
 
 > Version 2.2 — Mai 2026  
