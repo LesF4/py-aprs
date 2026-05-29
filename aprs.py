@@ -6,12 +6,40 @@ import sounddevice as sd
 import serial
 import time
 import crcmod
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for
 import threading
 import platform
 import collections
 import queue
 import re as _re
+import logging
+import logging.handlers
+
+# ── Configuration du logger APRS ────────────────────────────────────────────
+# Rotation automatique : 5 fichiers de 1 Mo max → ~5 Mo total (adapté Raspberry Pi)
+_log_handler = logging.handlers.RotatingFileHandler(
+    "aprs.log",
+    maxBytes=1_000_000,   # 1 Mo par fichier
+    backupCount=5,        # 5 fichiers de rotation → 5 Mo max
+    encoding="utf-8",
+)
+_log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+
+# Console (stdout) — même format, niveau INFO par défaut
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+))
+
+logger = logging.getLogger("aprs")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(_log_handler)
+logger.addHandler(_console_handler)
+logger.propagate = False
 
 default_port = "/dev/ttyUSB0" if platform.system() == "Linux" else "COM3"
 
@@ -49,27 +77,218 @@ DEFAULT_CONFIG = {
         "enabled":      False,
         "advance_min":  10,    # minutes avant le passage pour envoyer l'alerte
     },
-    # ── Synchronisation Wavelog ──────────────────────────────────────────────
-    "wavelog": {
-        "enabled":       False,
-        "url":           "",          # ex: https://monwavelog.example.com
-        "api_key":       "",          # clé API Wavelog (Paramètres → API)
-        "station_id":    1,           # ID station Wavelog (défaut 1)
-        "sync_rx":       True,        # synchroniser les trames RX reçues
-        "sync_tx":       True,        # synchroniser les trames TX émises
-        "sync_interval": 5,           # minutes entre chaque synchro automatique
-        "only_qso":      True,        # ne synchroniser que les messages/QSO (pas tous les beacons)
-        "last_sync_id":  0,           # dernier id de logbook synchronisé
-    },
 }
 
 app = Flask(__name__)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LOGIN_PATCH_APPLIED ──
+# Système d'authentification Login / Password
+# ══════════════════════════════════════════════════════════════════════════════
+import secrets as _secrets
+from werkzeug.security import generate_password_hash as _gen_hash, \
+                              check_password_hash   as _chk_hash
+from functools import wraps as _wraps
+
+_USERS_FILE   = "users.json"
+_DEFAULT_USER = "admin"
+_DEFAULT_PASS = "aprs1200"
+
+# Clé secrète Flask (persistante entre redémarrages)
+_SECRET_KEY_FILE = ".flask_secret"
+if os.path.exists(_SECRET_KEY_FILE):
+    with open(_SECRET_KEY_FILE) as _f:
+        app.secret_key = _f.read().strip()
+else:
+    app.secret_key = _secrets.token_hex(32)
+    with open(_SECRET_KEY_FILE, "w") as _f:
+        _f.write(app.secret_key)
+
+# ── Gestion users.json ────────────────────────────────────────────────────────
+
+def _load_users():
+    if os.path.exists(_USERS_FILE):
+        try:
+            with open(_USERS_FILE, "r", encoding="utf-8") as _f:
+                return json.load(_f)
+        except Exception:
+            pass
+    # Créer utilisateur par défaut
+    users = {_DEFAULT_USER: _gen_hash(_DEFAULT_PASS)}
+    _save_users(users)
+    logger.info("[AUTH] Fichier users.json créé avec compte par défaut (admin/aprs1200)")
+    return users
+
+def _save_users(users):
+    tmp = _USERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as _f:
+        json.dump(users, _f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _USERS_FILE)
+
+_users_db = _load_users()
+
+# ── Décorateur de protection des routes ──────────────────────────────────────
+
+def _login_required(f):
+    @_wraps(f)
+    def _decorated(*args, **kwargs):
+        if not session.get("logged_in"):
+            # SSE (EventSource) : retourner 401, pas une redirection HTML
+            if request.headers.get("Accept", "").startswith("text/event-stream"):
+                return Response("data: {\"type\":\"auth_required\"}\n\n",
+                                status=401, mimetype="text/event-stream")
+            # Requêtes JSON/API
+            if request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return jsonify({"error": "Non authentifié", "redirect": "/login"}), 401
+            return redirect("/login?next=" + request.path)
+        return f(*args, **kwargs)
+    return _decorated
+
+# ── Page de login ─────────────────────────────────────────────────────────────
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APRS Station — Connexion</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0f1e;font-family:'Segoe UI',system-ui,sans-serif;
+       display:flex;align-items:center;justify-content:center;min-height:100vh;
+       color:#e2e8f0}
+  .card{background:#111827;border:1px solid #1e3a5f;border-radius:16px;
+        padding:2.5rem 2rem;width:100%;max-width:400px;
+        box-shadow:0 0 40px rgba(59,130,246,.15)}
+  .logo{text-align:center;margin-bottom:2rem}
+  .logo .icon{font-size:3rem;display:block;margin-bottom:.5rem}
+  .logo h1{font-size:1.4rem;font-weight:700;color:#60a5fa;letter-spacing:.05em}
+  .logo p{font-size:.8rem;color:#64748b;margin-top:.25rem}
+  label{display:block;font-size:.75rem;color:#94a3b8;margin-bottom:.4rem;
+        text-transform:uppercase;letter-spacing:.08em}
+  input{width:100%;background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;
+        padding:.75rem 1rem;color:#e2e8f0;font-size:.95rem;outline:none;
+        transition:border .2s}
+  input:focus{border-color:#3b82f6}
+  .field{margin-bottom:1.25rem}
+  .btn{width:100%;background:linear-gradient(135deg,#1d4ed8,#2563eb);
+       border:none;border-radius:8px;padding:.85rem;color:#fff;font-size:1rem;
+       font-weight:600;cursor:pointer;transition:opacity .2s;margin-top:.5rem}
+  .btn:hover{opacity:.9}
+  .error{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);
+         border-radius:8px;padding:.75rem 1rem;color:#f87171;
+         font-size:.85rem;margin-bottom:1.25rem;display:none}
+  .error.show{display:block}
+  .footer{text-align:center;margin-top:1.5rem;font-size:.7rem;color:#334155}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <span class="icon">📡</span>
+    <h1>APRS Station</h1>
+    <p>Identification requise</p>
+  </div>
+  <div class="error {ERR_CLASS}" id="err">{ERR_MSG}</div>
+  <form method="POST" action="/login">
+    <input type="hidden" name="next" value="{NEXT}">
+    <div class="field">
+      <label>Identifiant</label>
+      <input type="text" name="username" autofocus autocomplete="username" value="{USERNAME}">
+    </div>
+    <div class="field">
+      <label>Mot de passe</label>
+      <input type="password" name="password" autocomplete="current-password">
+    </div>
+    <button class="btn" type="submit">Se connecter</button>
+  </form>
+  <div class="footer">APRS Station v{VERSION}</div>
+</div>
+</body>
+</html>"""
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    next_url = request.args.get("next", "/")
+    err = ""
+    username = ""
+    if request.method == "POST":
+        next_url  = request.form.get("next", "/")
+        username  = request.form.get("username", "").strip()
+        password  = request.form.get("password", "")
+        ph = _users_db.get(username)
+        if ph and _chk_hash(ph, password):
+            session.permanent = True
+            session["logged_in"] = True
+            session["username"]  = username
+            logger.info("[AUTH] Connexion réussie : %s", username)
+            return redirect(next_url or "/")
+        err = "Identifiant ou mot de passe incorrect."
+        logger.warning("[AUTH] Échec connexion : %s", username)
+    html = _LOGIN_HTML.replace("{ERR_CLASS}", "show" if err else "") \
+                      .replace("{ERR_MSG}",   err) \
+                      .replace("{NEXT}",      next_url) \
+                      .replace("{USERNAME}",  username) \
+                      .replace("{VERSION}",   APP_VERSION)
+    return Response(html, mimetype="text/html", status=200 if not err else 401)
+
+@app.route('/logout')
+def logout():
+    user = session.get("username", "?")
+    session.clear()
+    logger.info("[AUTH] Déconnexion : %s", user)
+    return redirect("/login")
+
+# ── Changement de mot de passe ────────────────────────────────────────────────
+
+@app.route('/auth/change_password', methods=['POST'])
+def auth_change_password():
+    if not session.get("logged_in"):
+        return jsonify({"error": "Non authentifié"}), 401
+    data = request.json or {}
+    current  = data.get("current_password", "")
+    new_pass = data.get("new_password", "").strip()
+    username = session.get("username", "")
+    ph = _users_db.get(username)
+    if not ph or not _chk_hash(ph, current):
+        return jsonify({"ok": False, "error": "Mot de passe actuel incorrect"}), 403
+    if len(new_pass) < 6:
+        return jsonify({"ok": False, "error": "Le mot de passe doit faire au moins 6 caractères"}), 400
+    _users_db[username] = _gen_hash(new_pass)
+    _save_users(_users_db)
+    logger.info("[AUTH] Mot de passe changé pour %s", username)
+    return jsonify({"ok": True})
+
+@app.route('/auth/whoami')
+def auth_whoami():
+    return jsonify({
+        "logged_in": bool(session.get("logged_in")),
+        "username":  session.get("username", ""),
+    })
+
+# ── Durée de session (30 jours) ───────────────────────────────────────────────
+from datetime import timedelta as _timedelta
+app.permanent_session_lifetime = _timedelta(days=30)
+
+
+
 # ── Version applicative ──────────────────────────────────────────────────────
-APP_VERSION = "2.2"
-APP_VERSION_DATE = "2025-05-25"
+APP_VERSION = "2.4"
+APP_VERSION_DATE = "2026-05-27"
 APP_CHANGELOG = [
-    {"version": "2.2", "date": "2025-05-25", "label": "current", "changes": [
+    {"version": "2.4", "date": "2026-05-27", "label": "current", "changes": [
+        "Passage en version 2.4",
+        "Mise à jour du changelog intégré",
+    ]},
+    {"version": "2.3", "date": "2026-05-26", "label": "", "changes": [
+        "Passages ISS : moteur SGP4 embarqué (stdlib pure) — remplace open-notify.org hors-service",
+        "TLE ISS rechargé toutes les 6h depuis CelesTrak (3 sources + cache disque 7j hors-ligne)",
+        "Élévation maximale affichée pour chaque passage ISS dans le widget",
+        "Fermeture propre (Graceful Shutdown) : SIGTERM/SIGINT + atexit",
+        "Sauvegarde synchrone et atomique de chat.json et config.json à l'arrêt",
+        "Fermeture ordonnée des sockets KISS TX, iGate et Wavelog",
+    ]},
+    {"version": "2.2", "date": "2025-05-25", "label": "", "changes": [
         "Liens QRZ.com sur tous les indicatifs (console, QSO, MAP, stats)",
         "Navigation mobile : barre fixe en bas d'écran (bottom nav)",
         "Viewport mobile-first, touch targets 44 px, zoom iOS désactivé",
@@ -82,7 +301,6 @@ APP_CHANGELOG = [
         "Alertes météo : 6 types (température, vent, rafales, pluie, pression, WMO)",
         "Widget Propagation VHF : SFI / Kp / A-index NOAA en temps réel",
         "Passages ISS : widget compact dans TRAFIC + alerte avant passage",
-        "Web Push Notifications (Notification API, sans VAPID)",
         "Statistiques 24 h avec top 10 stations (onglet STATS)",
         "Persistance stats via /stats/save et /stats/load",
     ]},
@@ -142,10 +360,10 @@ class APRSChat:
                 data = json.load(f)
             self.conversations = data.get("conversations", {})
             self.msg_counter   = data.get("msg_counter", 1)
-            print("[QSO] %d conversation(s) restaurée(s) depuis %s" % (
-                len(self.conversations), CHAT_FILE))
+            logger.info("[QSO] %d conversation(s) restaurée(s) depuis %s",
+                        len(self.conversations), CHAT_FILE)
         except Exception as e:
-            print("[QSO] Impossible de charger %s : %s" % (CHAT_FILE, e))
+            logger.error("[QSO] Impossible de charger %s : %s", CHAT_FILE, e)
 
     def _save(self):
         """Sauvegarde les conversations dans chat.json (appelé sous self._lock)."""
@@ -158,7 +376,7 @@ class APRSChat:
                 }, f, ensure_ascii=False, indent=2)
             os.replace(tmp, CHAT_FILE)   # remplacement atomique
         except Exception as e:
-            print("[QSO] Erreur sauvegarde %s : %s" % (CHAT_FILE, e))
+            logger.error("[QSO] Erreur sauvegarde %s : %s", CHAT_FILE, e)
 
     # ── API ───────────────────────────────────────────────────────────────────
 
@@ -185,21 +403,34 @@ class APRSChat:
             if dest not in self.conversations:
                 self.conversations[dest] = []
             self.conversations[dest].append({
-                "dir": "tx", "from": config_manager.data.get("callsign", "?"),
-                "text": text, "ts": time.strftime("%d/%m %H:%M"), "msgno": msgno
+                "dir":           "tx",
+                "from":          config_manager.data.get("callsign", "?"),
+                "text":          text,
+                "ts":            time.strftime("%d/%m %H:%M"),
+                "msgno":         msgno,
+                "acked":         False,
+                "acked_failed":  False,
+                "retry_count":   0,
+                "retry_at":      time.time() + 30,   # premier retry dans 30 s
             })
             self._save()
 
     def mark_ack(self, msgno):
+        """Marque un message TX comme acquitté. Retourne (dest, msgno) si trouvé."""
         with self._lock:
             changed = False
-            for msgs in self.conversations.values():
+            found_dest = None
+            for dest, msgs in self.conversations.items():
                 for m in msgs:
                     if m.get("msgno") == msgno and m["dir"] == "tx" and not m.get("acked"):
-                        m["acked"] = True
-                        changed = True
+                        m["acked"]        = True
+                        m["acked_failed"] = False
+                        m["retry_at"]     = None   # stop retry
+                        changed    = True
+                        found_dest = dest
             if changed:
                 self._save()
+        return (found_dest, msgno) if changed else (None, None)
 
     def get_history(self, callsign):
         with self._lock:
@@ -228,216 +459,99 @@ class APRSChat:
             if changed:
                 self._save()
 
+    # ── Retry ACK ─────────────────────────────────────────────────────────────
+
+    MAX_RETRIES = 3          # nombre max de re-émissions
+    RETRY_INTERVAL = 30.0    # secondes entre chaque retry
+
+    def get_pending_retries(self):
+        """Retourne les messages TX en attente de retry (retry_at <= now, non ackés).
+        Appelé par le thread _ack_retry_worker."""
+        now = time.time()
+        pending = []
+        with self._lock:
+            for dest, msgs in self.conversations.items():
+                for m in msgs:
+                    if (m["dir"] == "tx"
+                            and not m.get("acked")
+                            and not m.get("acked_failed")
+                            and m.get("msgno")
+                            and m.get("retry_at") is not None
+                            and m["retry_at"] <= now):
+                        pending.append({
+                            "dest":   dest,
+                            "text":   m["text"],
+                            "msgno":  m["msgno"],
+                            "retry":  m.get("retry_count", 0),
+                        })
+        return pending
+
+    def bump_retry(self, msgno):
+        """Incrémente retry_count et planifie le prochain retry (ou marque échec)."""
+        with self._lock:
+            for msgs in self.conversations.values():
+                for m in msgs:
+                    if m.get("msgno") == msgno and m["dir"] == "tx":
+                        cnt = m.get("retry_count", 0) + 1
+                        m["retry_count"] = cnt
+                        if cnt >= self.MAX_RETRIES:
+                            m["acked_failed"] = True
+                            m["retry_at"]     = None
+                            logger.warning("[MSG] Abandon retry msgno=%s (%d essais)", msgno, cnt)
+                        else:
+                            m["retry_at"] = time.time() + self.RETRY_INTERVAL
+                        break
+            self._save()
+
 chat_manager = APRSChat()
 
 
-# ── Carnet de Trafic APRS ────────────────────────────────────────────────────
-LOGBOOK_FILE = "logbook.json"
+# ── Thread de retry ACK ───────────────────────────────────────────────────────
+# Conforme APRS spec : re-émet les messages TX non acquittés jusqu'à 3 fois
+# (intervalle 30 s). Marque acked_failed après MAX_RETRIES tentatives.
 
-class APRSLogbook:
-    """
-    Carnet de trafic APRS dédié.
-    Enregistre automatiquement chaque trame RX/TX avec ses métadonnées.
-    Permet le filtrage, la recherche, l'export CSV et ADIF.
-    """
-    def __init__(self):
-        self.entries  = []          # liste de dicts triés par ts desc
-        self._lock    = threading.Lock()
-        self._counter = 1
-        self._load()
-
-    def _load(self):
-        if not os.path.exists(LOGBOOK_FILE):
-            return
+def _ack_retry_worker():
+    """Vérifie toutes les 10 s les messages TX en attente d'ACK et les re-émet."""
+    while True:
+        time.sleep(10)
         try:
-            with open(LOGBOOK_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self.entries  = data.get("entries", [])
-            self._counter = data.get("counter", 1)
-            print("[LOG] %d entrée(s) chargée(s) depuis %s" % (len(self.entries), LOGBOOK_FILE))
-        except Exception as e:
-            print("[LOG] Erreur chargement logbook : %s" % e)
-
-    def _save(self):
-        try:
-            tmp = LOGBOOK_FILE + ".tmp"
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump({"entries": self.entries, "counter": self._counter},
-                          f, ensure_ascii=False, indent=2)
-            os.replace(tmp, LOGBOOK_FILE)
-        except Exception as e:
-            print("[LOG] Erreur sauvegarde logbook : %s" % e)
-
-    def add(self, frame, direction="RX"):
-        """Ajoute une entrée dans le carnet depuis une frame APRS."""
-        extra = frame.get("extra", {}) or {}
-        # Pour les messages TX (QSO envoyés), le callsign pertinent est le
-        # destinataire du message (msg_dest) et non l'indicatif propre (src).
-        _is_tx_msg = (direction == "TX" and
-                      frame.get("aprs_type") == "Message" and
-                      extra.get("msg_dest"))
-        if _is_tx_msg:
-            _callsign = (extra.get("msg_dest", "") or "").upper().strip()
-            _dest     = (frame.get("src", "") or "").upper().strip()
-        else:
-            _callsign = (frame.get("src", "") or "").upper().strip()
-            _dest     = (frame.get("dest", "") or "").upper().strip()
-        with self._lock:
-            entry = {
-                "id":         self._counter,
-                "ts":         time.strftime("%Y-%m-%d %H:%M:%S"),
-                "date":       time.strftime("%Y-%m-%d"),
-                "time":       time.strftime("%H:%M:%S"),
-                "direction":  direction,
-                "callsign":   _callsign,
-                "dest":       _dest,
-                "path":       frame.get("path", "") or "",
-                "aprs_type":  frame.get("aprs_type", "") or "",
-                "payload":    (frame.get("payload", "") or "")[:200],
-                "comment":    (extra.get("comment", "") or "")[:100],
-                "lat":        extra.get("lat"),
-                "lon":        extra.get("lon"),
-                "speed_kmh":  extra.get("speed_kmh"),
-                "alt_m":      extra.get("alt_m"),
-                "symbol":     extra.get("symbol", ""),
-                "source":     frame.get("_source", "RF"),
-                "freq":       "144.800",
-                "band":       "2m",
-                "mode":       "APRS",
-                "note":       "",
-            }
-            self._counter += 1
-            self.entries.insert(0, entry)   # plus récent en premier
-            # Limite à 5000 entrées pour ne pas exploser la RAM
-            if len(self.entries) > 5000:
-                self.entries = self.entries[:5000]
-            # Sauvegarde différée toutes les 10 nouvelles entrées
-            if self._counter % 10 == 0:
-                self._save()
-        return entry
-
-    def update_note(self, entry_id, note):
-        with self._lock:
-            for e in self.entries:
-                if e["id"] == entry_id:
-                    e["note"] = note[:200]
-                    self._save()
-                    return True
-        return False
-
-    def delete(self, entry_id):
-        with self._lock:
-            before = len(self.entries)
-            self.entries = [e for e in self.entries if e["id"] != entry_id]
-            if len(self.entries) < before:
-                self._save()
-                return True
-        return False
-
-    def clear_all(self):
-        with self._lock:
-            self.entries = []
-            self._save()
-
-    def get_entries(self, page=1, per_page=50, search="", direction="", aprs_type=""):
-        with self._lock:
-            result = list(self.entries)
-        # Filtres
-        if search:
-            s = search.upper()
-            result = [e for e in result if
-                      s in e.get("callsign","").upper() or
-                      s in e.get("dest","").upper() or
-                      s in e.get("comment","").upper() or
-                      s in e.get("payload","").upper()]
-        if direction:
-            result = [e for e in result if e.get("direction","") == direction]
-        if aprs_type:
-            result = [e for e in result if aprs_type.lower() in e.get("aprs_type","").lower()]
-        total = len(result)
-        start = (page - 1) * per_page
-        return result[start:start+per_page], total
-
-    def export_csv(self, search="", direction="", aprs_type=""):
-        """Génère le contenu CSV du carnet."""
-        import io, csv as _csv
-        entries, _ = self.get_entries(page=1, per_page=99999,
-                                      search=search, direction=direction, aprs_type=aprs_type)
-        buf = io.StringIO()
-        fieldnames = ["id","date","time","direction","callsign","dest","path",
-                      "aprs_type","comment","lat","lon","speed_kmh","alt_m",
-                      "symbol","source","freq","band","mode","note","payload"]
-        w = _csv.DictWriter(buf, fieldnames=fieldnames, extrasaction='ignore')
-        w.writeheader()
-        for e in entries:
-            w.writerow({k: e.get(k,"") for k in fieldnames})
-        return buf.getvalue()
-
-    def export_adif(self, search="", direction="", aprs_type=""):
-        """Génère un fichier ADIF (Amateur Data Interchange Format) standard."""
-        entries, _ = self.get_entries(page=1, per_page=99999,
-                                      search=search, direction=direction, aprs_type=aprs_type)
-        lines = [
-            "ADIF Export — Py-APRS Logbook",
-            "<ADIF_VER:5>3.1.1",
-            "<PROGRAMID:8>Py-APRS",
-            "<EOH>",
-        ]
-        my_call = config_manager.data.get("callsign", "N0CALL").upper()
-        for e in entries:
-            cs   = e.get("callsign","") or ""
-            if not cs or cs in ("APRS","BEACON","CQ","?"):
-                continue
-            date_adif = (e.get("date","") or "").replace("-","")
-            time_adif = (e.get("time","") or "").replace(":","")[:6]
-            band      = e.get("band","2m") or "2m"
-            mode      = e.get("mode","APRS") or "APRS"
-            freq      = e.get("freq","144.800") or "144.800"
-            comment   = e.get("comment","") or ""
-            note      = e.get("note","") or ""
-            rst       = "599"
-            fields = [
-                "<CALL:%d>%s" % (len(cs), cs),
-                "<QSO_DATE:%d>%s" % (len(date_adif), date_adif),
-                "<TIME_ON:%d>%s" % (len(time_adif), time_adif),
-                "<BAND:%d>%s" % (len(band), band),
-                "<FREQ:%d>%s" % (len(freq), freq),
-                "<MODE:%d>%s" % (len(mode), mode),
-                "<RST_SENT:%d>%s" % (len(rst), rst),
-                "<RST_RCVD:%d>%s" % (len(rst), rst),
-                "<STATION_CALLSIGN:%d>%s" % (len(my_call), my_call),
-            ]
-            if comment:
-                fields.append("<COMMENT:%d>%s" % (len(comment), comment))
-            if note:
-                fields.append("<NOTES:%d>%s" % (len(note), note))
-            fields.append("<EOR>")
-            lines.append(" ".join(fields))
-        return "\n".join(lines)
-
-    def get_stats(self):
-        """Statistiques rapides du carnet."""
-        with self._lock:
-            entries = list(self.entries)
-        total   = len(entries)
-        rx      = sum(1 for e in entries if e.get("direction") == "RX")
-        tx      = sum(1 for e in entries if e.get("direction") == "TX")
-        calls   = {e["callsign"] for e in entries if e.get("callsign") and e["callsign"] not in ("","APRS","BEACON","CQ","?")}
-        types   = {}
-        for e in entries:
-            t = e.get("aprs_type","?") or "?"
-            types[t] = types.get(t, 0) + 1
-        top_type = sorted(types.items(), key=lambda x: -x[1])[:5]
-        return {
-            "total":      total,
-            "rx":         rx,
-            "tx":         tx,
-            "unique_calls": len(calls),
-            "top_types":  top_type,
-        }
+            pending = chat_manager.get_pending_retries()
+            for job in pending:
+                dest   = job["dest"]
+                text   = job["text"]
+                msgno  = job["msgno"]
+                retry  = job["retry"]
+                payload = ":" + dest.ljust(9) + ":" + text + "{" + msgno + "}"
+                logger.info("[MSG] Retry %d/%d msgno=%s -> %s",
+                            retry + 1, APRSChat.MAX_RETRIES, msgno, dest)
+                try:
+                    tx_queue.put_nowait({
+                        "dest":      "APRS",
+                        "payload":   payload,
+                        "path":      None,
+                        "aprs_type": "Message",
+                        "extra":     {"comment": text, "msg_dest": dest, "_retry": retry + 1},
+                    })
+                except Exception:
+                    pass
+                chat_manager.bump_retry(msgno)
+                # Diffuser l'état retry au frontend
+                retry_event = {
+                    "type":  "msg_retry",
+                    "msgno": msgno,
+                    "dest":  dest,
+                    "retry": retry + 1,
+                    "max":   APRSChat.MAX_RETRIES,
+                    "failed": (retry + 1) >= APRSChat.MAX_RETRIES,
+                }
+                for _q in list(listeners):
+                    try: _q.put_nowait(retry_event)
+                    except Exception: pass
+        except Exception as _e:
+            logger.error("[ACK-RETRY] Erreur : %s", _e)
 
 
-logbook = APRSLogbook()
+# LOGBOOK_REMOVED
 
 
 def _clean_comment(s):
@@ -510,7 +624,7 @@ class APRSModem:
     def init_hardware(self):
         """Aucun port serie a ouvrir — Dire Wolf gere la PTT via direwolf.conf."""
         self.ser = None
-        print("[HW] init_hardware : PTT geree par Dire Wolf (cf. direwolf.conf)")
+        logger.info("[HW] init_hardware : PTT geree par Dire Wolf (cf. direwolf.conf)")
 
     # Dernière erreur TX (exposée par /rx_test)
     tx_last_error = ""
@@ -557,7 +671,7 @@ class APRSModem:
             s.connect((cls.DIREWOLF_HOST, cls.DIREWOLF_KISS_PORT))
             s.settimeout(None)
             cls._tx_sock = s
-            print("[TX] Nouvelle connexion KISS persistante établie")
+            logger.info("[TX] Nouvelle connexion KISS persistante établie")
         return cls._tx_sock
 
     def send_packet(self, dest, payload, custom_path=None):
@@ -605,8 +719,8 @@ class APRSModem:
 
             kiss_frame = bytes([FEND, 0x00]) + kiss_escape(ax25) + bytes([FEND])
 
-            print("[TX] -> dest=%s payload=%s (%d octets AX.25)" % (
-                dest, payload[:50], len(ax25)))
+            logger.debug("[TX] -> dest=%s payload=%s (%d octets AX.25)",
+                dest, payload[:50], len(ax25))
 
             # ── Envoi via connexion persistante — 1 retry si socket morte ────
             for attempt in range(2):
@@ -617,7 +731,7 @@ class APRSModem:
                     s.settimeout(None)
                     APRSModem.tx_last_ok    = time.strftime("%H:%M:%S")
                     APRSModem.tx_last_error = ""
-                    print("[TX] Trame KISS envoyée OK (%d octets)" % len(kiss_frame))
+                    logger.debug("[TX] Trame KISS envoyée OK (%d octets)", len(kiss_frame))
                     break
                 except Exception as e:
                     # Forcer la fermeture pour provoquer une reconnexion au prochain appel
@@ -625,10 +739,10 @@ class APRSModem:
                     except: pass
                     APRSModem._tx_sock = None
                     if attempt == 0:
-                        print("[TX] Socket morte — reconnexion...")
+                        logger.warning("[TX] Socket morte — reconnexion...")
                     else:
                         APRSModem.tx_last_error = str(e)
-                        print("[TX] ERREUR envoi KISS : %s" % e)
+                        logger.error("[TX] ERREUR envoi KISS : %s", e)
                         raise
 
     def start_rx(self):
@@ -918,7 +1032,7 @@ class APRSModem:
             except Exception as _mic_err:
                 # En cas d'échec du décodage, garder le payload brut
                 extra['comment'] = _clean_comment(info[1:])
-                print("[MIC-E] Erreur décodage : %s" % _mic_err)
+                logger.warning("[MIC-E] Erreur décodage : %s", _mic_err)
 
         elif dti == '$':
             name = "NMEA"
@@ -1159,14 +1273,14 @@ class APRSModem:
 
         # Cas 1 : non configuré
         if dev_cfg is None or dev_cfg == "":
-            print("[RX] Device RX non configure -> default")
+            logger.debug("[RX] Device RX non configure -> default")
             return "default"
 
         dev_str = str(dev_cfg)
 
         # Cas 2 : déjà un nom ALSA direct (plughw:X,Y ou hw:X,Y)
         if dev_str.startswith("plughw:") or dev_str.startswith("hw:"):
-            print("[RX] Device ALSA direct : %s" % dev_str)
+            logger.debug("[RX] Device ALSA direct : %s", dev_str)
             return dev_str
 
         # Cas 3 : index entier PortAudio (ancien format) — résoudre vers ALSA
@@ -1175,7 +1289,7 @@ class APRSModem:
             devs = sd.query_devices()
             if idx < len(devs):
                 pa_name = devs[idx]["name"]
-                print("[RX] Résolution index PA %d (%s) -> ALSA" % (idx, pa_name))
+                logger.debug("[RX] Résolution index PA %d (%s) -> ALSA", idx, pa_name)
 
                 # Tentative via arecord -l
                 try:
@@ -1186,7 +1300,7 @@ class APRSModem:
                             m = _re.search(r"card (\d+)[^,]*,\s*device (\d+)", line)
                             if m:
                                 dev = "plughw:%s,%s" % (m.group(1), m.group(2))
-                                print("[RX] Résolu : %s" % dev)
+                                logger.debug("[RX] Résolu : %s", dev)
                                 return dev
                 except Exception:
                     pass
@@ -1195,16 +1309,16 @@ class APRSModem:
                 m = _re.search(r"hw:(\d+),(\d+)", pa_name)
                 if m:
                     dev = "plughw:%s,%s" % (m.group(1), m.group(2))
-                    print("[RX] Extrait du nom PA : %s" % dev)
+                    logger.debug("[RX] Extrait du nom PA : %s", dev)
                     return dev
 
-                print("[RX] Passage nom brut PA : %s" % pa_name)
+                logger.debug("[RX] Passage nom brut PA : %s", pa_name)
                 return pa_name
         except (ValueError, Exception) as ex:
-            print("[RX] _find_alsa_device_name : %s" % ex)
+            logger.error("[RX] _find_alsa_device_name : %s", ex)
 
         # Cas 4 : string inconnue, on la passe directement
-        print("[RX] Device brut : %s" % dev_str)
+        logger.debug("[RX] Device brut : %s", dev_str)
         return dev_str
 
     def _write_direwolf_conf(self, alsa_dev, conf_path):
@@ -1238,9 +1352,9 @@ class APRSModem:
         ]
         with open(conf_path, "w") as f:
             f.write("\n".join(lines) + "\n")
-        print("[DW] direwolf.conf:")
+        logger.debug("[DW] direwolf.conf:")
         for l in lines:
-            print("[DW]   " + l)
+            logger.debug("[DW]   %s", l)
 
     # ── Décodeur KISS ─────────────────────────────────────────────────────────
     @staticmethod
@@ -1321,22 +1435,22 @@ class APRSModem:
                 "aprs_type": aprs_type, "payload": info, "extra": extra
             }
         except Exception as ex:
-            print("[KISS] Erreur parseur AX.25 : " + str(ex))
+            logger.error("[KISS] Erreur parseur AX.25 : %s", ex)
             return None
 
     def _rx_loop(self):
         import subprocess, shutil, socket, os as _os, tempfile
 
         if not shutil.which('direwolf'):
-            print("[RX] direwolf introuvable -- sudo apt install direwolf -y")
+            logger.critical("[RX] direwolf introuvable -- sudo apt install direwolf -y")
             APRSModem.rx_thread_alive = False
             return
 
         alsa_dev  = self._find_alsa_device_name()
         conf_path = _os.path.join(tempfile.gettempdir(), 'aprs_direwolf.conf')
         self._write_direwolf_conf(alsa_dev, conf_path)
-        print("[RX] Démarrage Dire Wolf sur %s (KISS TCP :%d)" % (
-            alsa_dev, APRSModem.DIREWOLF_KISS_PORT))
+        logger.info("[RX] Démarrage Dire Wolf sur %s (KISS TCP :%d)",
+            alsa_dev, APRSModem.DIREWOLF_KISS_PORT)
 
         ALPHA = 0.15
 
@@ -1359,7 +1473,7 @@ class APRSModem:
                         line = line.rstrip()
                         APRSModem.dw_log_lines.append("[ERR] " + line)
                         if line.strip():
-                            print("[DW] " + line)
+                            logger.debug("[DW] %s", line.rstrip())
                 threading.Thread(target=_dw_stderr, args=(dw_proc,), daemon=True, name="dw-stderr").start()
                 # Thread de capture stdout (trames décodées, stats…)
                 def _dw_stdout(proc):
@@ -1367,7 +1481,7 @@ class APRSModem:
                         line = line.rstrip()
                         APRSModem.dw_log_lines.append(line)
                         if line.strip():
-                            print("[DW] " + line)
+                            logger.debug("[DW] %s", line)
                         if "[0]" in line or "audio" in line.lower():
                             # Comptage des trames signalées par Dire Wolf
                             APRSModem.dw_frames_decoded += 1
@@ -1395,12 +1509,12 @@ class APRSModem:
                         sock = None
 
                 if sock is None:
-                    print("[RX] Impossible de se connecter au port KISS de Dire Wolf")
+                    logger.error("[RX] Impossible de se connecter au port KISS de Dire Wolf")
                     raise RuntimeError("KISS port unreachable")
 
                 sock.settimeout(1.0)
                 APRSModem.rx_thread_alive = True
-                print("[RX] Connecté au port KISS -- en écoute...")
+                logger.info("[RX] Connecté au port KISS -- en écoute...")
 
                 buf = bytearray()
                 while self.is_rx_running:
@@ -1430,14 +1544,14 @@ class APRSModem:
                         if frame:
                             APRSModem.rx_bit_count += len(ax25_bytes) * 8
                             APRSModem.rx_queue.put(frame)
-                            print("[KISS] Trame RX : %s>%s %s" % (
+                            logger.debug("[KISS] Trame RX : %s>%s %s",
                                 frame.get("src","?"), frame.get("dest","?"),
-                                frame.get("aprs_type","?")))
+                                frame.get("aprs_type","?"))
                         else:
-                            print("[KISS] Trame AX.25 non parsée (%d octets)" % len(ax25_bytes))
+                            logger.warning("[KISS] Trame AX.25 non parsée (%d octets)", len(ax25_bytes))
 
             except Exception as e:
-                print("[RX] Erreur pipeline Dire Wolf : " + str(e))
+                logger.error("[RX] Erreur pipeline Dire Wolf : %s", e)
             finally:
                 if sock:
                     try: sock.shutdown(socket.SHUT_RDWR)
@@ -1460,7 +1574,7 @@ class APRSModem:
                         except: pass
 
             if self.is_rx_running:
-                print("[RX] Pipeline interrompu -- redémarrage dans 3 s...")
+                logger.warning("[RX] Pipeline interrompu -- redémarrage dans 3 s...")
                 time.sleep(3.0)
 
         APRSModem.rx_thread_alive = False
@@ -1554,12 +1668,14 @@ def _enum_audio_devices():
 
 
 @app.route('/audio_devices')
+@_login_required
 def audio_devices_route():
     """Retourne la liste des devices audio (appelable par AJAX pour refresh)."""
     return jsonify(_enum_audio_devices())
 
 
 @app.route('/')
+@_login_required
 def index():
     devices = _enum_audio_devices()
 
@@ -1712,6 +1828,28 @@ def index():
             .lg\:col-span-3, .lg\:col-span-4, .lg\:col-span-8, .lg\:col-span-9 { width: 100% !important; }
             /* Console trafic compacte */
             .h-\[780px\] { height: calc(100vh - 260px) !important; min-height: 300px; }
+            /* Tooltip waypoints trail */
+            .aprs-trail-tip {
+                background: rgba(15,23,42,0.92) !important;
+                border: 1px solid #334155 !important;
+                border-radius: 5px !important;
+                color: #94a3b8 !important;
+                font-size: 10px !important;
+                font-family: monospace !important;
+                padding: 2px 6px !important;
+                box-shadow: 0 2px 8px #0006 !important;
+                white-space: nowrap !important;
+            }
+            .aprs-trail-tip::before { display: none !important; }
+            /* Animation entrée nouvelle trame */
+            @keyframes aprsCardIn {
+                from { opacity: 0; transform: translateY(-6px) scale(.99); }
+                to   { opacity: 1; transform: translateY(0)    scale(1); }
+            }
+            /* Hover sur carte trame */
+            .aprs-card:hover { background: rgba(15,23,42,0.75) !important; }
+            /* Bouton trame brute : override min-height mobile */
+            .aprs-card button { min-height: unset !important; }
             /* Chat QSO mobile */
             .h-\[600px\] { height: calc(100vh - 320px) !important; min-height: 260px; }
             /* ISS iframe */
@@ -1725,8 +1863,8 @@ def index():
             .rounded-\[2\.5rem\] { border-radius: 1rem !important; }
             .rounded-\[2rem\] { border-radius: 1rem !important; }
             /* Inputs touch-friendly */
-            input[type=text], input[type=number], input[type=password],
-            input[type=email], textarea, select {
+            input[type=text]:not(.modal-input), input[type=number], input[type=password],
+            input[type=email], textarea, select:not(.modal-select) {
                 font-size: 16px !important; /* Évite zoom auto iOS */
                 min-height: 44px;
             }
@@ -1747,7 +1885,7 @@ def index():
     </style>
 <script>
     function switchTab(tabId) {
-        ['terminal', 'config', 'qso', 'map', 'iss', 'stats', 'logbook'].forEach(function(t) {
+        ['terminal', 'config', 'qso', 'map', 'iss', 'stats'].forEach(function(t) {
             var el  = document.getElementById('tab-' + t);
             var btn = document.getElementById('btn-' + t);
             var mbn = document.getElementById('mnav-' + t);
@@ -1762,6 +1900,7 @@ def index():
         if (btn) btn.className = "px-6 py-2.5 rounded-xl font-bold transition-all bg-blue-600 text-white shadow-lg";
         if (mbn) mbn.classList.add('active');
         if (tabId === 'map') setTimeout(function(){ if(typeof _initMap==='function') _initMap(); }, 80);
+        if (tabId === 'qso') setTimeout(function(){ if(typeof refreshContacts==='function') refreshContacts(); }, 50);
         if (tabId === 'iss') {
             var iframe = document.getElementById('iss-iframe');
             if (iframe && iframe.src === 'about:blank') iframe.src = iframe.dataset.src;
@@ -1782,7 +1921,7 @@ def index():
                 <i class="fas fa-broadcast-tower text-3xl text-white"></i>
             </a>
             <div>
-                <h1 class="text-3xl font-black tracking-tight text-white italic">Py-APRS <span id="app-version-badge" class="text-blue-500 text-sm not-italic font-medium ml-2 cursor-pointer hover:text-blue-300 transition-colors" onclick="document.getElementById('modal-aide').classList.remove('hidden');aideShowTab('changelog')" title="Voir le changelog">v2.2</span></h1>
+                <h1 class="text-3xl font-black tracking-tight text-white italic">Py-APRS <span id="app-version-badge" class="text-blue-500 text-sm not-italic font-medium ml-2 cursor-pointer hover:text-blue-300 transition-colors" onclick="document.getElementById('modal-aide').classList.remove('hidden');aideShowTab('changelog')" title="Voir le changelog">v2.4</span></h1>
                 <div class="flex items-center gap-2 mt-1">
                     <span class="relative flex h-2 w-2">
                         <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -1820,7 +1959,6 @@ def index():
             </button>
             <button id="btn-iss"      onclick="switchTab('iss')"      class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-slate-200">🛰️ ISS</button>
             <button id="btn-stats"    onclick="switchTab('stats')"    class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-slate-200">📊 STATS</button>
-            <button id="btn-logbook"  onclick="switchTab('logbook')"  class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-slate-200">📓 CARNET</button>
             <button onclick="document.getElementById('modal-aide').classList.remove('hidden')" class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-amber-300">❓ AIDE</button>
         </nav>
     </header>
@@ -1852,10 +1990,6 @@ def index():
         <button id="mnav-stats" onclick="switchTab('stats')">
             <span class="nav-icon">📊</span>
             <span>STATS</span>
-        </button>
-        <button id="mnav-logbook" onclick="switchTab('logbook')">
-            <span class="nav-icon">📓</span>
-            <span>CARNET</span>
         </button>
         <button onclick="document.getElementById('modal-aide').classList.remove('hidden')">
             <span class="nav-icon">❓</span>
@@ -1955,31 +2089,26 @@ def index():
                         <button onclick="testRX(this)" class="w-full mt-1 bg-slate-800 hover:bg-emerald-900/30 border border-slate-700 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all">
                             🎧 Tester la reception
                         </button>
-                        <!-- ── Notifications navigateur ── -->
-                        <div class="border-t border-slate-800/60 pt-3 mt-1">
-                            <div class="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2">🔔 Notifications</div>
-                            <button id="notif-btn" onclick="togglePushNotif()" class="w-full py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all bg-slate-800 border border-slate-700 text-slate-500 hover:border-blue-600 hover:text-blue-300">
-                                ─ Chargement…
-                            </button>
-                            <div id="notif-status" class="text-[9px] text-slate-600 text-center mt-1 italic"></div>
-                        </div>
                     </div>
                 </div>
 
-                <!-- ── Passages ISS (compact) ── -->
+                <!-- ── Passages ISS ── # ── ISS_DISPLAY_PATCH_APPLIED ── ── -->
                 <div style="border-radius:1.5rem;overflow:hidden;box-shadow:0 10px 30px #0006;background:rgba(15,23,42,0.6);border:1px solid #1e293b">
                     <div style="padding:10px 16px;background:rgba(15,23,42,0.5);border-bottom:1px solid #1e293b;display:flex;align-items:center;justify-content:space-between">
-                        <span style="font-size:10px;font-weight:900;color:#a78bfa;text-transform:uppercase;letter-spacing:.1em">🛸 Passages ISS</span>
+                        <div style="display:flex;align-items:center;gap:8px">
+                            <span style="font-size:10px;font-weight:900;color:#a78bfa;text-transform:uppercase;letter-spacing:.1em">🛸 Passages ISS</span>
+                            <span id="iss-next-countdown" style="font-size:9px;font-weight:700;color:#c4b5fd;background:rgba(167,139,250,.12);border:1px solid #7c3aed44;border-radius:6px;padding:1px 6px;display:none"></span>
+                        </div>
                         <button type="button" onclick="issPassRefresh()" id="iss-refresh-btn"
                             style="font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.08em;background:none;border:none;cursor:pointer;padding:0">
                             ↺ MAJ
                         </button>
                     </div>
-                    <div style="padding:12px 14px;display:flex;flex-direction:column;gap:6px">
+                    <div style="padding:10px 12px;display:flex;flex-direction:column;gap:5px">
                         <div id="iss-pass-list" style="font-size:10px;color:#475569;font-style:italic;text-align:center;min-height:32px">
                             ⏳ Chargement...
                         </div>
-                        <div id="iss-pass-status" style="font-size:9px;color:#475569;font-style:italic;text-align:center"></div>
+                        <div id="iss-pass-status" style="font-size:8px;color:#334155;text-align:center;margin-top:2px"></div>
                     </div>
                 </div>
 
@@ -1993,12 +2122,23 @@ def index():
                                 <span id="rx-led" class="w-2.5 h-2.5 rounded-full bg-slate-700 inline-block transition-colors duration-300"></span>
                                 <span class="text-xs font-black text-slate-400 uppercase tracking-widest">📻 Moniteur de Trafic APRS</span>
                             </div>
-                            <div class="flex items-center gap-4">
+                            <div class="flex items-center gap-3 flex-wrap">
                                 <span class="text-[10px] font-mono text-slate-600">
-                                    📤 TX: <span id="tx-count" class="text-blue-400">0</span>
-                                    &nbsp;📥 RX: <span id="rx-count" class="text-emerald-400">0</span>
+                                    📤 TX&thinsp;<span id="tx-count" class="text-blue-400 font-bold">0</span>
+                                    &ensp;📥 RX&thinsp;<span id="rx-count" class="text-emerald-400 font-bold">0</span>
+                                    &ensp;🌐 IS&thinsp;<span id="is-count" class="text-violet-400 font-bold">0</span>
                                 </span>
-                                <button onclick="clearConsole()" class="text-[10px] text-slate-600 hover:text-red-400 font-bold uppercase tracking-widest transition-colors">
+                                <select id="monitor-filter" onchange="applyMonitorFilter()"
+                                    style="background:#0f172a;border:1px solid #1e3a5f;border-radius:7px;padding:2px 8px;color:#94a3b8;font-size:10px;outline:none;cursor:pointer;min-height:unset">
+                                    <option value="">Tout afficher</option>
+                                    <option value="RX">📥 RX uniquement</option>
+                                    <option value="TX">📤 TX uniquement</option>
+                                    <option value="IS">🌐 IS uniquement</option>
+                                    <option value="pos">📍 Positions</option>
+                                    <option value="msg">💬 Messages</option>
+                                    <option value="wx">🌦️ Météo</option>
+                                </select>
+                                <button onclick="clearConsole()" class="text-[10px] text-slate-600 hover:text-red-400 font-bold uppercase tracking-widest transition-colors" style="min-height:unset">
                                     🗑️ Effacer
                                 </button>
                             </div>
@@ -2281,147 +2421,6 @@ def index():
                     </div>
 
 
-                    <!-- ── Synchronisation Wavelog ───────────────────────── -->
-                    <div class="glass rounded-[2rem] p-6 space-y-5 mt-6">
-                        <div class="flex items-center justify-between">
-                            <h2 class="text-sm font-black text-white uppercase tracking-widest flex items-center gap-2">
-                                <img src="https://wavelog.org/assets/img/wavelog-sm.png" style="height:18px;vertical-align:middle;filter:brightness(1.2)" onerror="this.style.display='none'">
-                                🌊 Synchronisation Wavelog
-                            </h2>
-                            <div id="wavelog-status-badge" class="flex items-center gap-2 text-[10px] font-mono text-slate-500">
-                                <span id="wavelog-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#334155"></span>
-                                <span id="wavelog-status-txt">–</span>
-                            </div>
-                        </div>
-
-                        <!-- Toggle activer -->
-                        <div class="flex items-center justify-between bg-slate-900/60 rounded-2xl px-4 py-3">
-                            <div>
-                                <div class="text-white font-bold text-xs">Activer la synchronisation</div>
-                                <div class="text-slate-500 text-[10px] mt-0.5">Exporte automatiquement les QSO vers votre instance Wavelog</div>
-                            </div>
-                            <label class="relative inline-flex items-center cursor-pointer">
-                                <input type="checkbox" name="wavelog_enabled" id="wavelog_enabled"
-                                    """ + ('checked' if config_manager.data.get('wavelog',{}).get('enabled') else '') + """
-                                    class="sr-only peer">
-                                <div class="w-11 h-6 bg-slate-700 peer-focus:ring-2 peer-focus:ring-cyan-500 rounded-full peer
-                                    peer-checked:after:translate-x-full peer-checked:bg-cyan-600
-                                    after:content-[''] after:absolute after:top-[2px] after:left-[2px]
-                                    after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
-                            </label>
-                        </div>
-
-                        <!-- URL + API key -->
-                        <div class="grid grid-cols-1 gap-4">
-                            <div>
-                                <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">URL Wavelog</label>
-                                <input type="text" name="wavelog_url" id="wavelog_url"
-                                    value='""" + (config_manager.data.get('wavelog',{}).get('url','')) + """'
-                                    class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-cyan-500 transition-all"
-                                    placeholder="https://monwavelog.example.com">
-                                <p class="text-slate-600 text-[9px] mt-1 ml-1">Sans slash final · ex : <span class="text-slate-500 font-mono">https://log.f1riq.fr</span></p>
-                            </div>
-                            <div>
-                                <div class="flex items-center justify-between mb-2 ml-1">
-                                    <label class="block text-[10px] font-black text-slate-500 uppercase">Clé API</label>
-                                    <a href="#" onclick="document.getElementById('wavelog_url').value && window.open(document.getElementById('wavelog_url').value+'/index.php/admin/api_keys','_blank'); return false;"
-                                       class="text-[9px] text-cyan-500 hover:text-cyan-300 font-bold uppercase tracking-widest transition-colors">↗ Gérer les clés</a>
-                                </div>
-                                <div class="flex gap-2">
-                                    <input type="password" name="wavelog_api_key" id="wavelog_api_key"
-                                        value='""" + (config_manager.data.get('wavelog',{}).get('api_key','')) + """'
-                                        class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-cyan-500 transition-all"
-                                        placeholder="Votre clé API Wavelog"
-                                        autocomplete="off">
-                                    <button type="button" onclick="wavelogTestConn()"
-                                        id="wavelog-test-btn"
-                                        class="shrink-0 px-3 py-2 bg-slate-800 hover:bg-cyan-900/40 border border-slate-700 hover:border-cyan-600 rounded-xl text-[10px] font-bold text-cyan-300 transition-colors">
-                                        🔌 Tester
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Station ID + Intervalle -->
-                        <div class="grid grid-cols-2 gap-4">
-                            <div>
-                                <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">ID Station Wavelog</label>
-                                <input type="number" name="wavelog_station_id" min="1"
-                                    value='""" + str(config_manager.data.get('wavelog',{}).get('station_id',1)) + """'
-                                    class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-cyan-500 transition-all">
-                                <p class="text-slate-600 text-[9px] mt-1 ml-1">Paramètres → Stations dans Wavelog</p>
-                            </div>
-                            <div>
-                                <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">Intervalle synchro (min)</label>
-                                <select name="wavelog_sync_interval"
-                                    class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm outline-none focus:border-cyan-500 appearance-none transition-all">
-                                    """ + "".join([
-                                        '<option value="%d"%s>%d min</option>' % (v,
-                                        ' selected' if str(config_manager.data.get('wavelog',{}).get('sync_interval',5)) == str(v) else '', v)
-                                        for v in [1,5,10,15,30,60]
-                                    ]) + """
-                                </select>
-                            </div>
-                        </div>
-
-                        <!-- Options de filtre -->
-                        <div class="space-y-2">
-                            <div class="text-[10px] font-black text-slate-500 uppercase mb-2">Trames à synchroniser</div>
-                            <label class="flex items-center gap-3 bg-slate-900/60 rounded-2xl px-4 py-3 cursor-pointer border border-transparent has-[:checked]:border-cyan-500/40">
-                                <input type="checkbox" name="wavelog_sync_rx" id="wavelog_sync_rx"
-                                    """ + ('checked' if config_manager.data.get('wavelog',{}).get('sync_rx',True) else '') + """
-                                    class="accent-cyan-500">
-                                <div>
-                                    <div class="text-white text-xs font-bold">📥 Trames RX (reçues)</div>
-                                    <div class="text-slate-500 text-[9px]">Stations entendues en RF ou via iGate IS</div>
-                                </div>
-                            </label>
-                            <label class="flex items-center gap-3 bg-slate-900/60 rounded-2xl px-4 py-3 cursor-pointer border border-transparent has-[:checked]:border-cyan-500/40">
-                                <input type="checkbox" name="wavelog_sync_tx" id="wavelog_sync_tx"
-                                    """ + ('checked' if config_manager.data.get('wavelog',{}).get('sync_tx',True) else '') + """
-                                    class="accent-cyan-500">
-                                <div>
-                                    <div class="text-white text-xs font-bold">📤 Trames TX (émises)</div>
-                                    <div class="text-slate-500 text-[9px]">Beacons, messages et QSO envoyés</div>
-                                </div>
-                            </label>
-                            <label class="flex items-center gap-3 bg-slate-900/60 rounded-2xl px-4 py-3 cursor-pointer border border-transparent has-[:checked]:border-cyan-500/40">
-                                <input type="checkbox" name="wavelog_only_qso" id="wavelog_only_qso"
-                                    """ + ('checked' if config_manager.data.get('wavelog',{}).get('only_qso',True) else '') + """
-                                    class="accent-cyan-500">
-                                <div>
-                                    <div class="text-white text-xs font-bold">💬 QSO / contacts uniquement</div>
-                                    <div class="text-slate-500 text-[9px]">Exclut les beacons météo, propagation, telemetrie, objets purs</div>
-                                </div>
-                            </label>
-                        </div>
-
-                        <!-- Compteurs + actions -->
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="bg-slate-900/60 rounded-xl px-3 py-2 text-center">
-                                <div class="text-slate-500 text-[9px] uppercase">QSO synchronisés</div>
-                                <div id="wavelog-synced" class="text-cyan-400 font-black text-lg tabular-nums">0</div>
-                            </div>
-                            <div class="bg-slate-900/60 rounded-xl px-3 py-2 text-center">
-                                <div class="text-slate-500 text-[9px] uppercase">Dernière synchro</div>
-                                <div id="wavelog-last-sync" class="text-slate-400 font-mono text-xs mt-1">–</div>
-                            </div>
-                        </div>
-                        <div class="flex gap-2">
-                            <button type="button" onclick="wavelogSyncNow()" id="wavelog-sync-btn"
-                                class="flex-1 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all bg-cyan-900/30 border border-cyan-700/50 text-cyan-300 hover:bg-cyan-800/40">
-                                ⚡ Synchroniser maintenant
-                            </button>
-                            <button type="button" onclick="wavelogResetSync()"
-                                class="px-3 py-2 rounded-xl text-[10px] font-bold transition-all bg-slate-800 border border-slate-700 text-slate-400 hover:border-orange-600 hover:text-orange-300"
-                                title="Réinitialise le curseur — tout sera re-synchronisé">
-                                ↺ Réinitialiser
-                            </button>
-                        </div>
-                        <p class="text-slate-700 text-[9px] text-center">
-                            Wavelog open-source · <a href="https://github.com/wavelog/wavelog" target="_blank" class="text-slate-500 hover:text-cyan-400 transition-colors">github.com/wavelog/wavelog</a>
-                        </p>
-                    </div>
 
                     <!-- ── Alertes passage ISS ── -->
                     <div class="border-t border-slate-800/60 pt-8">
@@ -2716,290 +2715,12 @@ def index():
             </div>
         </div>
 
-        <!-- ════════════════════════════ CARNET DE TRAFIC ══════════════════════════ -->
-        <div id="tab-logbook" class="hidden space-y-6">
+        <!-- ═══════════════════════════ LOGBOOK ═══════════════════════════════ -->
 
-            <!-- ── Barre de stats + actions ── -->
-            <div class="glass rounded-[2rem] p-5 flex flex-col lg:flex-row items-start lg:items-center gap-4 justify-between">
-                <div class="flex items-center gap-4 flex-wrap">
-                    <span class="text-[10px] font-black text-amber-400 uppercase tracking-widest">📓 Carnet de Trafic APRS</span>
-                    <div id="lb-stats-badges" class="flex gap-2 flex-wrap text-[10px] font-mono">
-                        <span class="bg-slate-800 px-2 py-1 rounded-lg text-slate-400">Total : <span id="lb-stat-total" class="text-white font-bold">0</span></span>
-                        <span class="bg-slate-800 px-2 py-1 rounded-lg text-slate-400">RX : <span id="lb-stat-rx" class="text-emerald-400 font-bold">0</span></span>
-                        <span class="bg-slate-800 px-2 py-1 rounded-lg text-slate-400">TX : <span id="lb-stat-tx" class="text-blue-400 font-bold">0</span></span>
-                        <span class="bg-slate-800 px-2 py-1 rounded-lg text-slate-400">Indicatifs uniques : <span id="lb-stat-calls" class="text-violet-400 font-bold">0</span></span>
-                    </div>
-                </div>
-                <div class="flex gap-2 flex-wrap">
-                    <!-- Import -->
-                    <label class="cursor-pointer flex items-center gap-1.5 px-3 py-2 rounded-xl text-[10px] font-bold bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 transition-all">
-                        📥 Importer CSV/ADIF
-                        <input type="file" accept=".csv,.adi,.adif" onchange="lbImport(this)" class="hidden">
-                    </label>
-                    <!-- Export CSV -->
-                    <button onclick="lbExport('csv')" class="px-3 py-2 rounded-xl text-[10px] font-bold bg-slate-800 border border-slate-700 text-emerald-300 hover:bg-emerald-900/30 transition-all">
-                        📤 Export CSV
-                    </button>
-                    <!-- Export ADIF -->
-                    <button onclick="lbExport('adif')" class="px-3 py-2 rounded-xl text-[10px] font-bold bg-slate-800 border border-slate-700 text-amber-300 hover:bg-amber-900/30 transition-all">
-                        📤 Export ADIF
-                    </button>
-                    <!-- Ajouter manuellement -->
-                    <button onclick="lbShowAddModal()" class="px-3 py-2 rounded-xl text-[10px] font-bold bg-slate-800 border border-emerald-700/60 text-emerald-300 hover:bg-emerald-900/30 transition-all">
-                        ➕ Ajouter contact
-                    </button>
-                    <!-- Vider -->
-                    <button onclick="lbClearAll()" class="px-3 py-2 rounded-xl text-[10px] font-bold bg-slate-800 border border-red-900/40 text-red-400 hover:bg-red-900/30 transition-all">
-                        🗑️ Vider
-                    </button>
-                </div>
-            </div>
-
-            <!-- ── Filtres ── -->
-            <div class="glass rounded-[2rem] p-4 flex flex-col lg:flex-row gap-3 items-start lg:items-center">
-                <div class="flex items-center gap-2 flex-1">
-                    <span class="text-[10px] text-slate-500 font-bold uppercase shrink-0">🔍 Recherche</span>
-                    <input id="lb-search" type="text" placeholder="Indicatif, commentaire, payload..."
-                           class="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-white text-xs font-mono outline-none focus:border-blue-500 transition-all"
-                           oninput="lbRefresh()">
-                </div>
-                <div class="flex gap-2 flex-wrap">
-                    <select id="lb-dir" onchange="lbRefresh()"
-                            class="bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white outline-none focus:border-blue-500 appearance-none">
-                        <option value="">Tous (TX+RX)</option>
-                        <option value="RX">📥 RX uniquement</option>
-                        <option value="TX">📤 TX uniquement</option>
-                    </select>
-                    <select id="lb-type" onchange="lbRefresh()"
-                            class="bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white outline-none focus:border-blue-500 appearance-none">
-                        <option value="">Tous les types</option>
-                        <option value="Position">📍 Position</option>
-                        <option value="Message">💬 Message</option>
-                        <option value="Mic-E">📱 Mic-E</option>
-                        <option value="Meteo">🌦️ Météo</option>
-                        <option value="Statut">📢 Statut</option>
-                        <option value="Objet">🎯 Objet</option>
-                        <option value="Telemetrie">📊 Télémétrie</option>
-                        <option value="Beacon">📡 Beacon</option>
-                    </select>
-                    <span class="text-[10px] text-slate-600 font-mono self-center" id="lb-count-label">0 entrée(s)</span>
-                </div>
-            </div>
-
-            <!-- ── Tableau du carnet ── -->
-            <div class="glass rounded-[2rem] overflow-hidden shadow-2xl">
-                <div class="overflow-x-auto">
-                    <table class="w-full text-[11px] font-mono">
-                        <thead>
-                            <tr class="border-b border-slate-800 bg-slate-900/70 text-[9px] font-black text-slate-500 uppercase tracking-widest">
-                                <th class="px-3 py-3 text-left">Date/Heure</th>
-                                <th class="px-3 py-3 text-left">Dir</th>
-                                <th class="px-3 py-3 text-left">Indicatif</th>
-                                <th class="px-3 py-3 text-left">Dest</th>
-                                <th class="px-3 py-3 text-left">Type</th>
-                                <th class="px-3 py-3 text-left">Commentaire</th>
-                                <th class="px-3 py-3 text-left">Pos</th>
-                                <th class="px-3 py-3 text-left">Src</th>
-                                <th class="px-3 py-3 text-left">Note</th>
-                                <th class="px-3 py-3 text-center">⚙️</th>
-                            </tr>
-                        </thead>
-                        <tbody id="lb-tbody">
-                            <tr><td colspan="10" class="px-6 py-12 text-center text-slate-600 italic">⏳ Chargement...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-                <!-- Pagination -->
-                <div class="px-5 py-3 bg-slate-900/50 border-t border-slate-800 flex items-center justify-between gap-3">
-                    <button onclick="lbPrevPage()" id="lb-prev" class="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 disabled:opacity-30 transition-all">◀ Préc.</button>
-                    <span id="lb-page-info" class="text-[10px] text-slate-500 font-mono">Page 1</span>
-                    <button onclick="lbNextPage()" id="lb-next" class="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 disabled:opacity-30 transition-all">Suiv. ▶</button>
-                </div>
-            </div>
-        </div>
-
-    </main>
-</div>
-
-<!-- ══════════════════════════════════════════════════════════════════════
-     Modal — Ajout manuel d'un contact dans le carnet
-═══════════════════════════════════════════════════════════════════════ -->
-<div id="lb-add-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(2,6,23,.82);backdrop-filter:blur(4px);"
-     onclick="if(event.target===this)lbCloseAddModal()">
-    <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(96vw,560px);
-                background:#0f172a;border:1px solid #334155;border-radius:24px;box-shadow:0 24px 60px #00000080;padding:28px 24px;">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
-            <span style="font-size:13px;font-weight:900;color:#f59e0b;text-transform:uppercase;letter-spacing:.06em">
-                ➕ Ajouter un contact
-            </span>
-            <button onclick="lbCloseAddModal()" style="color:#64748b;font-size:18px;line-height:1;background:none;border:none;cursor:pointer;padding:2px 6px">✕</button>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:11px;font-family:monospace;">
-            <div style="grid-column:1/3">
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Indicatif *</label>
-                <input id="lbAdd-callsign" type="text" placeholder="F4XXX-9" maxlength="20"
-                       style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:13px;font-family:monospace;outline:none;box-sizing:border-box"
-                       oninput="this.value=this.value.toUpperCase()">
-            </div>
-            <div>
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Direction</label>
-                <select id="lbAdd-direction"
-                        style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;appearance:none">
-                    <option value="RX">📥 RX — Reçu</option>
-                    <option value="TX">📤 TX — Émis</option>
-                </select>
-            </div>
-            <div>
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Type APRS</label>
-                <select id="lbAdd-aprs_type"
-                        style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;appearance:none">
-                    <option value="Manuel">Manuel</option>
-                    <option value="Message">💬 Message</option>
-                    <option value="Position">📍 Position</option>
-                    <option value="Mic-E">📱 Mic-E</option>
-                    <option value="Beacon">📡 Beacon</option>
-                    <option value="Statut">📢 Statut</option>
-                    <option value="Objet">🎯 Objet</option>
-                    <option value="Meteo">🌦️ Météo</option>
-                </select>
-            </div>
-            <div>
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Date</label>
-                <input id="lbAdd-date" type="date"
-                       style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;box-sizing:border-box">
-            </div>
-            <div>
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Heure UTC</label>
-                <input id="lbAdd-time" type="time"
-                       style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;box-sizing:border-box">
-            </div>
-            <div>
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Fréquence (MHz)</label>
-                <input id="lbAdd-freq" type="text" value="144.800" maxlength="20"
-                       style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;box-sizing:border-box">
-            </div>
-            <div>
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Bande</label>
-                <select id="lbAdd-band"
-                        style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;appearance:none">
-                    <option value="2m">2m (144 MHz)</option>
-                    <option value="70cm">70cm (430 MHz)</option>
-                    <option value="10m">10m (28 MHz)</option>
-                    <option value="6m">6m (50 MHz)</option>
-                    <option value="23cm">23cm (1.2 GHz)</option>
-                </select>
-            </div>
-            <div>
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Mode</label>
-                <select id="lbAdd-mode"
-                        style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;appearance:none">
-                    <option value="APRS">APRS</option>
-                    <option value="FM">FM</option>
-                    <option value="SSB">SSB</option>
-                    <option value="CW">CW</option>
-                    <option value="FT8">FT8</option>
-                    <option value="JS8">JS8</option>
-                </select>
-            </div>
-            <div style="grid-column:1/3">
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Commentaire</label>
-                <input id="lbAdd-comment" type="text" placeholder="Commentaire ou message échangé..." maxlength="100"
-                       style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;box-sizing:border-box">
-            </div>
-            <div style="grid-column:1/3">
-                <label style="display:block;color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Note personnelle</label>
-                <input id="lbAdd-note" type="text" placeholder="Mémo, conditions de propagation..." maxlength="200"
-                       style="width:100%;background:#020617;border:1px solid #334155;border-radius:10px;padding:9px 12px;color:#fff;font-size:11px;font-family:monospace;outline:none;box-sizing:border-box">
-            </div>
-        </div>
-        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px">
-            <button onclick="lbCloseAddModal()"
-                    style="padding:9px 18px;border-radius:12px;font-size:10px;font-weight:800;background:#1e293b;border:1px solid #334155;color:#94a3b8;cursor:pointer;text-transform:uppercase;letter-spacing:.05em">
-                Annuler
-            </button>
-            <button id="lbAdd-submit-btn" onclick="lbSubmitAdd()"
-                    style="padding:9px 18px;border-radius:12px;font-size:10px;font-weight:800;background:#065f46;border:1px solid #10b981;color:#34d399;cursor:pointer;text-transform:uppercase;letter-spacing:.05em">
-                ✅ Enregistrer
-            </button>
-        </div>
-        <div id="lbAdd-error" style="margin-top:10px;font-size:10px;color:#f87171;font-family:monospace;display:none"></div>
-    </div>
 </div>
 
 <script>
     var txCount = 0;
-
-    // ── Modal ajout manuel logbook ──────────────────────────────────────────
-    function lbShowAddModal() {
-        var now = new Date();
-        var pad = function(n){ return String(n).padStart(2,'0'); };
-        document.getElementById('lbAdd-date').value =
-            now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate());
-        document.getElementById('lbAdd-time').value =
-            pad(now.getHours()) + ':' + pad(now.getMinutes());
-        document.getElementById('lbAdd-callsign').value = '';
-        document.getElementById('lbAdd-comment').value  = '';
-        document.getElementById('lbAdd-note').value     = '';
-        document.getElementById('lbAdd-freq').value     = '144.800';
-        document.getElementById('lbAdd-direction').value  = 'RX';
-        document.getElementById('lbAdd-aprs_type').value  = 'Manuel';
-        document.getElementById('lbAdd-band').value     = '2m';
-        document.getElementById('lbAdd-mode').value     = 'APRS';
-        document.getElementById('lbAdd-error').style.display = 'none';
-        document.getElementById('lb-add-modal').style.display = 'block';
-        setTimeout(function(){ document.getElementById('lbAdd-callsign').focus(); }, 80);
-    }
-
-    function lbCloseAddModal() {
-        document.getElementById('lb-add-modal').style.display = 'none';
-    }
-
-    async function lbSubmitAdd() {
-        var cs = (document.getElementById('lbAdd-callsign').value || '').trim().toUpperCase();
-        if (!cs) {
-            document.getElementById('lbAdd-error').textContent = '⚠️ Indicatif requis.';
-            document.getElementById('lbAdd-error').style.display = 'block';
-            document.getElementById('lbAdd-callsign').focus();
-            return;
-        }
-        var btn = document.getElementById('lbAdd-submit-btn');
-        btn.textContent = '⏳ Enregistrement...';
-        btn.disabled = true;
-        document.getElementById('lbAdd-error').style.display = 'none';
-        var payload = {
-            callsign:   cs,
-            direction:  document.getElementById('lbAdd-direction').value,
-            aprs_type:  document.getElementById('lbAdd-aprs_type').value,
-            date:       document.getElementById('lbAdd-date').value,
-            time:       document.getElementById('lbAdd-time').value,
-            freq:       (document.getElementById('lbAdd-freq').value || '').trim() || '144.800',
-            band:       document.getElementById('lbAdd-band').value,
-            mode:       document.getElementById('lbAdd-mode').value,
-            comment:    document.getElementById('lbAdd-comment').value.trim(),
-            note:       document.getElementById('lbAdd-note').value.trim(),
-        };
-        try {
-            var r   = await fetch('/logbook/add', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload),
-            });
-            var res = await r.json();
-            if (res.ok) {
-                lbCloseAddModal();
-                lbRefresh();
-                lbLoadStats();
-            } else {
-                throw new Error(res.error || 'Erreur inconnue');
-            }
-        } catch(e) {
-            document.getElementById('lbAdd-error').textContent = '❌ ' + e.message;
-            document.getElementById('lbAdd-error').style.display = 'block';
-        } finally {
-            btn.textContent = '✅ Enregistrer';
-            btn.disabled = false;
-        }
-    }
 
     // ── Navigation ─────────────────────────────────────────────────────────
     // switchTab définie dans <head>
@@ -3014,9 +2735,14 @@ def index():
         return '<a href="https://www.openstreetmap.org/?mlat=' + la + '&mlon=' + lo + '&zoom=14" target="_blank" class="text-blue-400 hover:text-blue-300 underline font-mono text-[11px]">' + la + ', ' + lo + '</a>';
     }
 
-    function badge(label, value, cls) {
-        cls = cls || 'text-slate-300';
-        return '<span class="inline-flex items-center gap-1 bg-slate-800 rounded-md px-2 py-0.5 text-[10px] font-mono"><span class="text-slate-500">' + esc(label) + '</span><span class="' + cls + '">' + esc(String(value)) + '</span></span>';
+    // # MONITOR_UI_PATCH_APPLIED
+    function badge(label, value, cls, bgCls) {
+        cls   = cls   || 'text-slate-300';
+        bgCls = bgCls || 'bg-slate-800/80';
+        return '<span class="inline-flex items-center gap-1 ' + bgCls + ' rounded-md px-2 py-0.5 text-[10px] font-mono border border-slate-700/40">'
+             + '<span class="text-slate-500 text-[9px] uppercase tracking-wide">' + esc(label) + '</span>'
+             + '<span class="' + cls + ' font-semibold">' + esc(String(value)) + '</span>'
+             + '</span>';
     }
 
     // ── Coordonnées station locale (depuis la config serveur) ──────────────
@@ -3045,8 +2771,9 @@ def index():
         } catch(ex) {}
     })();
 
-    // callsign → distKm calculée depuis une trame de position propre (pas Objet)
-    var _stationPosDistKm = {};
+    // callsign → distKm et bearing calculés depuis une trame de position propre (pas Objet)
+    var _stationPosDistKm  = {};
+    var _stationPosBearing = {};   // callsign → azimut (°) vers la station distante
 
     function haversineKm(lat1, lon1, lat2, lon2) {
         var R = 6371;
@@ -3058,30 +2785,54 @@ def index():
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
     }
 
+    /** Azimut vrai (initial bearing) de (lat1,lon1) vers (lat2,lon2), en degrés 0-360. */
+    function bearingDeg(lat1, lon1, lat2, lon2) {
+        var toRad = Math.PI / 180;
+        var dLon  = (lon2 - lon1) * toRad;
+        var φ1    = lat1 * toRad, φ2 = lat2 * toRad;
+        var y     = Math.sin(dLon) * Math.cos(φ2);
+        var x     = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(dLon);
+        return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+    }
+
+    /** Rose des vents 16 secteurs → flèche Unicode pointant vers la cible. */
+    function bearingArrow(deg) {
+        // flèches pointant dans la direction d'émission (N=↑, E=→, S=↓, O=←)
+        var arrows = ['↑','↗','→','↘','↓','↙','←','↖'];
+        return arrows[Math.round((deg % 360) / 45) % 8];
+    }
+
     function buildFields(frame) {
         var e = frame.extra || {};
         var parts = [];
         if (e.lat !== undefined && e.lon !== undefined) {
-            parts.push('<span class="inline-flex items-center gap-1 bg-slate-800 rounded-md px-2 py-0.5 text-[10px] font-mono"><span class="text-slate-500">pos</span>' + coordLink(e.lat, e.lon) + '</span>');
+            parts.push('<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:2px 7px;font-family:monospace;font-size:10px">'
+                     + '<span style="color:#10b981;font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.08em">📍pos</span>'
+                     + coordLink(e.lat, e.lon) + '</span>');
             if (_stationLat !== null && _stationLon !== null) {
                 var _isObj = (frame.aprs_type === 'Objet');
                 var _src   = (frame.src || '').toUpperCase();
-                var _dist;
+                var _dist, _brng;
                 if (_isObj && _stationPosDistKm[_src] !== undefined) {
-                    // Objet iGaté : afficher la distance de la station émettrice
+                    // Objet iGaté : afficher la distance/azimut de la station émettrice
                     _dist = _stationPosDistKm[_src];
+                    _brng = _stationPosBearing[_src];
                 } else {
                     _dist = haversineKm(_stationLat, _stationLon, e.lat, e.lon);
+                    _brng = bearingDeg(_stationLat, _stationLon, e.lat, e.lon);
                     // Mémoriser si c'est une trame de position propre
-                    if (!_isObj) _stationPosDistKm[_src] = _dist;
+                    if (!_isObj) { _stationPosDistKm[_src] = _dist; _stationPosBearing[_src] = _brng; }
                 }
                 var _distStr = _dist < 10 ? _dist.toFixed(1) + ' km' : Math.round(_dist) + ' km';
                 var _distCls = _dist < 50 ? 'text-emerald-300' : _dist < 150 ? 'text-yellow-300' : 'text-orange-300';
-                var _distBadge = badge('📏', _distStr, _distCls);
+                var _brngStr = _brng !== undefined ? bearingArrow(_brng) + ' ' + Math.round(_brng) + '°' : '';
+                var _bearingBadge = _brngStr ? badge('🧭', _distStr + ' · ' + _brngStr, _distCls) : badge('📏', _distStr, _distCls);
                 if (_isObj && _stationPosDistKm[_src] !== undefined) {
-                    _distBadge = badge('📏', _distStr + ' ·sta', _distCls);
+                    _bearingBadge = _brngStr
+                        ? badge('🧭', _distStr + ' · ' + _brngStr + ' ·sta', _distCls)
+                        : badge('📏', _distStr + ' ·sta', _distCls);
                 }
-                parts.push(_distBadge);
+                parts.push(_bearingBadge);
             }
         }
         if (e.symbol) parts.push(badge('sym', e.symbol));
@@ -3097,12 +2848,13 @@ def index():
             parts.push(badge('📡 PHG', e.phg_power_w+'W · '+e.phg_height_m+'m · '+e.phg_gain_db+'dB · '+e.phg_dir, 'text-orange-300'));
         if (e.rng_km !== undefined)
             parts.push(badge('📶 RNG', e.rng_km+' km', 'text-orange-300'));
-        if (e.msg_dest) parts.push(badge('vers', e.msg_dest, 'text-indigo-300'));
-        if (e.msg_text) parts.push('<span class="text-slate-200 text-xs italic">' + esc(e.msg_text) + '</span>');
+        if (e.msg_dest) parts.push(badge('vers', e.msg_dest, 'text-indigo-300', 'bg-indigo-950/40'));
+        if (e.msg_text) parts.push('<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);border-radius:6px;padding:3px 9px;font-size:11px;color:#c7d2fe;font-style:italic">'
+            + '💬 ' + esc(e.msg_text) + '</span>');
 
         // ── Champs météo ──────────────────────────────────────────────────
         var isWx = (frame.aprs_type === 'Meteo' || frame.aprs_type === 'Meteo Peet');
-        if (e.temp_c        !== undefined) parts.push(badge('🌡️', e.temp_c.toFixed(1) + ' °C', 'text-orange-300'));
+        if (e.temp_c        !== undefined) parts.push(badge('🌡️', e.temp_c.toFixed(1) + ' °C', 'text-orange-300', 'bg-orange-950/30'));
         if (e.humidity_pct  !== undefined) parts.push(badge('💧', e.humidity_pct + ' %', 'text-cyan-300'));
         var _card16 = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSO","SO","OSO","O","ONO","NO","NNO"];
         function degToCard(d) { return _card16[Math.round((d % 360) / 22.5) % 16]; }
@@ -3297,31 +3049,97 @@ def index():
 
     function addLog(type, frame) {
         var con = document.getElementById('console');
-        var div = document.createElement('div');
-        var timeStr = new Date().toLocaleTimeString();
-        var isTX    = type === 'TX';
-        var isIS    = frame._source === 'IS';
-        var borderColor = isTX ? '#3b82f6' : isIS ? '#8b5cf6' : '#10b981';
-        var color       = isTX ? 'text-blue-400' : isIS ? 'text-violet-400' : 'text-emerald-400';
-        var dirLabel    = isTX ? '📤 TX' : isIS ? '🌐 IS' : '📥 RX';
+        var now = new Date();
+        var timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+        var isTX = type === 'TX';
+        var isIS = frame._source === 'IS';
+
+        // ── Couleurs par direction ────────────────────────────────────────
+        var accentColor, dirBg, dirText, dirLabel, dirBorder;
+        if (isTX) {
+            accentColor = '#3b82f6'; dirBg = 'rgba(59,130,246,0.08)';
+            dirText = '#93c5fd'; dirLabel = '📤 TX';
+            dirBorder = 'rgba(59,130,246,0.3)';
+        } else if (isIS) {
+            accentColor = '#8b5cf6'; dirBg = 'rgba(139,92,246,0.08)';
+            dirText = '#c4b5fd'; dirLabel = '🌐 IS';
+            dirBorder = 'rgba(139,92,246,0.3)';
+        } else {
+            accentColor = '#10b981'; dirBg = 'rgba(16,185,129,0.06)';
+            dirText = '#6ee7b7'; dirLabel = '📥 RX';
+            dirBorder = 'rgba(16,185,129,0.25)';
+        }
+
+        // ── Type APRS : couleur de fond du badge ─────────────────────────
+        var typeColors = {
+            'Message':'rgba(99,102,241,0.15)', 'Position':'rgba(16,185,129,0.10)',
+            'Meteo':'rgba(14,165,233,0.12)', 'Meteo Peet':'rgba(14,165,233,0.12)',
+            'Objet':'rgba(245,158,11,0.12)', 'Mic-E':'rgba(236,72,153,0.10)',
+            'Telemetrie':'rgba(168,85,247,0.10)', 'Statut':'rgba(251,191,36,0.08)',
+            'Beacon ISS':'rgba(139,92,246,0.15)'
+        };
+        var typeBg = 'rgba(30,41,59,0.8)';
+        for (var tk in typeColors) {
+            if (frame.aprs_type && frame.aprs_type.indexOf(tk) !== -1) { typeBg = typeColors[tk]; break; }
+        }
+
+        // ── Ligne d'en-tête ───────────────────────────────────────────────
+        var destPath = '';
+        if (frame.dest) {
+            destPath += '<span style="color:#475569;font-size:9px;margin:0 3px">▸</span>'
+                     +  '<span style="background:#0f172a;border:1px solid #1e293b;border-radius:5px;padding:1px 6px;font-family:monospace;font-size:10px;color:#64748b">'
+                     +  esc(frame.dest) + '</span>';
+        }
+        if (frame.path) {
+            destPath += '<span style="color:#334155;font-size:9px;font-family:monospace;margin-left:3px">' + esc(frame.path) + '</span>';
+        }
+
+        var typeBadge = '<span style="display:inline-flex;align-items:center;gap:3px;background:' + typeBg + ';border:1px solid rgba(148,163,184,0.1);border-radius:6px;padding:2px 7px;font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap">'
+                      + aprsTypeEmoji(frame.aprs_type) + ' ' + esc(frame.aprs_type || '?') + '</span>';
+
+        var dirBadge = '<span style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:5px;font-size:9px;font-weight:900;letter-spacing:.1em;background:' + dirBg + ';color:' + dirText + ';border:1px solid ' + dirBorder + '">' + dirLabel + '</span>';
+
+        var header = '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:space-between">'
+            + '<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:0">'
+            + dirBadge
+            + qrzLink(frame.src || '?', {cls:'text-[11px] font-black font-mono px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-blue-300 transition-colors border border-slate-700/50'})
+            + destPath
+            + '</div>'
+            + '<div style="display:flex;align-items:center;gap:6px;flex-shrink:0">'
+            + typeBadge
+            + '<span style="font-size:9px;font-family:monospace;color:#475569;white-space:nowrap">' + timeStr + '</span>'
+            + '</div>'
+            + '</div>';
+
+        // ── Champs décodés ────────────────────────────────────────────────
         var fieldsHtml = buildFields(frame);
-        var rawLine = (frame.payload && frame.aprs_type !== 'Telemetrie')
-            ? '<div class="mt-1.5 font-mono text-[10px] text-slate-600 truncate">' + esc(frame.payload.substring(0,120)) + '</div>'
-            : '';
-        div.style.borderLeftColor = borderColor;
-        div.className = "rx-entry bg-slate-900/40 p-4 rounded-2xl border border-slate-800/50";
-        div.innerHTML = '<div class="flex justify-between items-start">'
-            + '<div class="flex items-center gap-2 flex-wrap">'
-            + '<span class="text-[10px] font-black ' + color + ' uppercase tracking-tighter">' + dirLabel + ' &bull; ' + timeStr + '</span>'
-            + qrzLink(frame.src || '?')
-            + '<span class="text-slate-600 text-[10px]">&#9658;</span>'
-            + '<span class="text-[10px] bg-slate-800 rounded px-1.5 py-0.5 font-mono text-slate-400">' + esc(frame.dest || '?') + '</span>'
-            + (frame.path ? '<span class="text-[9px] text-slate-600 font-mono">' + esc(frame.path) + '</span>' : '')
-            + '</div>'
-            + '<span class="text-[9px] font-bold text-slate-600 uppercase tracking-widest shrink-0 ml-2">' + aprsTypeEmoji(frame.aprs_type) + ' ' + esc(frame.aprs_type || '') + '</span>'
-            + '</div>'
-            + fieldsHtml + rawLine;
+
+        // ── Trame brute repliable ─────────────────────────────────────────
+        var rawHtml = '';
+        if (frame.payload && frame.aprs_type !== 'Telemetrie') {
+            var rawTrunc = esc(frame.payload.substring(0, 200));
+            rawHtml = '<div style="margin-top:6px">'
+                + '<button class="raw-toggle" style="background:none;border:none;padding:0;font-size:9px;color:#334155;cursor:pointer;font-family:monospace;font-weight:700;text-transform:uppercase;letter-spacing:.08em;min-height:unset">'
+                + '\u22ef trame brute</button>'
+                + '<div class="raw-body" style="display:none;margin-top:4px;padding:6px 8px;background:#040d18;border-radius:6px;border:1px solid #1e293b;font-family:monospace;font-size:10px;color:#475569;word-break:break-all;white-space:pre-wrap;line-height:1.5">'
+                + rawTrunc + '</div>'
+                + '</div>';
+        }
+
+        // ── Assemblage ────────────────────────────────────────────────────
+        var div = document.createElement('div');
+        div.className = 'rx-entry aprs-card';
+        div.style.cssText = 'border-left:3px solid ' + accentColor + ';background:rgba(15,23,42,0.55);'
+            + 'border-radius:12px;border:1px solid rgba(30,41,59,0.9);border-left-width:3px;border-left-color:' + accentColor + ';'
+            + 'padding:10px 14px;animation:aprsCardIn .18s ease-out';
+        div.innerHTML = header
+            + (fieldsHtml ? '<div style="margin-top:7px">' + fieldsHtml.replace(/^<div[^>]*>/, '').replace(/<\/div>$/, '') + '</div>' : '')
+            + rawHtml;
         con.prepend(div);
+
+        // Limiter à 200 entrées pour les perfs
+        var children = con.children;
+        while (children.length > 202) con.removeChild(children[children.length - 1]);
     }
 
     // ── Restauration de l'historique après F5 ─────────────────────────────
@@ -3647,13 +3465,39 @@ def index():
                 addLog('TX', data);
             } else if (data.type === 'iss_pass_alert') {
                 _issPassAlertShow(data);
+            } else if (data.type === 'msg_ack') {
+                // ── ACK reçu : mettre à jour la bulle TX en temps réel ────────
+                var badge = document.getElementById('ack-badge-' + data.msgno);
+                if (badge) {
+                    badge.outerHTML = '<span style="color:#34d399;font-size:9px;margin-left:4px" title="ACK reçu">✓ ACK</span>';
+                }
+                // Rafraîchir si c'est la conversation active
+                if (activeContact && activeContact === data.dest) {
+                    // Pas de rechargement complet — le badge vient d'être mis à jour inline
+                }
+            } else if (data.type === 'msg_retry') {
+                // ── Retry en cours ou timeout ─────────────────────────────────
+                var badge2 = document.getElementById('ack-badge-' + data.msgno);
+                if (badge2) {
+                    if (data.failed) {
+                        badge2.outerHTML = '<span style="color:#f87171;font-size:9px;margin-left:4px" title="Pas de réponse après ' + data.max + ' essais">✗ TIMEOUT</span>';
+                    } else {
+                        badge2.title = 'Retry ' + data.retry + '/' + data.max + '…';
+                        badge2.textContent = '⟳';
+                        badge2.style.color = '#f59e0b';
+                    }
+                }
+                if (data.failed && activeContact && activeContact === data.dest) {
+                    refreshContacts();
+                }
             } else if (data.type !== 'connected') {
                 rxFrameCount++;
                 document.getElementById('rx-count').textContent = rxFrameCount;
                 document.getElementById('rx-led').style.background = '#60a5fa';
                 setTimeout(function() { document.getElementById('rx-led').style.background = '#34d399'; }, 400);
                 if (window._statsRecord) _statsRecord(data._source === 'IS' ? 'IS' : 'RX', data);
-                addLog('RX', data);
+                if (data._source === 'IS') _incIsCount();
+                addLog(data._source === 'IS' ? 'IS' : 'RX', data);
                 // Dispatcher vers la carte Leaflet
                 document.dispatchEvent(new CustomEvent('aprs-frame', {detail: data}));
                 // Notification chat si message prive
@@ -3663,7 +3507,6 @@ def index():
                     document.getElementById('qso-badge').classList.remove('hidden');
                     var _mb=document.getElementById('mnav-qso-badge');if(_mb){_mb.textContent='●';_mb.style.display='block';}
                     var _msgTxt = (data.extra && data.extra.msg_text) ? data.extra.msg_text : '';
-                    _pushNotif('💬 QSO — ' + (data.src || '?'), _msgTxt, 'qso-' + (data.src || 'rx'));
                 }
             }
         } catch(err) {}
@@ -3724,44 +3567,143 @@ def index():
 
     // ── Passages ISS ─────────────────────────────────────────────────────────
 
+    // ── Countdown ticker ISS ─────────────────────────────────────────────────
+    var _issNextRisetime = 0;
+    var _issCountdownTimer = null;
+    function _issTickCountdown() {
+        var el = document.getElementById('iss-next-countdown');
+        if (!el || !_issNextRisetime) return;
+        var now  = Date.now() / 1000;
+        var diff = Math.round(_issNextRisetime - now);
+        if (diff <= 0) {
+            el.textContent = '🛸 EN COURS';
+            el.style.color = '#4ade80';
+            el.style.borderColor = '#22c55e44';
+            el.style.background  = 'rgba(74,222,128,.12)';
+            return;
+        }
+        var h = Math.floor(diff / 3600);
+        var m = Math.floor((diff % 3600) / 60);
+        var s = diff % 60;
+        var txt = h > 0
+            ? h + 'h' + String(m).padStart(2,'0') + 'm'
+            : m + 'min ' + String(s).padStart(2,'0') + 's';
+        el.textContent = '⏱ ' + txt;
+        el.style.display = 'inline-block';
+    }
+
     function issPassRefresh() {
         var list = document.getElementById('iss-pass-list');
         var btn  = document.getElementById('iss-refresh-btn');
-        if (list) list.innerHTML = '<span style="color:#475569;font-style:italic">⏳ Interrogation open-notify.org...</span>';
+        if (list) list.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">⏳ Calcul SGP4...</span>';
         if (btn)  btn.textContent = '…';
         fetch('/iss_passes').then(function(r){ return r.json(); }).then(function(d){
             if (btn) btn.textContent = '↺ MAJ';
             if (!list) return;
             if (d.error) {
-                list.innerHTML = '<span style="color:#ef4444">' + d.error + '</span>';
+                list.innerHTML = '<span style="color:#ef4444;font-size:10px">' + d.error + '</span>';
                 return;
             }
             if (!d.passes || !d.passes.length) {
-                list.innerHTML = '<span style="color:#475569;font-style:italic">Aucun passage prévu</span>';
+                list.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">Aucun passage prévu</span>';
                 return;
             }
+
+            // Mettre à jour le countdown sur le 1er passage
+            _issNextRisetime = d.passes[0].risetime || 0;
+            _issTickCountdown();
+            if (_issCountdownTimer) clearInterval(_issCountdownTimer);
+            _issCountdownTimer = setInterval(_issTickCountdown, 1000);
+
             list.innerHTML = d.passes.map(function(p, i) {
-                var inMin = p.in_min;
-                var col   = inMin < 20 ? '#a78bfa' : (inMin < 60 ? '#67e8f9' : '#475569');
-                var bold  = (i === 0) ? 'font-weight:700;color:#c4b5fd' : '';
-                return '<div style="display:flex;justify-content:space-between;align-items:center;' +
-                       'padding:4px 0;border-bottom:1px solid #1e293b;' + bold + '">' +
-                       '<span style="font-family:monospace;font-size:11px">' +
-                       (i === 0 ? '🛸 ' : '   ') + p.risetime_fmt + '</span>' +
-                       '<span style="color:' + col + ';font-family:monospace;font-size:10px">' +
-                       'dans ' + inMin + ' min · ' + p.duration_min + ' min</span>' +
-                       '</div>';
+                var inMin   = Math.round(p.in_min);
+                var maxEl   = (p.max_el !== undefined && p.max_el !== null) ? Math.round(p.max_el) : null;
+                var dur     = p.duration_min;
+                var isNext  = (i === 0);
+
+                // Couleur selon imminence
+                var urgColor = inMin < 15  ? '#f472b6'   // rose : très proche
+                             : inMin < 60  ? '#a78bfa'   // violet : < 1h
+                             : inMin < 240 ? '#67e8f9'   // cyan : < 4h
+                             :               '#475569';  // gris : lointain
+
+                // Qualité du passage selon élévation max
+                var elLabel = '', elColor = '#475569', elPct = 0;
+                if (maxEl !== null) {
+                    elPct = Math.min(100, Math.round(maxEl / 90 * 100));
+                    if      (maxEl >= 60) { elLabel = '⭐ Excellent'; elColor = '#4ade80'; }
+                    else if (maxEl >= 30) { elLabel = '✦ Bon';        elColor = '#a78bfa'; }
+                    else if (maxEl >= 10) { elLabel = '· Passable';   elColor = '#67e8f9'; }
+                    else                  { elLabel = '↙ Rasant';     elColor = '#475569'; }
+                }
+
+                // Fond de carte
+                var cardBg  = isNext
+                    ? 'background:linear-gradient(135deg,rgba(124,58,237,.18),rgba(59,130,246,.10));border:1px solid #7c3aed55'
+                    : 'background:rgba(15,23,42,0.5);border:1px solid #1e293b';
+
+                var html = '<div style="border-radius:10px;padding:8px 10px;' + cardBg + ';margin-bottom:4px">';
+
+                // Ligne 1 : heure + badge "dans Xmin"
+                html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">';
+                html +=   '<span style="font-family:monospace;font-size:' + (isNext ? '13' : '11') + 'px;font-weight:' + (isNext ? '800' : '600') + ';color:' + (isNext ? '#e2e8f0' : '#94a3b8') + '">';
+                html +=     (isNext ? '🛸 ' : '') + p.risetime_fmt;
+                html +=   '</span>';
+                html +=   '<span style="font-size:10px;font-weight:700;color:' + urgColor + ';background:' + urgColor + '18;border-radius:6px;padding:2px 7px;white-space:nowrap">';
+                html +=     (inMin <= 0 ? 'EN COURS' : 'dans ' + inMin + ' min');
+                html +=   '</span>';
+                html += '</div>';
+
+                // Ligne 2 : durée + élévation max + label qualité
+                html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:' + (maxEl !== null ? '6' : '0') + 'px">';
+                html +=   '<span style="font-size:9px;color:#64748b">⏱ ' + dur + ' min</span>';
+                if (maxEl !== null) {
+                    html += '<span style="font-size:9px;color:#64748b">·</span>';
+                    html += '<span style="font-size:9px;color:' + elColor + ';font-weight:700">▲ ' + maxEl + '°</span>';
+                    html += '<span style="font-size:9px;color:' + elColor + '">' + elLabel + '</span>';
+                }
+                // Fréquences (seulement si passage notable ou 1er)
+                if (isNext || (maxEl !== null && maxEl >= 20)) {
+                    html += '<span style="margin-left:auto;font-size:8px;color:#334155;font-family:monospace">145.825 · 437.550</span>';
+                }
+                html += '</div>';
+
+                // Barre d'élévation
+                if (maxEl !== null) {
+                    var barColor = maxEl >= 60 ? '#4ade80' : maxEl >= 30 ? '#a78bfa' : '#67e8f9';
+                    html += '<div style="height:3px;background:#0f172a;border-radius:2px;overflow:hidden">';
+                    html +=   '<div style="width:' + elPct + '%;height:100%;background:' + barColor + ';border-radius:2px;transition:width .6s ease"></div>';
+                    html += '</div>';
+                }
+
+                html += '</div>';
+                return html;
             }).join('');
+
+            // Statut position
             var st = document.getElementById('iss-pass-status');
-            if (st) {
+            if (st && d.lat !== undefined) {
                 st.textContent = '📍 ' + d.lat.toFixed(2) + '° / ' + d.lon.toFixed(2) + '°';
             }
-            // Miroir dans l'onglet Réglages
+
+            // Miroir Réglages (version condensée)
             var cfgList = document.getElementById('iss-pass-list-cfg');
-            if (cfgList) cfgList.innerHTML = list ? list.innerHTML : '';
+            if (cfgList) {
+                cfgList.innerHTML = d.passes.map(function(p, i) {
+                    var inMin = Math.round(p.in_min);
+                    var maxEl = (p.max_el !== undefined && p.max_el !== null) ? Math.round(p.max_el) : null;
+                    var col   = inMin < 60 ? '#a78bfa' : '#475569';
+                    return '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #1e293b33">'
+                        + '<span style="font-family:monospace;font-size:10px;color:' + (i===0?'#e2e8f0':'#64748b') + '">'
+                        + (i===0?'🛸 ':'') + p.risetime_fmt + '</span>'
+                        + '<span style="font-size:9px;color:' + col + '">'
+                        + 'dans ' + inMin + 'min' + (maxEl!==null ? ' · ▲'+maxEl+'°' : '') + ' · ' + p.duration_min + 'min'
+                        + '</span></div>';
+                }).join('');
+            }
         }).catch(function(e){
             if (btn) btn.textContent = '↺ MAJ';
-            if (list) list.innerHTML = '<span style="color:#ef4444">❌ open-notify.org inaccessible</span>';
+            if (list) list.innerHTML = '<span style="color:#ef4444;font-size:10px">❌ Calcul SGP4 indisponible</span>';
             console.warn('[ISS]', e);
         });
     }
@@ -3820,9 +3762,6 @@ def index():
             });
             setTimeout(function(){ try { ctx.close(); } catch(_){} }, 1000);
         } catch(_){}
-        _pushNotif('🛸 Passage ISS dans ' + adv + ' min',
-                   data.risetime_fmt + ' · ' + data.duration_min + ' min · 145.825 MHz',
-                   'iss-pass');
         setTimeout(function(){ if (banner.parentNode) banner.parentNode.removeChild(banner); }, 15000);
     }
 
@@ -3844,7 +3783,7 @@ def index():
         issPassRefresh();
     })();
 
-    // Rafraîchissement auto toutes les 15 min (évite d'appeler open-notify trop souvent)
+    // Rafraîchissement auto toutes les 15 min (rafraîchissement automatique toutes les 15 min)
     setInterval(issPassRefresh, 15 * 60 * 1000);
 
     // ── Rafraichissement liste peripheriques audio ──────────────────────────
@@ -3972,6 +3911,40 @@ def index():
 
     function clearConsole() { document.getElementById('console').innerHTML = ''; }
 
+    // ── Handler délégué : bouton "trame brute" ───────────────────────────────
+    document.addEventListener('click', function(ev) {
+        if (ev.target && ev.target.classList.contains('raw-toggle')) {
+            var body = ev.target.parentNode.querySelector('.raw-body');
+            if (body) body.style.display = body.style.display === 'none' ? 'block' : 'none';
+        }
+    });
+
+    // ── Compteur IS ─────────────────────────────────────────────────────────
+    var _isCount = 0;
+    function _incIsCount() {
+        _isCount++;
+        var el = document.getElementById('is-count');
+        if (el) el.textContent = _isCount;
+    }
+
+    // ── Filtre moniteur ─────────────────────────────────────────────────────
+    function applyMonitorFilter() {
+        var val = (document.getElementById('monitor-filter') || {}).value || '';
+        var cards = document.querySelectorAll('#console .aprs-card');
+        cards.forEach(function(card) {
+            if (!val) { card.style.display = ''; return; }
+            var html = card.innerHTML.toLowerCase();
+            var show = false;
+            if (val === 'RX') show = html.indexOf('📥 rx') !== -1;
+            else if (val === 'TX') show = html.indexOf('📤 tx') !== -1;
+            else if (val === 'IS') show = html.indexOf('🌐 is') !== -1;
+            else if (val === 'pos') show = html.indexOf('📍pos') !== -1;
+            else if (val === 'msg') show = html.indexOf('💬') !== -1;
+            else if (val === 'wx') show = html.indexOf('🌡️') !== -1 || html.indexOf('💧') !== -1 || html.indexOf('💨') !== -1;
+            card.style.display = show ? '' : 'none';
+        });
+    }
+
     // ── Beacon auto ────────────────────────────────────────────────────────
     var _beaconRemaining = null;
     var _beaconInterval  = 0;
@@ -4081,27 +4054,6 @@ def index():
         data.igate_enabled  = document.getElementById('igate_enabled') ? document.getElementById('igate_enabled').checked : false;
         data.igate_rx_only  = data.igate_rx_only === 'true';
         data.igate_port     = parseInt(data.igate_port) || 14580;
-        // ── Wavelog : reconstruction du sous-objet ────────────────────────────
-        data.wavelog = {
-            enabled:       document.getElementById('wavelog_enabled')  ? document.getElementById('wavelog_enabled').checked  : false,
-            url:           (data.wavelog_url       || '').trim(),
-            api_key:       (data.wavelog_api_key   || '').trim(),
-            station_id:    parseInt(data.wavelog_station_id)   || 1,
-            sync_interval: parseInt(data.wavelog_sync_interval) || 5,
-            sync_rx:       document.getElementById('wavelog_sync_rx')   ? document.getElementById('wavelog_sync_rx').checked   : true,
-            sync_tx:       document.getElementById('wavelog_sync_tx')   ? document.getElementById('wavelog_sync_tx').checked   : true,
-            only_qso:      document.getElementById('wavelog_only_qso')  ? document.getElementById('wavelog_only_qso').checked  : true,
-            last_sync_id:  0,   // conservé côté serveur — on le recharge après save
-        };
-        // Récupérer le last_sync_id actuel pour ne pas l'écraser
-        try {
-            var _wlst = await (await fetch('/wavelog/status')).json();
-            if (_wlst.last_sync_id) data.wavelog.last_sync_id = _wlst.last_sync_id;
-        } catch(_) {}
-        // Nettoyer les clés wavelog_* à plat (on a reconstruit l'objet)
-        ['wavelog_url','wavelog_api_key','wavelog_station_id','wavelog_sync_interval',
-         'wavelog_enabled','wavelog_sync_rx','wavelog_sync_tx','wavelog_only_qso'
-        ].forEach(function(k){ delete data[k]; });
         try {
             await fetch('/update_config', {
                 method: 'POST',
@@ -4209,7 +4161,13 @@ def index():
             }
 
             // ── Métadonnées ────────────────────────────────────────────────
-            var acked   = m.acked ? '<span style="color:#34d399;font-size:9px;margin-left:4px">✓ ACK</span>' : '';
+            var ackState = m.acked
+                ? '<span style="color:#34d399;font-size:9px;margin-left:4px" title="ACK reçu">✓ ACK</span>'
+                : m.acked_failed
+                    ? '<span style="color:#f87171;font-size:9px;margin-left:4px" title="Pas de réponse après 3 essais">✗ TIMEOUT</span>'
+                    : m.msgno
+                        ? '<span id="ack-badge-'+esc(m.msgno)+'" style="color:#94a3b8;font-size:9px;margin-left:4px" title="En attente de confirmation">⏳</span>'
+                        : '';
             var timeStr = m.ts ? m.ts.split(' ')[1] || m.ts : '';
             var msgno   = m.msgno ? '<span style="color:#475569;font-size:9px"> #' + m.msgno + '</span>' : '';
             var caller  = esc(m.from || (isTx ? 'Moi' : activeContact || '?'));
@@ -4227,7 +4185,7 @@ def index():
                       +     'box-shadow:0 2px 8px #1d4ed840;'
                       +     'word-break:break-word;'
                       +   '">'
-                      +     esc(m.text) + acked
+                      +     esc(m.text) + ackState
                       +   '</div>'
                       +   '<div style="text-align:right;font-size:9px;color:#475569;margin-top:3px;padding-right:4px;font-family:monospace">'
                       +     timeStr + msgno
@@ -4482,7 +4440,7 @@ def index():
     // CARTE APRS — Leaflet
     // ══════════════════════════════════════════════════════════════════════
     var _map        = null;
-    var _mapMarkers = {};   // callsign → { marker, emoji }
+    var _mapMarkers = {};   // callsign → { marker, polyline, emoji, trail:[[lat,lon],…] }
     var _mapCount   = 0;
 
     // Emoji par type de trame
@@ -4513,21 +4471,96 @@ def index():
         });
     }
 
+    // Symboles APRS mobiles — doit correspondre à _TRAIL_SYMBOLS Python
+    var _TRAIL_SYM = {'/j':1,'/k':1,'/u':1,'/v':1,'/o':1,'/O':1,'/f':1,'/g':1,
+        '/[':1,'/X':1,'/Y':1,'/a':1,'/s':1,'/>':1,'/<':1,'/^':1,'/n':1,'/r':1,
+        '\\\\j':1,'\\\\k':1,'\\\\u':1,'\\\\v':1,'\\\\a':1,'\\\\s':1,'\\\\>':1,'\\\\<':1,'\\\\^':1};
+    function _isMobileSym(sym) {
+        if (!sym) return false;
+        var s = sym.trim().toLowerCase();
+        if (_TRAIL_SYM[s]) return true;
+        return false;
+    }
+
+    // Palette de couleurs par station (hachage de l'indicatif)
+    function _stationColor(cs) {
+        var palette = ['#f97316','#3b82f6','#10b981','#ec4899','#f59e0b','#8b5cf6','#06b6d4','#84cc16'];
+        var h = 0;
+        for (var i = 0; i < cs.length; i++) h = (h * 31 + cs.charCodeAt(i)) & 0xffff;
+        return palette[h % palette.length];
+    }
+
     function _placeMarker(cs, lat, lon, emoji, popupHtml) {
+        var m = _mapMarkers[cs];
+        var trail = m.trail || [];
+        var course = m.lastCourse || -1;
+
+        // ── Icône avec rotation selon le cap ───────────────────────────────
+        var rotStyle = (course >= 0) ? 'transform:rotate(' + course + 'deg);' : '';
         var icon = L.divIcon({
             className: '',
             html: '<div style="display:flex;flex-direction:column;align-items:center;gap:1px">'
-                + '<div style="font-size:22px;line-height:1;filter:drop-shadow(0 1px 2px #000a)">' + emoji + '</div>'
-                + '<div style="background:rgba(15,23,42,0.85);color:#60a5fa;border:1px solid #334155;'
-                + 'border-radius:4px;padding:1px 4px;font-size:9px;font-weight:700;font-family:monospace;white-space:nowrap">' + cs + '</div>'
+                + '<div style="font-size:22px;line-height:1;filter:drop-shadow(0 1px 2px #000a);' + rotStyle + '">' + emoji + '</div>'
+                + '<div style="background:rgba(15,23,42,0.9);color:#60a5fa;border:1px solid #334155;'
+                + 'border-radius:4px;padding:1px 5px;font-size:9px;font-weight:700;font-family:monospace;white-space:nowrap;letter-spacing:.04em">' + cs + '</div>'
                 + '</div>',
-            iconAnchor: [11, 30]
+            iconAnchor: [13, 32]
         });
-        if (_mapMarkers[cs] && _mapMarkers[cs].marker) {
-            _mapMarkers[cs].marker.setLatLng([lat, lon]).setIcon(icon).setPopupContent(popupHtml);
+        if (m.marker) {
+            m.marker.setLatLng([lat, lon]).setIcon(icon).setPopupContent(popupHtml);
         } else {
-            var marker = L.marker([lat, lon], {icon: icon}).bindPopup(popupHtml).addTo(_map);
-            _mapMarkers[cs].marker = marker;
+            m.marker = L.marker([lat, lon], {icon: icon}).bindPopup(popupHtml, {maxWidth: 260}).addTo(_map);
+        }
+
+        // ── Trail : segments avec dégradé temporel ────────────────────────
+        var stColor = _stationColor(cs);
+
+        // Supprimer les anciens segments et waypoints
+        if (m.trailLayers) {
+            m.trailLayers.forEach(function(l){ _map.removeLayer(l); });
+        }
+        m.trailLayers = [];
+
+        if (trail.length >= 2) {
+            var now = Date.now() / 1000;
+            var oldest = trail[0][2] || (now - 3600);
+            var span   = Math.max(now - oldest, 1);
+
+            for (var i = 0; i < trail.length - 1; i++) {
+                var p1 = trail[i], p2 = trail[i+1];
+                var age = (now - (p1[2] || now)) / span; // 0=récent, 1=ancien
+                age = Math.min(Math.max(age, 0), 1);
+                // Opacité : 0.15 (vieux) → 0.9 (récent)
+                var opacity = 0.15 + (1 - age) * 0.75;
+                // Largeur : 1.5 (vieux) → 3.5 (récent)
+                var weight  = 1.5 + (1 - age) * 2;
+                var seg = L.polyline([[p1[0],p1[1]], [p2[0],p2[1]]], {
+                    color: stColor, weight: weight, opacity: opacity,
+                    lineJoin: 'round', lineCap: 'round'
+                }).addTo(_map);
+                m.trailLayers.push(seg);
+            }
+
+            // Waypoints : petits cercles sur chaque position intermédiaire
+            for (var j = 0; j < trail.length - 1; j++) {
+                var pt = trail[j];
+                var ptAge = (now - (pt[2] || now)) / span;
+                ptAge = Math.min(Math.max(ptAge, 0), 1);
+                var ptOpacity = 0.2 + (1 - ptAge) * 0.6;
+                var ptRadius  = 1.5 + (1 - ptAge) * 2;
+
+                // Tooltip heure + vitesse
+                var ptTime = pt[2] ? new Date(pt[2]*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}) : '';
+                var ptSpd  = (pt[3] !== undefined && pt[3] >= 0) ? pt[3] + ' km/h' : '';
+                var ptTip  = ptTime + (ptSpd ? ' · ' + ptSpd : '');
+
+                var dot = L.circleMarker([pt[0], pt[1]], {
+                    radius: ptRadius, color: stColor, weight: 1,
+                    fillColor: stColor, fillOpacity: ptOpacity, opacity: ptOpacity
+                }).addTo(_map);
+                if (ptTip) dot.bindTooltip(ptTip, {permanent: false, direction: 'top', className: 'aprs-trail-tip'});
+                m.trailLayers.push(dot);
+            }
         }
     }
 
@@ -4543,26 +4576,65 @@ def index():
         var _isObjFrame = (frame.aprs_type === 'Objet');
         var _rawDistKm  = (_stationLat !== null && _stationLon !== null)
             ? haversineKm(_stationLat, _stationLon, lat, lon) : null;
-        // Pour un objet, préférer la distance de position propre de la station
+        var _rawBrng    = (_stationLat !== null && _stationLon !== null)
+            ? bearingDeg(_stationLat, _stationLon, lat, lon) : null;
+        // Pour un objet, préférer la distance/azimut de position propre de la station
         var _distKm = (_isObjFrame && _stationPosDistKm[cs] !== undefined)
             ? _stationPosDistKm[cs] : _rawDistKm;
+        var _brngMap = (_isObjFrame && _stationPosBearing[cs] !== undefined)
+            ? _stationPosBearing[cs] : _rawBrng;
         // Mémoriser si c'est une trame de position propre
-        if (!_isObjFrame && _rawDistKm !== null) _stationPosDistKm[cs] = _rawDistKm;
+        if (!_isObjFrame && _rawDistKm !== null) {
+            _stationPosDistKm[cs]  = _rawDistKm;
+            _stationPosBearing[cs] = _rawBrng;
+        }
         var _distLabel = _distKm !== null
             ? (_distKm < 10 ? _distKm.toFixed(1) : Math.round(_distKm)) + ' km' : null;
+        var _brngLabel = _brngMap !== null
+            ? bearingArrow(_brngMap) + ' ' + Math.round(_brngMap) + '°' : null;
         var _distColor = _distKm === null ? '' : _distKm < 50 ? '#34d399' : _distKm < 150 ? '#fbbf24' : '#fb923c';
+        // ── Popup station mobile enrichi ─────────────────────────────────
+        var _stClr = _stationColor(cs);
         var popup =
-            '<b style="font-size:13px">' + emoji + ' ' + cs + '</b>'
-            + (_distLabel ? ' &nbsp;<span style="font-size:11px;color:' + _distColor + ';font-weight:700">📏 ' + _distLabel + '</span>' : '')
-            + '<br><span style="font-size:11px;color:#94a3b8">' + (frame.aprs_type || '') + '</span>'
-            + (e.symbol ? '<br><span style="font-size:11px">' + e.symbol + '</span>' : '')
-            + (e.speed_kmh !== undefined ? '<br>🏎️ ' + e.speed_kmh + ' km/h &nbsp;🧭 ' + (e.course||'?') + '°' : '')
-            + (e.alt_m     !== undefined ? '<br>⬆️ '  + e.alt_m + ' m' : '')
-            + (e.comment && e.comment.length ? '<br>💬 ' + e.comment : '')
-            + '<br><span style="font-size:10px;color:#64748b">' + new Date().toLocaleTimeString() + '</span>';
+            '<div style="font-family:system-ui;min-width:180px">'
+            + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">'
+            + '<span style="font-size:20px">' + emoji + '</span>'
+            + '<div>'
+            + '<div style="font-size:13px;font-weight:900;font-family:monospace;color:#f1f5f9">' + cs + '</div>'
+            + '<div style="font-size:10px;color:#64748b">' + (frame.aprs_type || '') + '</div>'
+            + '</div>'
+            + (_distLabel ? '<span style="margin-left:auto;font-size:11px;color:' + _distColor + ';font-weight:700;white-space:nowrap">🧭 ' + _distLabel + '</span>' : '')
+            + '</div>'
+            + (e.speed_kmh !== undefined ? '<div style="font-size:11px;color:#94a3b8;margin-bottom:2px">🏎️ <b style="color:#f1f5f9">' + e.speed_kmh + ' km/h</b>&ensp;🧭 ' + (e.course !== undefined ? e.course + '°' : '?') + (_brngLabel ? '&ensp;' + _brngLabel : '') + '</div>' : '')
+            + (e.alt_m     !== undefined ? '<div style="font-size:11px;color:#94a3b8;margin-bottom:2px">⬆️ <b style="color:#f1f5f9">' + e.alt_m + ' m</b></div>' : '')
+            + (e.comment && e.comment.length ? '<div style="font-size:11px;color:#cbd5e1;margin-bottom:4px;font-style:italic">💬 ' + esc(e.comment) + '</div>' : '');
+
+        // Dernières positions du trail
+        var _trailNow = (_mapMarkers[cs] && _mapMarkers[cs].trail) ? _mapMarkers[cs].trail : [];
+        if (_trailNow.length > 1) {
+            popup += '<div style="margin-top:6px;border-top:1px solid #1e293b;padding-top:5px">'
+                   + '<div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px">Historique (' + _trailNow.length + ' pts)</div>';
+            var _showPts = _trailNow.slice(-5).reverse();
+            _showPts.forEach(function(pt, idx) {
+                var _ptT = pt[2] ? new Date(pt[2]*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
+                var _ptS = (pt[3] !== undefined && pt[3] >= 0) ? pt[3] + ' km/h' : '';
+                var _ptC = (pt[4] !== undefined && pt[4] >= 0) ? pt[4] + '°' : '';
+                var _ptLl = pt[0].toFixed(4) + ', ' + pt[1].toFixed(4);
+                popup += '<div style="font-size:10px;color:' + (idx===0?'#cbd5e1':'#64748b') + ';font-family:monospace;padding:1px 0">'
+                       + (idx===0?'▶ ':'  ')
+                       + _ptT
+                       + (_ptS ? ' <span style="color:' + _stClr + '">' + _ptS + '</span>' : '')
+                       + (_ptC ? ' <span style="color:#94a3b8">' + _ptC + '</span>' : '')
+                       + '</div>';
+            });
+            popup += '</div>';
+        }
+
+        popup += '<div style="font-size:9px;color:#475569;margin-top:5px">'
+               + new Date().toLocaleTimeString('fr-FR') + '</div></div>';
 
         if (!_mapMarkers[cs]) {
-            _mapMarkers[cs] = { lat: lat, lon: lon, emoji: emoji, popup: popup, distKm: _distKm };
+            _mapMarkers[cs] = { lat: lat, lon: lon, emoji: emoji, popup: popup, distKm: _distKm, trail: [] };
             _mapCount++;
             document.getElementById('map-station-count').textContent = _mapCount;
             var badge = document.getElementById('map-badge');
@@ -4576,6 +4648,33 @@ def index():
             _mapMarkers[cs].emoji  = emoji;
             _mapMarkers[cs].popup  = popup;
             _mapMarkers[cs].distKm = _distKm;
+        }
+
+        // ── Accumulation de traînée pour stations mobiles ─────────────────
+        var _rawSym = (e.symbol || '').trim().toLowerCase();
+        var _mobile = _isMobileSym(_rawSym)
+                   || (e.speed_kmh !== undefined && e.speed_kmh > 0)
+                   || (frame.aprs_type === 'Mic-E');
+
+        // Stocker le cap pour la rotation de l'icône
+        if (e.course !== undefined && e.course >= 0) {
+            _mapMarkers[cs].lastCourse = e.course;
+        }
+
+        if (_mobile) {
+            var _tr = _mapMarkers[cs].trail;
+            var _now_s = Date.now() / 1000;
+            var _addPt = true;
+            if (_tr.length) {
+                var _lp = _tr[_tr.length-1];
+                if (Math.abs(_lp[0]-lat) < 1e-5 && Math.abs(_lp[1]-lon) < 1e-5) _addPt = false;
+            }
+            if (_addPt) {
+                var _spd = (e.speed_kmh !== undefined) ? e.speed_kmh : -1;
+                var _crs = (e.course    !== undefined) ? e.course    : -1;
+                _tr.push([lat, lon, _now_s, _spd, _crs]);
+                if (_tr.length > 100) _tr.shift();
+            }
         }
 
         if (_map) _placeMarker(cs, lat, lon, emoji, popup);
@@ -4607,7 +4706,10 @@ def index():
     }
 
     function mapClearAll() {
-        if (_map) Object.values(_mapMarkers).forEach(function(m) { if (m.marker) _map.removeLayer(m.marker); });
+        if (_map) Object.values(_mapMarkers).forEach(function(m) {
+            if (m.marker)   _map.removeLayer(m.marker);
+            if (m.polyline) _map.removeLayer(m.polyline);
+        });
         _mapMarkers = {}; _mapCount = 0;
         document.getElementById('map-station-count').textContent = '0';
         document.getElementById('map-badge').classList.add('hidden');
@@ -4800,6 +4902,162 @@ def index():
         };
     })();
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 📡 ALERTES PROPAGATION VHF
+    // ══════════════════════════════════════════════════════════════════════
+    (function() {
+        var _alertTimer = null;
+        var _alertQueue = [];
+        var _alertShowing = false;
+
+        // ── Bip audio doux ─────────────────────────────────────────────────
+        function _alertBeep(level) {
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                var freqs = level === 'special' ? [660, 880, 1100] : [440, 550];
+                freqs.forEach(function(freq, i) {
+                    var osc = ctx.createOscillator();
+                    var g   = ctx.createGain();
+                    osc.frequency.value = freq;
+                    osc.type = 'sine';
+                    g.gain.setValueAtTime(0, ctx.currentTime + i * 0.18);
+                    g.gain.linearRampToValueAtTime(0.18, ctx.currentTime + i * 0.18 + 0.05);
+                    g.gain.linearRampToValueAtTime(0, ctx.currentTime + i * 0.18 + 0.22);
+                    osc.connect(g); g.connect(ctx.destination);
+                    osc.start(ctx.currentTime + i * 0.18);
+                    osc.stop(ctx.currentTime + i * 0.18 + 0.3);
+                });
+                setTimeout(function(){ try { ctx.close(); } catch(_){} }, 1200);
+            } catch(_) {}
+        }
+
+        // ── Bannière flash ─────────────────────────────────────────────────
+        function _showBanner(alert) {
+            _alertShowing = true;
+            var colors = alert.level === 'special'
+                ? { bg: '#1e1b4b', border: '#818cf8', text: '#a5b4fc', icon: '🌠' }
+                : { bg: '#052e16', border: '#22c55e', text: '#86efac', icon: '📡' };
+
+            var banner = document.createElement('div');
+            banner.id = 'vhf-alert-banner';
+            banner.style.cssText = [
+                'position:fixed', 'top:18px', 'left:50%', 'transform:translateX(-50%)',
+                'z-index:9999', 'min-width:320px', 'max-width:90vw',
+                'background:' + colors.bg,
+                'border:1.5px solid ' + colors.border,
+                'border-radius:16px', 'padding:14px 20px',
+                'display:flex', 'align-items:center', 'gap:14px',
+                'box-shadow:0 8px 32px rgba(0,0,0,.6)',
+                'animation:vhfAlertIn .35s cubic-bezier(.22,1,.36,1)',
+                'cursor:pointer',
+            ].join(';');
+
+            // Injecter le keyframe si absent
+            if (!document.getElementById('vhf-alert-style')) {
+                var st = document.createElement('style');
+                st.id  = 'vhf-alert-style';
+                st.textContent = [
+                    '@keyframes vhfAlertIn{from{opacity:0;transform:translateX(-50%) translateY(-20px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}',
+                    '@keyframes vhfAlertOut{from{opacity:1}to{opacity:0;transform:translateX(-50%) translateY(-10px)}}',
+                    '@keyframes vhfPulse{0%,100%{box-shadow:0 8px 32px rgba(0,0,0,.6)}50%{box-shadow:0 8px 40px ' + colors.border + '66}}',
+                ].join('');
+                document.head.appendChild(st);
+            }
+            if (alert.level === 'special') banner.style.animation += ',vhfPulse 1.2s ease infinite';
+
+            banner.innerHTML =
+                '<span style="font-size:26px">' + colors.icon + '</span>'
+                + '<div style="flex:1">'
+                +   '<div style="font-size:12px;font-weight:800;color:' + colors.text + ';letter-spacing:.04em">' + alert.label + '</div>'
+                +   '<div style="font-size:10px;color:#94a3b8;margin-top:2px">' + alert.detail + '</div>'
+                + '</div>'
+                + '<button onclick="this.parentNode.remove()" style="background:none;border:none;color:#64748b;font-size:18px;cursor:pointer;padding:0 4px;line-height:1">×</button>';
+
+            // Clic → aller sur MAP/Propagation
+            banner.addEventListener('click', function(e) {
+                if (e.target.tagName !== 'BUTTON') {
+                    if (typeof switchTab === 'function') switchTab('map');
+                }
+            });
+
+            document.body.appendChild(banner);
+            _alertBeep(alert.level);
+
+            // Auto-dismiss après 12 s
+            setTimeout(function() {
+                if (!banner.parentNode) { _alertShowing = false; _nextAlert(); return; }
+                banner.style.animation = 'vhfAlertOut .4s ease forwards';
+                setTimeout(function() {
+                    if (banner.parentNode) banner.parentNode.removeChild(banner);
+                    _alertShowing = false;
+                    _nextAlert();
+                }, 400);
+            }, 12000);
+        }
+
+        function _nextAlert() {
+            if (_alertQueue.length && !_alertShowing) {
+                var a = _alertQueue.shift();
+                setTimeout(function() { _showBanner(a); }, 600);
+            }
+        }
+
+        // ── Mise à jour du badge dans le widget propagation ────────────────
+        function _updatePropBadge(data) {
+            var badge = document.getElementById('vhf-alert-badge');
+            if (!badge) {
+                // Créer le badge et l'insérer dans le widget propagation
+                var box = document.getElementById('vhf-prop-content');
+                if (!box) return;
+                badge = document.createElement('div');
+                badge.id = 'vhf-alert-badge';
+                badge.style.cssText = 'margin-top:8px;border-radius:10px;padding:6px 10px;font-size:10px;font-family:monospace;text-align:center;display:none';
+                box.parentNode.insertBefore(badge, box.nextSibling);
+            }
+            if (data.score >= 70) {
+                var color = data.es ? '#818cf8' : '#22c55e';
+                var txt   = data.es
+                    ? '🌠 Es actif — ouvertures 6m/2m possibles'
+                    : '📡 Conditions VHF favorables — Kp ' + (data.kp !== null ? data.kp.toFixed(1) : '?');
+                badge.style.cssText = badge.style.cssText.replace('display:none','').replace(/display:[^;]+/,'display:block');
+                badge.style.background = '#0f1629';
+                badge.style.border = '1px solid ' + color;
+                badge.style.color  = color;
+                badge.textContent  = txt;
+            } else if (data.aurora) {
+                badge.style.background = '#1e1b4b';
+                badge.style.border = '1px solid #818cf8';
+                badge.style.color  = '#a5b4fc';
+                badge.style.display = 'block';
+                badge.textContent  = '🌠 Aurora possible — Kp ' + (data.kp !== null ? data.kp.toFixed(1) : '?');
+            } else {
+                badge.style.display = 'none';
+            }
+        }
+
+        // ── Polling /vhf_alert_check toutes les 5 min ──────────────────────
+        function _pollAlerts() {
+            fetch('/vhf_alert_check', {cache: 'no-store'})
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    _updatePropBadge(d);
+                    if (d.alerts && d.alerts.length) {
+                        d.alerts.forEach(function(a) {
+                            _alertQueue.push(a);
+                        });
+                        _nextAlert();
+                    }
+                })
+                .catch(function() {});
+        }
+
+        // Premier poll après 30 s (laisser la page s'initialiser)
+        setTimeout(_pollAlerts, 30000);
+        // Puis toutes les 5 min
+        _alertTimer = setInterval(_pollAlerts, 5 * 60 * 1000);
+
+    })();
+
     // ── iGate : calcul passcode + polling statut ───────────────────────────
     function igateCalcPasscode() {
         var call = (document.querySelector('[name=callsign]') || {}).value || '';
@@ -4876,9 +5134,9 @@ def index():
                 <h3 class="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">🚀 Démarrage rapide</h3>
                 <ol class="space-y-2 text-slate-400 list-decimal list-inside">
                     <li>Aller dans <span class="text-white font-bold">⚙️ RÉGLAGES</span> et renseigner l'indicatif, le locator Maidenhead et la position GPS.</li>
-                    <li>Sélectionner le port série de Direwolf et cliquer <span class="text-white font-bold">💾 Sauvegarder</span>.</li>
-                    <li>Activer la connexion en cliquant <span class="text-white font-bold">▶ CONNEXION</span> dans l'onglet <span class="text-white font-bold">📻 TRAFIC</span>.</li>
-                    <li>Les trames APRS décodées apparaissent en temps réel dans la console.</li>
+                    <li>Sélectionner le port série PTT, le mode PTT et les périphériques audio RX/TX.</li>
+                    <li>Configurer les balises automatiques (intervalle par type) puis cliquer <span class="text-white font-bold">✅ APPLIQUER</span>.</li>
+                    <li>Les trames APRS décodées par Direwolf apparaissent en temps réel dans <span class="text-white font-bold">📻 TRAFIC</span>.</li>
                 </ol>
             </section>
 
@@ -4894,7 +5152,7 @@ def index():
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📶 Beacon Propagation</span><span>Interroge NOAA SWPC (SFI, Kp, A-index) et émet un beacon statut <span class="text-emerald-400">&gt;SFI:NNN K:N.N HF:xxx VHF:yyy {NOAA}</span>.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛰️ Envoyer statut</span><span>Émet le statut texte libre configuré dans les réglages (trame <span class="text-emerald-400">&gt;</span>).</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Console</span><span>Affiche les trames TX/RX. Clic sur un indicatif → fiche QRZ.com. Clic sur les coordonnées → onglet MAP.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Passages ISS</span><span>Widget compact affichant les 5 prochains passages de l'ISS. Mis à jour toutes les 15 min. Le bouton <span class="text-white font-bold">↺ MAJ</span> force un rafraîchissement.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Passages ISS</span><span>Widget compact affichant les 5 prochains passages de l'ISS avec durée et <span class="text-white font-mono">élév. max</span>. Calculés localement par SGP4 — fonctionne hors-ligne. Mis à jour toutes les 15 min. Le bouton <span class="text-white font-bold">↺ MAJ</span> force un recalcul.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Beacons auto</span><span>Chaque type de balise possède son propre intervalle configurable dans <span class="text-white font-bold">⚙️ RÉGLAGES</span>. Le temps restant avant la prochaine émission est affiché en temps réel.</span></div>
                 </div>
             </section>
@@ -4912,7 +5170,6 @@ def index():
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Commentaire</span><span>Texte libre joint à la balise station (max 43 caractères).</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Alertes ISS</span><span>Active la bannière + bip avant chaque passage de l'ISS. Nécessite un locator ou des coordonnées valides.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🌩️ Alertes Météo</span><span>Définir les seuils (température, vent, rafales, pluie, pression, codes WMO) et l'intervalle de vérification.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🔔 Notifications</span><span>Notifications Web Push navigateur pour recevoir les alertes même avec l'onglet en arrière-plan.</span></div>
                 </div>
             </section>
 
@@ -4962,7 +5219,8 @@ def index():
                 <h3 class="text-[10px] font-black text-violet-400 uppercase tracking-widest mb-3 flex items-center gap-2">🛸 Alerte Passage ISS</h3>
                 <div class="space-y-2 text-slate-400">
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Activation</span><span>Dans <span class="text-white font-bold">⚙️ RÉGLAGES</span>, section «&nbsp;Alertes Passage ISS&nbsp;». Activer le toggle et définir l'avance souhaitée.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Source</span><span>API <span class="text-white font-mono">open-notify.org</span> (gratuite, sans clé). Interrogée toutes les 60 s côté serveur.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Moteur SGP4</span><span>Calcul orbital embarqué (stdlib pure, sans dépendance externe). Précision ±30 s / ±5 km — suffisant pour planifier l'écoute APRS 145.825 MHz.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">TLE ISS</span><span>Rechargé toutes les 6 h depuis CelesTrak (3 sources en cascade). En cas de coupure réseau, le cache disque <span class="text-white font-mono">.iss_tle_cache</span> prend le relais jusqu'à 7 jours.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Bannière &amp; bip</span><span>Bannière violette + triple bip 440/660/880 Hz X minutes avant le passage. Cliquer pour fermer.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Voyant header</span><span>Point <span class="text-violet-400 font-bold">● ISS</span> animé sous «&nbsp;Station Active&nbsp;» quand l'alerte est activée.</span></div>
                 </div>
@@ -4980,7 +5238,7 @@ def index():
                 </div>
             </section>
 
-            <div class="text-center pt-2 pb-1 text-slate-700 text-[9px]">Py-APRS v2.2 · Direwolf backend · 73 de F1RIQ</div>
+            <div class="text-center pt-2 pb-1 text-slate-700 text-[9px]">Py-APRS v2.4 · Direwolf + SGP4 · 73 de F1RIQ</div>
         </div><!-- /aide-panel-guide -->
 
         <!-- ── CHANGELOG ── -->
@@ -4999,7 +5257,7 @@ def index():
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Beacon météo échoue</span><span>Locator Maidenhead absent ou invalide. Vérifier dans les réglages (format JN07XX).</span></div>
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">NOAA inaccessible</span><span>Vérifier la connexion Internet du serveur. Le widget propagation fonctionne aussi depuis le navigateur client si le serveur est hors ligne.</span></div>
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">MAP vide</span><span>Normal si aucune trame avec coordonnées GPS n'a été reçue depuis le démarrage. Les stations sans position ne sont pas cartographiées.</span></div>
-                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Passages ISS absents</span><span><span class="text-white font-mono">open-notify.org</span> inaccessible ou position non configurée. Vérifier le locator dans les réglages et la connexion Internet du serveur.</span></div>
+                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Passages ISS absents</span><span>Locator ou coordonnées absents dans les réglages, ou TLE ISS non rechargeable (pas d'Internet). Le calcul SGP4 fonctionne hors-ligne via le cache disque <code>.iss_tle_cache</code>.</span></div>
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Alerte météo muette</span><span>Vérifier que le toggle est actif et que la position (locator ou lat/lon) est renseignée. Cliquer <span class="text-white font-bold">🔍 Vérifier maintenant</span> pour diagnostiquer.</span></div>
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Voyant ISS absent</span><span>Normal si l'alerte ISS n'est pas activée dans les Réglages. Le voyant n'apparaît que lorsque le toggle est actif.</span></div>
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">iGate : pastille orange</span><span>Serveur APRS-IS inaccessible. Vérifier connexion Internet, <span class="text-white font-mono">rotate.aprs2.net</span> et port <span class="text-white font-mono">14580</span>. Reconnexion automatique toutes les 30 s.</span></div>
@@ -5022,7 +5280,7 @@ def index():
                         <div class="text-white font-black text-sm tracking-tight">F1RIQ</div>
                         <div class="text-slate-400 text-[10px] mt-0.5">Radioamateur · Développeur · France · JN07II</div>
                         <div class="text-slate-600 text-[9px] mt-0.5"><a href="mailto:tonyf1riq@gmail.com" class="hover:text-blue-400 transition-colors">tonyf1riq@gmail.com</a></div>
-                        <div class="text-slate-600 text-[9px] mt-1">Py-APRS · version 2.2 · Backend Dire Wolf</div>
+                        <div class="text-slate-600 text-[9px] mt-1">Py-APRS · version 2.4 · Backend Dire Wolf + SGP4</div>
                     </div>
                     <div class="ml-auto text-right shrink-0">
                         <div class="text-emerald-400 text-[10px] font-bold">✅ Logiciel libre</div>
@@ -5206,332 +5464,9 @@ try { _updateNotifBtn(); } catch(e) {}
 if ('serviceWorker' in navigator && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
     _registerSW().catch(function(){});
 }
-</script><script>
-// ══════════════════════════════════════════════════════════════════════════════
-// 📓 CARNET DE TRAFIC — JavaScript
-// ══════════════════════════════════════════════════════════════════════════════
-(function() {
-    var _page    = 1;
-    var _perPage = 50;
-    var _total   = 0;
-    var _debounceTimer = null;
-
-    // ── Exposition globale ───────────────────────────────────────────────────
-    window.lbRefresh   = lbRefresh;
-    window.lbPrevPage  = lbPrevPage;
-    window.lbNextPage  = lbNextPage;
-    window.lbExport    = lbExport;
-    window.lbImport    = lbImport;
-    window.lbClearAll  = lbClearAll;
-    window.lbSaveNote  = lbSaveNote;
-    window.lbDelete    = lbDelete;
-
-    // ── Helpers ──────────────────────────────────────────────────────────────
-    function _e(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-    function _dirBadge(dir) {
-        if (dir === 'TX') return '<span style="background:#1d4ed8;color:#bfdbfe;border-radius:6px;padding:1px 7px;font-size:8px;font-weight:900">📤 TX</span>';
-        if (dir === 'RX') return '<span style="background:#065f46;color:#6ee7b7;border-radius:6px;padding:1px 7px;font-size:8px;font-weight:900">📥 RX</span>';
-        return '<span style="background:#334155;color:#94a3b8;border-radius:6px;padding:1px 7px;font-size:8px">' + _e(dir) + '</span>';
-    }
-
-    function _typeBadge(t) {
-        var colors = {
-            'Position':'#1e3a5f','Message':'#1e293b','Mic-E':'#312e81',
-            'Meteo':'#0c4a6e','Statut':'#292524','Objet':'#451a03',
-            'Telemetrie':'#1e1b4b','Beacon':'#14532d','Propagation':'#2e1065',
-        };
-        var bg = colors[t] || '#1e293b';
-        return '<span style="background:' + bg + ';color:#cbd5e1;border-radius:6px;padding:1px 6px;font-size:8px;white-space:nowrap">' + _e(t||'?') + '</span>';
-    }
-
-    function _posCell(e) {
-        if (e.lat == null || e.lon == null) return '<span style="color:#334155">–</span>';
-        var la = parseFloat(e.lat).toFixed(4);
-        var lo = parseFloat(e.lon).toFixed(4);
-        return '<a href="https://www.openstreetmap.org/?mlat=' + la + '&mlon=' + lo + '&zoom=14" target="_blank" style="color:#38bdf8;font-size:9px;font-family:monospace">📍' + la + '</a>';
-    }
-
-    function _srcBadge(src) {
-        if (src === 'IS') return '<span style="color:#a78bfa;font-size:9px">🌐 IS</span>';
-        if (src === 'ADIF') return '<span style="color:#fbbf24;font-size:9px">📄 ADIF</span>';
-        if (src === 'import') return '<span style="color:#94a3b8;font-size:9px">📥</span>';
-        return '<span style="color:#6ee7b7;font-size:9px">📡 RF</span>';
-    }
-
-    // ── Chargement / rendu ────────────────────────────────────────────────────
-    function lbRefresh() {
-        clearTimeout(_debounceTimer);
-        _debounceTimer = setTimeout(function() { _page = 1; _load(); }, 250);
-    }
-
-    function _load() {
-        var search = (document.getElementById('lb-search')||{}).value || '';
-        var dir    = (document.getElementById('lb-dir')||{}).value || '';
-        var type   = (document.getElementById('lb-type')||{}).value || '';
-        var url    = '/logbook/entries?page=' + _page + '&per_page=' + _perPage
-                   + '&search=' + encodeURIComponent(search)
-                   + '&direction=' + encodeURIComponent(dir)
-                   + '&aprs_type=' + encodeURIComponent(type);
-        fetch(url).then(function(r){
-            if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
-            return r.json();
-        }).then(function(d) {
-            _total = d.total || 0;
-            _render(d.entries || []);
-            _updatePager();
-            // Compteur label
-            var lbl = document.getElementById('lb-count-label');
-            if (lbl) lbl.textContent = _total + ' entrée(s)';
-        }).catch(function(err){
-            var tbody = document.getElementById('lb-tbody');
-            if (tbody) tbody.innerHTML = '<tr><td colspan="10" style="padding:2rem;text-align:center;'
-                + 'color:#ef4444;font-family:monospace;font-size:11px">'
-                + '❌ Erreur chargement carnet : ' + err + '<br>'
-                + '<span style=\'color:#64748b\'>Vérifiez que le serveur Flask tourne correctement.</span>'
-                + '</td></tr>';
-            console.error('[logbook] _load error:', err);
-        });
-    }
-
-    function _render(entries) {
-        var tbody = document.getElementById('lb-tbody');
-        if (!tbody) return;
-        if (!entries.length) {
-            tbody.innerHTML = '<tr><td colspan="10" style="padding:3rem;text-align:center;color:#475569;font-style:italic">Aucune entrée dans le carnet</td></tr>';
-            return;
-        }
-        tbody.innerHTML = entries.map(function(e, i) {
-            var rowBg = i % 2 === 0 ? '' : 'background:rgba(15,23,42,0.3)';
-            var tsShort = (e.ts || '').substring(0, 16);
-            return '<tr style="border-bottom:1px solid #0f172a;' + rowBg + '" id="lb-row-' + e.id + '">'
-                // Date/Heure
-                + '<td style="padding:6px 12px;white-space:nowrap;color:#64748b;font-size:10px">' + _e(tsShort) + '</td>'
-                // Direction
-                + '<td style="padding:6px 8px">' + _dirBadge(e.direction) + '</td>'
-                // Callsign
-                + '<td style="padding:6px 8px">'
-                +   (e.callsign && e.callsign !== 'APRS' && e.callsign !== '?'
-                        ? '<a href="https://www.qrz.com/db/' + encodeURIComponent(e.callsign.split('-')[0]) + '" target="_blank" style="color:#60a5fa;font-weight:700;font-family:monospace;font-size:11px" onclick="event.stopPropagation()">' + _e(e.callsign) + '</a>'
-                        : '<span style="color:#475569">' + _e(e.callsign||'?') + '</span>')
-                + '</td>'
-                // Dest
-                + '<td style="padding:6px 8px;color:#94a3b8;font-size:10px">' + _e(e.dest||'') + '</td>'
-                // Type
-                + '<td style="padding:6px 8px">' + _typeBadge(e.aprs_type) + '</td>'
-                // Commentaire
-                + '<td style="padding:6px 8px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd5e1;font-size:10px" title="' + _e(e.comment||'') + '">'
-                +   _e((e.comment||'').substring(0,60)) + '</td>'
-                // Pos
-                + '<td style="padding:6px 8px">' + _posCell(e) + '</td>'
-                // Source
-                + '<td style="padding:6px 8px">' + _srcBadge(e.source) + '</td>'
-                // Note (éditable)
-                + '<td style="padding:4px 6px;min-width:120px">'
-                +   '<input type="text" value="' + _e(e.note||'') + '" placeholder="Note..." maxlength="200"'
-                +   ' style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:3px 8px;color:#94a3b8;font-size:10px;width:100%;outline:none"'
-                +   ' onblur="lbSaveNote(' + e.id + ', this.value)"'
-                +   ' onkeydown="if(event.key===\'Enter\') this.blur()">'
-                + '</td>'
-                // Actions
-                + '<td style="padding:4px 8px;text-align:center">'
-                +   '<button onclick="lbDelete(' + e.id + ')" title="Supprimer" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:13px;padding:2px 5px" '
-                +   'class="hover:opacity-70 transition-opacity">🗑</button>'
-                + '</td>'
-                + '</tr>';
-        }).join('');
-    }
-
-    function _updatePager() {
-        var pages = Math.max(1, Math.ceil(_total / _perPage));
-        var info  = document.getElementById('lb-page-info');
-        var prev  = document.getElementById('lb-prev');
-        var next  = document.getElementById('lb-next');
-        if (info) info.textContent = 'Page ' + _page + ' / ' + pages + ' (' + _total + ')';
-        if (prev) prev.disabled = (_page <= 1);
-        if (next) next.disabled = (_page >= pages);
-    }
-
-    function lbPrevPage() { if (_page > 1) { _page--; _load(); } }
-    function lbNextPage() {
-        var pages = Math.ceil(_total / _perPage);
-        if (_page < pages) { _page++; _load(); }
-    }
-
-    // ── Actions ───────────────────────────────────────────────────────────────
-    function lbSaveNote(id, note) {
-        fetch('/logbook/note', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({id: id, note: note})
-        }).catch(function(err){ console.error('[logbook] saveNote error:', err); });
-    }
-
-    function lbDelete(id) {
-        if (!confirm('Supprimer cette entrée du carnet ?')) return;
-        fetch('/logbook/delete', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({id: id})
-        }).then(function(){ _load(); _loadStats(); }).catch(function(){});
-    }
-
-    function lbClearAll() {
-        if (!confirm('Vider tout le carnet de trafic ? Cette action est irréversible.')) return;
-        fetch('/logbook/clear', {method:'POST'}).then(function(){ _load(); _loadStats(); }).catch(function(){});
-    }
-
-    // ── Export ────────────────────────────────────────────────────────────────
-    function lbExport(fmt) {
-        var search = (document.getElementById('lb-search')||{}).value || '';
-        var dir    = (document.getElementById('lb-dir')||{}).value || '';
-        var type   = (document.getElementById('lb-type')||{}).value || '';
-        var url    = '/logbook/export/' + fmt
-                   + '?search=' + encodeURIComponent(search)
-                   + '&direction=' + encodeURIComponent(dir)
-                   + '&aprs_type=' + encodeURIComponent(type);
-        window.open(url, '_blank');
-    }
-
-    // ── Import ────────────────────────────────────────────────────────────────
-    function lbImport(input) {
-        var file = input.files[0];
-        if (!file) return;
-        var fd = new FormData();
-        fd.append('file', file);
-        fetch('/logbook/import', {method:'POST', body: fd})
-            .then(function(r){ return r.json(); })
-            .then(function(d) {
-                if (d.error) { alert('Erreur import : ' + d.error); return; }
-                alert('✅ ' + d.imported + ' entrée(s) importée(s).');
-                _load(); _loadStats();
-            })
-            .catch(function(){ alert('Erreur réseau lors de l\'import.'); });
-        input.value = '';
-    }
-
-    // ── Statistiques rapides ──────────────────────────────────────────────────
-    function _loadStats() {
-        fetch('/logbook/stats').then(function(r){
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.json();
-        }).then(function(d) {
-            function _s(id, v){ var e=document.getElementById(id); if(e) e.textContent=v; }
-            _s('lb-stat-total', d.total  || 0);
-            _s('lb-stat-rx',    d.rx     || 0);
-            _s('lb-stat-tx',    d.tx     || 0);
-            _s('lb-stat-calls', d.unique_calls || 0);
-        }).catch(function(err){ console.error('[logbook] stats error:', err); });
-    }
-
-    // ── Auto-refresh quand l'onglet devient actif ──────────────────────────
-    document.addEventListener('aprs-switchtab', function(ev) {
-        if (ev.detail === 'logbook') {
-            _load();
-            _loadStats();
-        }
-    });
-
-    // ── Mise à jour des stats quand une nouvelle trame arrive (SSE) ──────────
-    document.addEventListener('aprs-frame', function() {
-        // Refresh stats uniquement si l'onglet est actif (pas de spam)
-        var tab = document.getElementById('tab-logbook');
-        if (tab && !tab.classList.contains('hidden')) {
-            clearTimeout(_debounceTimer);
-            _debounceTimer = setTimeout(function() { _load(); _loadStats(); }, 1500);
-        }
-    });
-
-    // Chargement initial : stats + entrées du carnet
-    _loadStats();
-    _load();
-})();
-</script>
 
 <script>
 // ══════════════════════════════════════════════════════════════════════════════
-// 🌊 WAVELOG — JavaScript
-// ══════════════════════════════════════════════════════════════════════════════
-(function() {
-    function _updateWavelogStatus() {
-        fetch('/wavelog/status').then(function(r){ return r.json(); }).then(function(d) {
-            var dot    = document.getElementById('wavelog-dot');
-            var txt    = document.getElementById('wavelog-status-txt');
-            var synced = document.getElementById('wavelog-synced');
-            var lastSy = document.getElementById('wavelog-last-sync');
-            if (!dot) return;
-            if (!d.enabled) {
-                dot.style.background = '#334155'; dot.style.boxShadow = 'none';
-                if (txt) txt.textContent = 'Désactivé';
-            } else if (d.connected) {
-                dot.style.background = '#06b6d4'; dot.style.boxShadow = '0 0 6px #06b6d488';
-                if (txt) txt.textContent = d.status || 'Connecté';
-            } else {
-                dot.style.background = '#f59e0b'; dot.style.boxShadow = '0 0 5px #f59e0b88';
-                if (txt) txt.textContent = d.status || 'Déconnecté';
-            }
-            if (synced) synced.textContent = d.synced_total || 0;
-            if (lastSy) lastSy.textContent = d.last_sync || '–';
-        }).catch(function(){});
-    }
-    setInterval(_updateWavelogStatus, 6000);
-    _updateWavelogStatus();
-
-    window.wavelogTestConn = async function() {
-        var btn = document.getElementById('wavelog-test-btn');
-        var orig = btn ? btn.textContent : '';
-        if (btn) { btn.textContent = '⏳ Test...'; btn.disabled = true; }
-        var url = (document.getElementById('wavelog_url')||{}).value || '';
-        var key = (document.getElementById('wavelog_api_key')||{}).value || '';
-        if (!url || !key) {
-            if (btn) { btn.textContent = '⚠️ URL et clé requises';
-                setTimeout(function(){ btn.textContent = orig; btn.disabled = false; }, 3000); }
-            return;
-        }
-        try {
-            await fetch('/update_config', {
-                method:'POST', headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({wavelog:{url:url.trim(),api_key:key.trim(),
-                    enabled:false,station_id:1,sync_interval:5,sync_rx:true,
-                    sync_tx:true,only_qso:true,last_sync_id:0}})
-            });
-        } catch(_){}
-        try {
-            var r = await fetch('/wavelog/test', {method:'POST'});
-            var d = await r.json();
-            if (d.ok) {
-                var sn = (d.info && !Array.isArray(d.info)) ? (d.info.station_name||d.info.callsign||'') : '';
-                if (btn) btn.textContent = '✅ ' + (sn || 'Connexion OK');
-            } else {
-                if (btn) btn.textContent = '❌ ' + (d.message||'Échec');
-            }
-        } catch(e) { if (btn) btn.textContent = '❌ Erreur réseau'; }
-        setTimeout(function(){ if(btn){btn.textContent=orig;btn.disabled=false;} }, 4000);
-    };
-
-    window.wavelogSyncNow = async function() {
-        var btn = document.getElementById('wavelog-sync-btn');
-        var orig = btn ? btn.textContent : '';
-        if (btn) { btn.textContent = '⏳ Synchronisation...'; btn.disabled = true; }
-        try {
-            var r = await fetch('/wavelog/sync_now', {method:'POST'});
-            var d = await r.json();
-            if (btn) btn.textContent = d.ok
-                ? '✅ ' + (d.pushed||0) + ' QSO envoyé(s)'
-                : '❌ ' + (d.error||'Échec');
-            _updateWavelogStatus();
-        } catch(e) { if (btn) btn.textContent = '❌ Erreur réseau'; }
-        setTimeout(function(){ if(btn){btn.textContent=orig;btn.disabled=false;} }, 4000);
-    };
-
-    window.wavelogResetSync = async function() {
-        if (!confirm('Réinitialiser le curseur de synchro ?\nTous les QSO du carnet seront re-synchronisés lors de la prochaine synchro.')) return;
-        try {
-            await fetch('/wavelog/reset_sync', {method:'POST'});
-            _updateWavelogStatus();
-        } catch(e) { alert('Erreur : ' + e); }
-    };
-})();
 </script>
 
 </body>
@@ -5541,11 +5476,13 @@ if ('serviceWorker' in navigator && typeof Notification !== 'undefined' && Notif
 # ── Routes Flask ─────────────────────────────────────────────────────────────
 
 @app.route('/send_beacon', methods=['POST'])
+@_login_required
 def send_beacon():
     _do_send_beacon()
     return jsonify({"status": "queued"})
 
 @app.route('/send_weather', methods=['POST'])
+@_login_required
 def send_weather():
     """Récupère la météo Open-Meteo et émet un beacon APRS météo (@…_)."""
     result = _do_send_weather()
@@ -5554,6 +5491,7 @@ def send_weather():
     return jsonify(result)
 
 @app.route('/send_propagation', methods=['POST'])
+@_login_required
 def send_propagation():
     """Récupère les indices NOAA et émet un beacon APRS propagation (>SFI:… A:… K:…)."""
     result = _do_send_propagation()
@@ -5562,6 +5500,7 @@ def send_propagation():
     return jsonify(result)
 
 @app.route('/send_status', methods=['POST'])
+@_login_required
 def send_status():
     data = request.json
     text = data.get('text', config_manager.data.get('station_status', ''))
@@ -5574,6 +5513,7 @@ def send_status():
         return jsonify({"status": "busy"}), 429
 
 @app.route('/send_raw', methods=['POST'])
+@_login_required
 def send_raw():
     data         = request.json or {}
     msg          = data.get('message', '').strip()
@@ -5603,7 +5543,7 @@ def send_raw():
         path      = None
         aprs_type = "Bulletin"
 
-    print("[TX] send_raw -> dest=%s payload=%s" % (dest_addr, payload[:60]))
+    logger.debug("[TX] send_raw -> dest=%s payload=%s", dest_addr, payload[:60])
     try:
         tx_queue.put_nowait({"dest": dest_addr, "payload": payload, "path": path,
                              "aprs_type": aprs_type, "extra": {"comment": msg}})
@@ -5612,6 +5552,7 @@ def send_raw():
         return jsonify({"status": "busy", "error": "File TX pleine"}), 429
 
 @app.route('/rx_test')
+@_login_required
 def rx_test():
     """
     Diagnostic complet du pipeline Dire Wolf.
@@ -5651,6 +5592,7 @@ def rx_test():
     })
 
 @app.route('/rx_diag')
+@_login_required
 def rx_diag():
     """Page de diagnostic lisible : affiche les logs Dire Wolf en clair."""
     logs = list(APRSModem.dw_log_lines)
@@ -5664,6 +5606,7 @@ def rx_diag():
 
 
 @app.route('/tx_diag')
+@_login_required
 def tx_diag():
     """
     Diagnostic TX complet accessible sur http://localhost:5001/tx_diag
@@ -5784,6 +5727,7 @@ _reload_lock  = threading.Lock()
 _reload_status = {"state": "idle", "error": ""}
 
 @app.route('/update_config', methods=['POST'])
+@_login_required
 def update_config():
     data = request.json
     def _reload():
@@ -5810,10 +5754,12 @@ def update_config():
     return jsonify({"status": "reloading"})
 
 @app.route('/config_status')
+@_login_required
 def config_status():
     return jsonify(_reload_status)
 
 @app.route('/igate_status')
+@_login_required
 def igate_status():
     return jsonify({
         "enabled":      config_manager.data.get("igate_enabled", False),
@@ -5824,6 +5770,7 @@ def igate_status():
     })
 
 @app.route('/rx_stream')
+@_login_required
 def rx_stream():
     def generate():
         local_q = queue.Queue()
@@ -5844,15 +5791,18 @@ def rx_stream():
 # ── Routes Chat ───────────────────────────────────────────────────────────────
 
 @app.route('/chat/contacts')
+@_login_required
 def chat_contacts():
     return jsonify(chat_manager.get_contacts())
 
 @app.route('/chat/history/<callsign>')
+@_login_required
 def chat_history(callsign):
     chat_manager.mark_read(callsign)
     return jsonify(chat_manager.get_history(callsign))
 
 @app.route('/chat/send', methods=['POST'])
+@_login_required
 def chat_send():
     data  = request.json
     dest  = data.get('dest', '').upper().strip()
@@ -5877,6 +5827,19 @@ listeners = []
 
 stations_positions      = {}
 stations_positions_lock = threading.Lock()
+
+# ── Traînée (breadcrumbs) pour stations mobiles et ballons ───────────────────
+# MOBILE_TRAIL_PATCH_APPLIED
+# Symboles APRS considérés comme mobiles (table primaire '/' + secondaire '\\')
+_TRAIL_SYMBOLS = frozenset({
+    '/j', '/k', '/u', '/v', '/O', '/f', '/g',   # voiture, 4x4, bus, camion, ballon, moto
+    '/[', '/X', '/Y',                             # piéton, hélico, yacht
+    '/a', '/s', '/>', '/<', '/^', '/n',           # ambulance, bateau, voiture, moto, avion, camion
+    '\\j', '\\k', '\\u', '\\v',                   # variantes table secondaire
+    '\\a', '\\s', '\\>', '\\<', '\\^',           # variantes secondaires
+    '/r',                                          # récréatif/vélo
+})
+TRAIL_MAX = 100   # nombre max de positions mémorisées par station mobile
 
 
 
@@ -5944,7 +5907,7 @@ class APRSISClient:
             self._fobj = self._sock.makefile('r', encoding='utf-8', errors='replace')
             # Lire la bannière du serveur
             banner = self._fobj.readline()
-            print("[IGATE] Connecté à %s:%d — %s" % (server, port, banner.strip()))
+            logger.info("[IGATE] Connecté à %s:%d — %s", server, port, banner.strip())
 
             # Login
             login_line = "user %s pass %s vers Py-APRS 2.0" % (callsign, passcode)
@@ -5954,7 +5917,7 @@ class APRSISClient:
 
             # Lire la réponse au login
             resp = self._fobj.readline()
-            print("[IGATE] Login réponse : %s" % resp.strip())
+            logger.debug("[IGATE] Login réponse : %s", resp.strip())
             if "unverified" in resp.lower():
                 self.status = "⚠️ Non vérifié (passcode incorrect ?)"
                 # on reste connecté en lecture seule
@@ -5969,7 +5932,7 @@ class APRSISClient:
         except Exception as e:
             self.status = "❌ Erreur : %s" % e
             self.connected = False
-            print("[IGATE] Erreur connexion : %s" % e)
+            logger.error("[IGATE] Erreur connexion : %s", e)
             return False
 
     # ── Envoi d'une ligne brute ────────────────────────────────────────────
@@ -5978,7 +5941,7 @@ class APRSISClient:
             with self._lock:
                 self._sock.sendall((line + "\r\n").encode('utf-8', errors='replace'))
         except Exception as e:
-            print("[IGATE] Erreur envoi : %s" % e)
+            logger.error("[IGATE] Erreur envoi : %s", e)
             self.connected = False
 
     # ── Gate RF → IS ───────────────────────────────────────────────────────
@@ -6017,7 +5980,7 @@ class APRSISClient:
             try:
                 line = self._fobj.readline()
                 if not line:
-                    print("[IGATE] Connexion fermée par le serveur")
+                    logger.warning("[IGATE] Connexion fermée par le serveur")
                     self.connected = False
                     break
                 line = line.strip()
@@ -6032,7 +5995,7 @@ class APRSISClient:
                     APRSModem.rx_queue.put_nowait(frame)
             except Exception as e:
                 if not self._stop.is_set():
-                    print("[IGATE] Erreur lecture : %s" % e)
+                    logger.error("[IGATE] Erreur lecture : %s", e)
                 self.connected = False
                 break
 
@@ -6069,7 +6032,7 @@ class APRSISClient:
                 self.status = "🔄 Reconnexion dans %ds" % self.RECONNECT_DELAY
 
             if not self._stop.is_set():
-                print("[IGATE] Reconnexion dans %ds…" % self.RECONNECT_DELAY)
+                logger.info("[IGATE] Reconnexion dans %ds…", self.RECONNECT_DELAY)
                 self.status = "🔄 Reconnexion dans %ds" % self.RECONNECT_DELAY
                 time.sleep(self.RECONNECT_DELAY)
 
@@ -6176,15 +6139,15 @@ def _rx_broadcaster():
                 if _body.startswith("PARM."):
                     with _telem_meta_lock:
                         _telem_meta.setdefault(_src, {})["parm"] = _parse_telem_parm(_body[5:])
-                    print("[TELEM] PARM recu de %s" % _src)
+                    logger.debug("[TELEM] PARM recu de %s", _src)
                 elif _body.startswith("UNIT."):
                     with _telem_meta_lock:
                         _telem_meta.setdefault(_src, {})["unit"] = _parse_telem_parm(_body[5:])
-                    print("[TELEM] UNIT recu de %s" % _src)
+                    logger.debug("[TELEM] UNIT recu de %s", _src)
                 elif _body.startswith("EQNS."):
                     with _telem_meta_lock:
                         _telem_meta.setdefault(_src, {})["eqns"] = _parse_telem_eqns(_body[5:])
-                    print("[TELEM] EQNS recu de %s" % _src)
+                    logger.debug("[TELEM] EQNS recu de %s", _src)
                 elif _body.startswith("BITS."):
                     parts_b = _body[5:].split(',', 9)
                     with _telem_meta_lock:
@@ -6192,7 +6155,7 @@ def _rx_broadcaster():
                         meta["bits_mask"]  = parts_b[0].strip() if parts_b else ""
                         meta["bits_label"] = parts_b[1].strip() if len(parts_b) > 1 else ""
                         meta["bits_names"] = [p.strip() for p in parts_b[2:10]]
-                    print("[TELEM] BITS recu de %s" % _src)
+                    logger.debug("[TELEM] BITS recu de %s", _src)
 
             # ── Enrichissement des trames Télémétrie avec PARM/UNIT/EQNS ────
             if frame.get("aprs_type") == "Telemetrie":
@@ -6240,12 +6203,23 @@ def _rx_broadcaster():
                 ackto = extra.get("msg_ackno")
 
                 if extra.get("msg_ack") and ackto:
-                    chat_manager.mark_ack(ackto)
-                    print("[MSG] ACK recu pour msgno=%s de %s" % (ackto, src))
+                    found_dest, found_msgno = chat_manager.mark_ack(ackto)
+                    logger.info("[MSG] ACK recu pour msgno=%s de %s", ackto, src)
+                    if found_dest:
+                        # Diffuser l'event ack au frontend pour mise à jour live de la bulle TX
+                        ack_event = {
+                            "type":   "msg_ack",
+                            "msgno":  found_msgno,
+                            "dest":   found_dest,
+                            "src":    src,
+                        }
+                        for _q in list(listeners):
+                            try: _q.put_nowait(ack_event)
+                            except queue.Full: pass
                 elif dest and dest in my_calls():
                     chat_manager.add_incoming(src, text, msgno)
                     frame["_chat"] = True
-                    print("[MSG] Message recu de %s : %s (msgno=%s)" % (src, text[:40], msgno))
+                    logger.info("[MSG] Message recu de %s : %s (msgno=%s)", src, text[:40], msgno)
                     if msgno:
                         ack_payload = ":" + src.ljust(9) + ":ack" + msgno
                         try:
@@ -6253,9 +6227,9 @@ def _rx_broadcaster():
                                 "dest": "APRS", "payload": ack_payload, "path": None,
                                 "aprs_type": "ACK", "extra": {"comment": "ack" + msgno}
                             })
-                            print("[MSG] ACK envoye : ack%s -> %s" % (msgno, src))
+                            logger.debug("[MSG] ACK envoye : ack%s -> %s", msgno, src)
                         except Exception as e:
-                            print("[MSG] Erreur envoi ACK : %s" % e)
+                            logger.error("[MSG] Erreur envoi ACK : %s", e)
 
             # ── iGate : forward RF → APRS-IS ─────────────────────────────
             if (config_manager.data.get("igate_enabled") and
@@ -6278,22 +6252,39 @@ def _rx_broadcaster():
                 # Marquer l'activité pour la jauge
                 if frame.get("type") != "tx_event":
                     _rx_activity_ts[0] = time.time()
-                # ── Enregistrement carnet de trafic ──────────────────────────
-                _direction = "TX" if frame.get("type") == "tx_event" else "RX"
-                if frame.get("aprs_type") not in (None, "ACK", ""):
-                    try:
-                        logbook.add(frame, direction=_direction)
-                    except Exception as _le:
-                        pass
-
             # ── Mise à jour positions stations ──────────────────────────
             _e = frame.get("extra", {})
             if _e.get("lat") is not None and frame.get("type") not in ("tx_event", "rx_level"):
-                _cs = frame.get("src", "").upper().strip().split(",")[0]
+                _cs  = frame.get("src", "").upper().strip().split(",")[0]
+                _lat = _e["lat"];  _lon = _e["lon"];  _now = time.time()
+                # Détecter si c'est une station mobile/ballon (table+code symbol)
+                _sym = (_e.get("symbol_table", "") + _e.get("symbol_code", "")).lower()
+                _mobile = _sym in _TRAIL_SYMBOLS or bool(_re.search(r'[/\\][jkuvoOXY\[]', _sym))
                 with stations_positions_lock:
-                    stations_positions[_cs] = {"lat": _e["lat"], "lon": _e["lon"], "ts": time.time()}
+                    _prev = stations_positions.get(_cs, {})
+                    _trail = list(_prev.get("trail", []))
+                    if _mobile:
+                        # N'ajouter un point que si la position a réellement changé
+                        _spd = _e.get("speed_kmh", -1)
+                        _crs = _e.get("course", -1)
+                        if _spd is None: _spd = -1
+                        if _crs is None: _crs = -1
+                        if _trail:
+                            _last = _trail[-1]
+                            if abs(_last[0] - _lat) > 1e-5 or abs(_last[1] - _lon) > 1e-5:
+                                _trail.append((_lat, _lon, _now, _spd, _crs))
+                        else:
+                            _trail.append((_lat, _lon, _now, _spd, _crs))
+                        if len(_trail) > TRAIL_MAX:
+                            _trail = _trail[-TRAIL_MAX:]
+                    stations_positions[_cs] = {
+                        "lat": _lat, "lon": _lon, "ts": _now,
+                        "trail": _trail,
+                        "mobile": _mobile,
+                    }
 
-            # Diffuser à tous les clients SSE
+            # ── Carnet de trafic : enregistrement automatique ─────────────
+# Diffuser à tous les clients SSE
             for q in list(listeners):
                 try:
                     q.put_nowait(frame)
@@ -6319,6 +6310,7 @@ igate_client.start()   # démarre le manager iGate (se connecte si igate_enabled
 
 
 @app.route('/rx_history')
+@_login_required
 def rx_history_route():
     """Retourne les dernières trames reçues (max RX_HISTORY_MAX).
     Le frontend l'appelle au chargement pour restaurer l'affichage après un F5."""
@@ -6357,12 +6349,15 @@ def _tx_worker():
             modem.send_packet(job["dest"], job["payload"], job.get("path"))
         except Exception as e:
             APRSModem.tx_last_error = str(e)
-            print("[TX WORKER] ERREUR : %s" % e)
+            logger.error("[TX WORKER] ERREUR : %s", e)
             import traceback; traceback.print_exc()
         finally:
             tx_queue.task_done()
 
 threading.Thread(target=_tx_worker, daemon=True, name="tx-worker").start()
+
+# ── Démarrage du thread de retry ACK (après tx_queue et listeners) ────────────
+threading.Thread(target=_ack_retry_worker, daemon=True, name="ack-retry").start()
 
 # ── Beacon automatique ────────────────────────────────────────────────────────
 
@@ -6389,19 +6384,19 @@ def _make_beacon_worker(btype):
             "meteo":       _do_send_weather,
             "propagation": _do_send_propagation,
         }
-        print("[BCN] Thread démarré pour type=%s" % btype)
+        logger.info("[BCN] Thread démarré pour type=%s", btype)
         while True:
             schedules = config_manager.data.get('beacon_schedules', {})
             interval  = schedules.get(btype, 0)
             if interval and interval > 0:
                 # Émettre
-                print("[BCN] Émission type=%s interval=%d min" % (btype, interval))
+                logger.info("[BCN] Émission type=%s interval=%d min", btype, interval)
                 fn = _dispatch.get(btype)
                 if fn:
                     try:
                         fn()
                     except Exception as e:
-                        print("[BCN] Erreur type=%s : %s" % (btype, e))
+                        logger.error("[BCN] Erreur type=%s : %s", btype, e)
                 next_at = time.time() + interval * 60
                 with _beacon_workers_lock:
                     if btype in _beacon_workers:
@@ -6412,7 +6407,7 @@ def _make_beacon_worker(btype):
                     time.sleep(5)
                     new_interval = config_manager.data.get('beacon_schedules', {}).get(btype, 0)
                     if new_interval != interval:
-                        print("[BCN] Config changée type=%s (%d→%d) — redémarrage" % (btype, interval, new_interval))
+                        logger.info("[BCN] Config changée type=%s (%d→%d) — redémarrage", btype, interval, new_interval)
                         break
                 with _beacon_workers_lock:
                     if btype in _beacon_workers:
@@ -6503,9 +6498,9 @@ def _do_send_beacon():
     try:
         tx_queue.put_nowait({"dest": "APRS", "payload": payload, "path": None,
                              "aprs_type": "Beacon", "extra": {"comment": comment}})
-        print("[TX] Beacon queued : %s" % payload[:60])
+        logger.debug("[TX] Beacon queued : %s", payload[:60])
     except Exception as e:
-        print("[TX] Beacon queue erreur : %s" % e)
+        logger.error("[TX] Beacon queue erreur : %s", e)
 
 
 def _grid_to_latlon(grid):
@@ -6545,7 +6540,7 @@ def _fetch_openmeteo(lat, lon):
         "&timezone=auto"
     ) % (lat, lon)
 
-    print("[WX] Requete Open-Meteo : lat=%.4f lon=%.4f" % (lat, lon))
+    logger.debug("[WX] Requete Open-Meteo : lat=%.4f lon=%.4f", lat, lon)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "aprs_direwolf/1.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -6575,7 +6570,7 @@ def _fetch_openmeteo(lat, lon):
             "wmo_code":     code,
         }
     except Exception as e:
-        print("[WX] Erreur Open-Meteo : %s" % e)
+        logger.error("[WX] Erreur Open-Meteo : %s", e)
         return None
 
 
@@ -6606,11 +6601,11 @@ def _fetch_solar_indices():
             if isinstance(last, dict):
                 if last.get("Kp")        is not None: result["k_index"] = float(last["Kp"])
                 if last.get("a_running") is not None: result["a_index"] = float(last["a_running"])
-                print("[PROP] Kp=%.2f A=%.0f (%s)" % (
+                logger.debug("[PROP] Kp=%.2f A=%.0f (%s)",
                     result.get("k_index", 0), result.get("a_index", 0),
-                    last.get("time_tag", "?")))
+                    last.get("time_tag", "?"))
     except Exception as e:
-        print("[PROP] Erreur Kp NOAA : %s" % e)
+        logger.error("[PROP] Erreur Kp NOAA : %s", e)
 
     # ── SFI (F10.7 cm flux) ───────────────────────────────────────────────────
     url_sfi = "https://services.swpc.noaa.gov/json/f107_cm_flux.json"
@@ -6626,10 +6621,10 @@ def _fetch_solar_indices():
                     v = entry.get("f107")
                 if v is not None:
                     result["sfi"] = float(v)
-                    print("[PROP] SFI=%.0f (%s)" % (result["sfi"], entry.get("time_tag", "?")))
+                    logger.debug("[PROP] SFI=%.0f (%s)", result["sfi"], entry.get("time_tag", "?"))
                     break
     except Exception as e:
-        print("[PROP] Erreur SFI NOAA : %s" % e)
+        logger.error("[PROP] Erreur SFI NOAA : %s", e)
 
     sfi = result.get("sfi")
     k   = result.get("k_index")
@@ -6659,12 +6654,12 @@ def _fetch_solar_indices():
     result["vhf_cond"] = vhf_conditions(k)
     result["aurora"]   = (k is not None and k >= 5)
 
-    print("[PROP] SFI=%s A=%s K=%s HF=%s VHF=%s" % (
+    logger.info("[PROP] SFI=%s A=%s K=%s HF=%s VHF=%s",
         ("%.0f" % sfi) if sfi else "?",
         ("%.0f" % a)   if a   else "?",
         ("%.1f" % k)   if k   else "?",
         result["hf_cond"], result["vhf_cond"]
-    ))
+    )
     return result
 
 
@@ -6706,7 +6701,7 @@ def _do_send_propagation():
                 "comment":  payload[1:],
             }
         })
-        print("[PROP] Beacon propagation queued : %s" % payload)
+        logger.debug("[PROP] Beacon propagation queued : %s", payload)
         return {"status": "queued", "payload": payload, "data": data}
     except queue.Full:
         return {"error": "File TX pleine"}
@@ -6730,9 +6725,9 @@ def _do_send_iss_beacon():
             "aprs_type": "Beacon ISS",
             "extra":     {"comment": info}
         })
-        print("[TX] Beacon ISS queued : %s" % payload[:60])
+        logger.debug("[TX] Beacon ISS queued : %s", payload[:60])
     except Exception as e:
-        print("[TX] Beacon ISS erreur : %s" % e)
+        logger.error("[TX] Beacon ISS erreur : %s", e)
 
 
 def _do_send_weather():
@@ -6752,14 +6747,14 @@ def _do_send_weather():
         except (ValueError, TypeError):
             lat = lon = None
         if lat is None or lon is None:
-            print("[WX] Coordonnées manuelles absentes ou invalides — beacon météo annulé")
+            logger.warning("[WX] Coordonnées manuelles absentes ou invalides — beacon météo annulé")
             return {"error": "Latitude et longitude requises dans les réglages"}
     else:
         # ── Mode Locator Maidenhead (défaut) ──────────────────────────────────
         grid = cfg.get('maidenhead', '')
         lat, lon = _grid_to_latlon(grid)
         if lat is None:
-            print("[WX] Locator Maidenhead absent ou invalide — beacon météo annulé")
+            logger.warning("[WX] Locator Maidenhead absent ou invalide — beacon météo annulé")
             return {"error": "Locator Maidenhead requis dans les réglages"}
 
     wx = _fetch_openmeteo(lat, lon)
@@ -6846,7 +6841,7 @@ def _do_send_weather():
            wx["pressure_hpa"], wx["description"])
     )
 
-    print("[WX] Payload : %s" % payload[:80])
+    logger.debug("[WX] Payload : %s", payload[:80])
     try:
         tx_queue.put_nowait({
             "dest":      "APRS",
@@ -6872,6 +6867,7 @@ threading.Thread(target=_beacon_scheduler, daemon=True, name="beacon-supervisor"
 
 
 @app.route('/version')
+@_login_required
 def get_version():
     import json as _j
     return _j.dumps({
@@ -6881,13 +6877,35 @@ def get_version():
     }), 200, {'Content-Type': 'application/json'}
 
 @app.route('/known_callsigns')
+@_login_required
 def known_callsigns():
     """Retourne la liste des indicatifs dont la position a été reçue depuis le démarrage."""
     with stations_positions_lock:
         cs_list = sorted(stations_positions.keys())
     return jsonify(cs_list)
 
+@app.route('/map_trails')
+@_login_required
+def map_trails():
+    """Retourne les traînées (breadcrumbs) des stations mobiles.
+    Format : { "F4XXX-9": {"lat":..,"lon":..,"mobile":true,"trail":[[lat,lon,ts],..]}, … }
+    """
+    with stations_positions_lock:
+        data = {
+            cs: {
+                "lat":    pos["lat"],
+                "lon":    pos["lon"],
+                "mobile": pos.get("mobile", False),
+                "trail":  pos.get("trail", []),
+            }
+            for cs, pos in stations_positions.items()
+            if pos.get("mobile") and pos.get("trail")
+        }
+    import json as _j
+    return _j.dumps(data), 200, {'Content-Type': 'application/json'}
+
 @app.route('/beacon_status')
+@_login_required
 def beacon_status():
     """Retourne l'état de chaque type de balise : interval + next_in."""
     _ALL_TYPES = ["station", "iss", "meteo", "propagation"]
@@ -6903,6 +6921,7 @@ def beacon_status():
     return jsonify({"schedules": result})
 
 @app.route('/vhf_propagation')
+@_login_required
 def vhf_propagation():
     """
     Proxy serveur pour les indices NOAA SWPC.
@@ -6915,9 +6934,107 @@ def vhf_propagation():
     return _j.dumps(data), 200, {'Content-Type': 'application/json'}
 
 
+# ── Alerte propagation VHF ────────────────────────────────────────────────────
+_vhf_alert_state = {
+    "kp_prev":   None,   # dernier Kp connu
+    "es_prev":   False,  # Es actif au dernier poll
+}
+
+@app.route('/vhf_alert_check')
+@_login_required
+def vhf_alert_check():
+    """
+    Vérifie si les conditions VHF ont changé de façon favorable depuis
+    le dernier appel. Retourne les alertes à déclencher.
+    Réponse : {alerts: [{type, label, detail, level}], kp, sfi, a, es, score}
+    """
+    import json as _j
+    from datetime import datetime
+
+    data   = _fetch_solar_indices()
+    kp     = data.get("k_index")
+    sfi    = data.get("sfi")
+    a      = data.get("a_index")
+    aurora = data.get("aurora", False)
+
+    month  = datetime.utcnow().month
+    es_season = 4 <= month <= 9
+    es     = es_season and (kp is None or kp <= 3)
+
+    # Score VHF global (même logique que le JS)
+    score = 50
+    if sfi is not None: score += min(25, max(-10, (sfi - 100) * 0.25))
+    if kp  is not None: score += 10 if kp<=2 else 0 if kp<=4 else -15 if kp<=6 else -30
+    if a   is not None: score += 5  if a<=7  else -5 if a<=20 else -20
+    if es:              score += 15
+    score = max(0, min(100, round(score)))
+
+    prev_kp = _vhf_alert_state["kp_prev"]
+    prev_es = _vhf_alert_state["es_prev"]
+
+    alerts = []
+
+    # Kp vient de descendre sous 2 (favorable) depuis une valeur plus haute
+    if kp is not None and kp <= 2:
+        if prev_kp is None or prev_kp > 2:
+            alerts.append({
+                "type":   "kp_drop",
+                "level":  "good",
+                "label":  "Kp favorable",
+                "detail": "Kp %.1f — conditions VHF/UHF calmes, bonne propagation tropo" % kp,
+            })
+
+    # Kp monte au-dessus de 5 → aurora possible (ouverture exceptional VHF)
+    if kp is not None and kp >= 5:
+        if prev_kp is None or prev_kp < 5:
+            alerts.append({
+                "type":   "aurora",
+                "level":  "special",
+                "label":  "Aurora possible",
+                "detail": "Kp %.1f — ouverture aurora VHF 144 MHz possible !" % kp,
+            })
+
+    # Es (Sporadic-E) vient d'apparaître
+    if es and not prev_es:
+        alerts.append({
+            "type":   "es_open",
+            "level":  "special",
+            "label":  "Sporadic-E détecté",
+            "detail": "Saison Es active, Kp %.1f — ouvertures 6m/2m possibles" % (kp or 0),
+        })
+
+    # Score VHF global vient de dépasser 70
+    if score >= 70 and prev_kp is not None:
+        prev_score = 50
+        if prev_kp is not None:
+            prev_score += 10 if prev_kp<=2 else 0 if prev_kp<=4 else -15 if prev_kp<=6 else -30
+        if prev_score < 70 and not any(a["type"] == "kp_drop" for a in alerts):
+            alerts.append({
+                "type":   "score_up",
+                "level":  "good",
+                "label":  "Conditions VHF améliorées",
+                "detail": "Score VHF %d/100 — bonne fenêtre de propagation" % score,
+            })
+
+    # Mettre à jour l'état
+    _vhf_alert_state["kp_prev"] = kp
+    _vhf_alert_state["es_prev"] = es
+
+    return _j.dumps({
+        "alerts": alerts,
+        "kp":     kp,
+        "sfi":    sfi,
+        "a":      a,
+        "es":     es,
+        "score":  score,
+        "aurora": aurora,
+    }), 200, {'Content-Type': 'application/json'}
+
+
 STATS_FILE = 'stats.json'
 
 @app.route('/stats/load')
+@_login_required
 def stats_load():
     """Charge l'historique des statistiques depuis stats.json."""
     import json as _j
@@ -6931,6 +7048,7 @@ def stats_load():
 
 
 @app.route('/stats/save', methods=['POST'])
+@_login_required
 def stats_save():
     """Persiste l'historique des statistiques dans stats.json."""
     import json as _j
@@ -6941,40 +7059,6 @@ def stats_save():
         return _j.dumps({'ok': True}), 200, {'Content-Type': 'application/json'}
     except Exception as e:
         return _j.dumps({'ok': False, 'error': str(e)}), 500, {'Content-Type': 'application/json'}
-
-
-@app.route('/sw.js')
-def service_worker():
-    """Service Worker minimal pour les Web Push Notifications (pas de VAPID)."""
-    sw_code = r"""
-self.addEventListener('push', function(event) {
-    var data = {};
-    try { data = event.data.json(); } catch(e) { data = {title: 'Py-APRS', body: event.data ? event.data.text() : ''}; }
-    event.waitUntil(
-        self.registration.showNotification(data.title || 'Py-APRS', {
-            body:  data.body  || '',
-            icon:  data.icon  || '/favicon.ico',
-            tag:   data.tag   || 'aprs',
-            renotify: true,
-            requireInteraction: false
-        })
-    );
-});
-
-self.addEventListener('notificationclick', function(event) {
-    event.notification.close();
-    event.waitUntil(clients.matchAll({type:'window'}).then(function(cs) {
-        if (cs.length) { cs[0].focus(); } else { clients.openWindow('/'); }
-    }));
-});
-
-/* Activation immédiate */
-self.addEventListener('install',  function(e) { self.skipWaiting(); });
-self.addEventListener('activate', function(e) { e.waitUntil(self.clients.claim()); });
-"""
-    from flask import Response as _Resp
-    return _Resp(sw_code, mimetype='application/javascript',
-                 headers={'Service-Worker-Allowed': '/'})
 
 
 
@@ -7001,34 +7085,372 @@ def _grid_to_latlon_prox(grid):
 
 _iss_alerted_passes = set()   # risetime déjà alertés
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SGP4 simplifié — calcul des passages ISS (stdlib pure, sans open-notify.org)
+# Précision orbitale : ±5 km / ±30 s  — suffisant pour planifier l'écoute APRS
+# Sources TLE : CelesTrak GP (primaire) → CelesTrak stations (fallback)
+#               → cache disque .iss_tle_cache (survit aux coupures réseau)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import math   as _math
+import struct as _struct   # noqa — utilisé par _tle_checksum
+
+_SGP4_DEG2RAD = _math.pi / 180
+_SGP4_TWOPI   = 2 * _math.pi
+_SGP4_EARTH_R = 6378.137      # km — rayon équatorial WGS84
+_SGP4_MU      = 398600.4418   # km³/s²
+_SGP4_J2      = 1.08262668e-3
+_SGP4_TLE_CACHE = ".iss_tle_cache"
+
+# URLs de récupération TLE — tentées dans l'ordre
+_SGP4_TLE_SOURCES = [
+    # CelesTrak GP (nouveau format — 2024+)
+    "https://celestrak.org/SATCAT/gp.php?CATNR=25544&FORMAT=TLE",
+    # CelesTrak groupe stations (filtre ISS parmi les autres)
+    "https://celestrak.org/satcat/elements/gp.php?GROUP=stations&FORMAT=TLE",
+    # Heavens-Above (texte brut)
+    "https://www.heavens-above.com/tle.aspx?satid=25544",
+    # Satnogs (JSON → on extrait les lignes)
+    "https://db.satnogs.org/api/tle/?norad_cat_id=25544&format=json",
+]
+
+# TLE de secours embarqué — mis à jour lors des releases, valide ~30 jours
+_SGP4_FALLBACK_TLE = (
+    "1 25544U 98067A   26145.50000000  .00016717  00000-0  10270-3 0  9999",
+    "2 25544  51.6416 247.4627 0006703 130.5360 325.0288 15.50372314441433",
+)
+
+# Cache mémoire du TLE courant : (line1, line2, fetch_ts)
+_iss_tle_memory = [None, None, 0.0]
+_ISS_TLE_TTL    = 3600 * 6   # recharge les TLE toutes les 6h
+
+
+def _sgp4_tle_exp(s):
+    """Décode la notation exposant compacte TLE : '-11606-4' → -1.1606e-5."""
+    s = s.strip()
+    if not s or set(s) <= {'0', '+', '-', ' '}:
+        return 0.0
+    try:
+        sign = -1 if s[0] == '-' else 1
+        body = s[1:] if s[0] in ('+', '-') else s
+        mantissa = body[:-2].replace(' ', '')
+        exp_s    = body[-2:]
+        return sign * float("0." + mantissa) * 10 ** int(exp_s)
+    except Exception:
+        return 0.0
+
+
+def _sgp4_parse_tle(line1, line2):
+    """Parse deux lignes TLE → dict orbital."""
+    import datetime as _dt_sgp4
+    yy  = int(line1[18:20])
+    yr  = 2000 + yy if yy < 57 else 1900 + yy
+    doy = float(line1[20:32])
+    epoch = (_dt_sgp4.datetime(yr, 1, 1, tzinfo=_dt_sgp4.timezone.utc)
+             + _dt_sgp4.timedelta(days=doy - 1))
+
+    inc  = float(line2[8:16])  * _SGP4_DEG2RAD
+    raan = float(line2[17:25]) * _SGP4_DEG2RAD
+    ecc  = float("0." + line2[26:33].strip())
+    argp = float(line2[34:42]) * _SGP4_DEG2RAD
+    ma   = float(line2[43:51]) * _SGP4_DEG2RAD
+    mm   = float(line2[52:63])          # tr/jour
+    n0   = mm * _SGP4_TWOPI / 86400     # rad/s
+    a0   = (_SGP4_MU / (n0 * n0)) ** (1.0/3)
+
+    return dict(epoch=epoch, inc=inc, raan=raan, ecc=ecc,
+                argp=argp, ma=ma, n0=n0, a0=a0)
+
+
+def _sgp4_mean_to_true(ma, ecc):
+    """Résolution de l'équation de Kepler → anomalie vraie (rad)."""
+    E = ma
+    for _ in range(50):
+        dE = (ma - E + ecc * _math.sin(E)) / (1.0 - ecc * _math.cos(E))
+        E += dE
+        if abs(dE) < 1e-10:
+            break
+    ta = 2.0 * _math.atan2(
+        _math.sqrt(1 + ecc) * _math.sin(E / 2),
+        _math.sqrt(1 - ecc) * _math.cos(E / 2),
+    )
+    return ta % _SGP4_TWOPI
+
+
+def _sgp4_propagate(tle, t_unix):
+    """
+    Propagation SGP4 simplifiée (J2 uniquement).
+    Retourne (lat_deg, lon_deg, alt_km).
+    """
+    dt    = t_unix - tle["epoch"].timestamp()
+    n0    = tle["n0"]
+    a0    = tle["a0"]
+    ecc   = tle["ecc"]
+    inc   = tle["inc"]
+
+    # Précession J2
+    p        = a0 * (1 - ecc * ecc)
+    coef     = -1.5 * _SGP4_J2 * (_SGP4_EARTH_R / p) ** 2 * n0
+    raan_t   = (tle["raan"] + coef * _math.cos(inc) * dt) % _SGP4_TWOPI
+    argp_t   = (tle["argp"] + coef * (2.5 * _math.sin(inc)**2 - 2) * dt) % _SGP4_TWOPI
+    ma_t     = (tle["ma"]   + n0 * dt) % _SGP4_TWOPI
+
+    ta = _sgp4_mean_to_true(ma_t, ecc)
+    r  = a0 * (1 - ecc * ecc) / (1 + ecc * _math.cos(ta))
+    u  = argp_t + ta
+
+    # Position ECI
+    x = r * (_math.cos(raan_t) * _math.cos(u)
+              - _math.sin(raan_t) * _math.sin(u) * _math.cos(inc))
+    y = r * (_math.sin(raan_t) * _math.cos(u)
+              + _math.cos(raan_t) * _math.sin(u) * _math.cos(inc))
+    z = r *  _math.sin(inc) * _math.sin(u)
+
+    # Latitude géocentrique + altitude
+    rxy     = _math.sqrt(x*x + y*y)
+    lat_gc  = _math.atan2(z, rxy)
+    lon_eci = _math.atan2(y, x)
+    alt     = _math.sqrt(x*x + y*y + z*z) - _SGP4_EARTH_R
+
+    # GAST (temps sidéral de Greenwich)
+    jd   = 2440587.5 + t_unix / 86400.0
+    gast = _math.radians((280.46061837 + 360.98564736629 * (jd - 2451545.0)) % 360)
+
+    lon_deg = (_math.degrees(lon_eci - gast)) % 360
+    if lon_deg > 180:
+        lon_deg -= 360
+
+    return _math.degrees(lat_gc), lon_deg, alt
+
+
+def _sgp4_elevation(sat_lat, sat_lon, sat_alt, obs_lat, obs_lon):
+    """Angle d'élévation (degrés) du satellite depuis le sol observateur."""
+    slat = _math.radians(sat_lat)
+    slon = _math.radians(sat_lon)
+    olat = _math.radians(obs_lat)
+    olon = _math.radians(obs_lon)
+
+    r_sat = _SGP4_EARTH_R + sat_alt
+    sx = r_sat * _math.cos(slat) * _math.cos(slon)
+    sy = r_sat * _math.cos(slat) * _math.sin(slon)
+    sz = r_sat * _math.sin(slat)
+
+    ox = _SGP4_EARTH_R * _math.cos(olat) * _math.cos(olon)
+    oy = _SGP4_EARTH_R * _math.cos(olat) * _math.sin(olon)
+    oz = _SGP4_EARTH_R * _math.sin(olat)
+
+    dx, dy, dz = sx - ox, sy - oy, sz - oz
+    dist = _math.sqrt(dx*dx + dy*dy + dz*dz)
+    if dist < 1.0:
+        return -90.0
+
+    # Vecteur vertical local
+    ux = _math.cos(olat) * _math.cos(olon)
+    uy = _math.cos(olat) * _math.sin(olon)
+    uz = _math.sin(olat)
+
+    dot = (dx*ux + dy*uy + dz*uz) / dist
+    return _math.degrees(_math.asin(max(-1.0, min(1.0, dot))))
+
+
+def _sgp4_compute_passes(tle, obs_lat, obs_lon,
+                         n=5, horizon=0.0, hours_ahead=48):
+    """
+    Calcule les n prochains passages ISS visibles depuis (obs_lat, obs_lon).
+    horizon : élévation minimale en degrés (0 = horizon géométrique).
+    Retourne list[dict] : risetime, duration, risetime_fmt, duration_min, max_el.
+    """
+    import datetime as _dt_sgp4
+    now    = time.time()
+    t_end  = now + hours_ahead * 3600.0
+    step   = 20.0      # pas de propagation (s) — grossier pour la détection
+    passes = []
+
+    in_pass  = False
+    rise_t   = 0.0
+    max_el   = 0.0
+    t        = now
+
+    while t < t_end and len(passes) < n:
+        try:
+            lat, lon, alt = _sgp4_propagate(tle, t)
+            el = _sgp4_elevation(lat, lon, alt, obs_lat, obs_lon)
+        except Exception:
+            t += step
+            continue
+
+        if el > horizon:
+            if not in_pass:
+                in_pass = True
+                rise_t  = t
+                max_el  = el
+            else:
+                if el > max_el:
+                    max_el = el
+        else:
+            if in_pass:
+                in_pass  = False
+                set_t    = t
+
+                # Affiner le début de passage par bisection (6 itérations → ±0.3 s)
+                lo, hi = rise_t - step, rise_t
+                for _ in range(6):
+                    mid = (lo + hi) / 2.0
+                    try:
+                        lt2, ln2, al2 = _sgp4_propagate(tle, mid)
+                        em = _sgp4_elevation(lt2, ln2, al2, obs_lat, obs_lon)
+                    except Exception:
+                        break
+                    if em > horizon:
+                        hi = mid
+                    else:
+                        lo = mid
+                rise_ref = (lo + hi) / 2.0
+                duration = set_t - rise_ref
+
+                dt_obj = _dt_sgp4.datetime.fromtimestamp(rise_ref)
+                passes.append({
+                    "risetime":     int(rise_ref),
+                    "duration":     int(duration),
+                    "risetime_fmt": dt_obj.strftime("%d/%m %H:%M"),
+                    "duration_min": round(duration / 60.0, 1),
+                    "max_el":       round(max_el, 1),
+                })
+        t += step
+
+    return passes
+
+
+def _sgp4_parse_tle_text(txt):
+    """Extrait line1 + line2 ISS (NORAD 25544) depuis un bloc texte TLE brut."""
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    # Cherche d'abord la ligne TLE ISS explicite
+    for i, line in enumerate(lines):
+        if (line.startswith("1 25544") or
+                (line.startswith("1 ") and len(line) >= 69 and "25544" in line[2:8])):
+            if i + 1 < len(lines) and lines[i+1].startswith("2 25544"):
+                return line, lines[i+1]
+    # Fallback : deux lignes TLE consécutives quelconques (fichier mono-sat)
+    for i in range(len(lines) - 1):
+        if (lines[i].startswith("1 ") and lines[i+1].startswith("2 ")
+                and len(lines[i]) >= 69 and len(lines[i+1]) >= 69):
+            return lines[i], lines[i+1]
+    return None, None
+
+
+def _sgp4_parse_satnogs_json(txt):
+    """Extrait line1+line2 depuis la réponse JSON de l'API SatNOGS."""
+    import json as _jsgp4
+    try:
+        data = _jsgp4.loads(txt)
+        if isinstance(data, list) and data:
+            entry = data[0]
+            return entry.get("tle1"), entry.get("tle2")
+        if isinstance(data, dict):
+            return data.get("tle1"), data.get("tle2")
+    except Exception:
+        pass
+    return None, None
+
+
+def _sgp4_save_cache(line1, line2):
+    try:
+        with open(_SGP4_TLE_CACHE, "w") as _f:
+            _f.write(line1 + "\n" + line2 + "\n")
+    except Exception:
+        pass
+
+
+def _sgp4_load_cache():
+    """Charge le TLE depuis le cache disque. Retourne (l1, l2) ou (None, None)."""
+    try:
+        if not os.path.exists(_SGP4_TLE_CACHE):
+            return None, None
+        mtime = os.path.getmtime(_SGP4_TLE_CACHE)
+        # Cache valide 7 jours maximum
+        if time.time() - mtime > 7 * 86400:
+            return None, None
+        with open(_SGP4_TLE_CACHE) as _f:
+            lines = [l.strip() for l in _f.readlines() if l.strip()]
+        if len(lines) >= 2:
+            return lines[0], lines[1]
+    except Exception:
+        pass
+    return None, None
+
+
+def _sgp4_fetch_tle():
+    """
+    Récupère les TLE ISS depuis les sources distantes (multi-source avec fallback).
+    Retourne (line1, line2) ou le TLE embarqué si tout échoue.
+    """
+    import urllib.request as _ureq_sgp4
+
+    now = time.time()
+    # Cache mémoire encore valide ?
+    if (_iss_tle_memory[2] and
+            now - _iss_tle_memory[2] < _ISS_TLE_TTL and
+            _iss_tle_memory[0]):
+        return _iss_tle_memory[0], _iss_tle_memory[1]
+
+    # Tentative réseau — essayer chaque source dans l'ordre
+    for url in _SGP4_TLE_SOURCES:
+        try:
+            req = _ureq_sgp4.Request(
+                url,
+                headers={"User-Agent": "Py-APRS/2.2 (+https://github.com/LesF4)"}
+            )
+            with _ureq_sgp4.urlopen(req, timeout=8) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+
+            # Parser selon la source
+            if "satnogs" in url or url.endswith("json"):
+                l1, l2 = _sgp4_parse_satnogs_json(raw)
+            else:
+                l1, l2 = _sgp4_parse_tle_text(raw)
+
+            if l1 and l2 and len(l1) >= 69 and len(l2) >= 69:
+                _iss_tle_memory[0] = l1
+                _iss_tle_memory[1] = l2
+                _iss_tle_memory[2] = now
+                _sgp4_save_cache(l1, l2)
+                logger.info("[ISS] TLE ISS rechargé depuis %s", url)
+                return l1, l2
+
+        except Exception as e:
+            logger.debug("[ISS] Source TLE %s : %s", url, e)
+            continue
+
+    # Fallback cache disque
+    l1, l2 = _sgp4_load_cache()
+    if l1 and l2:
+        logger.warning("[ISS] TLE chargé depuis le cache disque (réseau indisponible)")
+        _iss_tle_memory[0] = l1
+        _iss_tle_memory[1] = l2
+        _iss_tle_memory[2] = now - _ISS_TLE_TTL + 300  # forcer rechargement dans 5 min
+        return l1, l2
+
+    # Dernière ressource : TLE embarqué
+    logger.warning("[ISS] Utilisation du TLE de secours embarqué (peut être périmé)")
+    return _SGP4_FALLBACK_TLE
+
 def _fetch_iss_passes(lat, lon, n=5):
     """
-    Interroge open-notify.org pour obtenir les n prochains passages ISS.
-    Retourne une liste de dicts : {risetime, duration, risetime_fmt}.
+    Calcule les n prochains passages ISS via SGP4 (stdlib pure).
+    Remplace l'appel à open-notify.org (hors-service depuis 2025).
+    Retourne une liste de dicts : {risetime, duration, risetime_fmt,
+                                   duration_min, max_el}.
     """
-    import urllib.request as _ureq, json as _j
-    url = "https://api.open-notify.org/iss-pass.json?lat=%.4f&lon=%.4f&n=%d" % (lat, lon, n)
     try:
-        req = _ureq.Request(url, headers={"User-Agent": "Py-APRS/1.0"})
-        with _ureq.urlopen(req, timeout=8) as resp:
-            data = _j.loads(resp.read())
-        passes = data.get("response") or data.get("passes") or []
-        result = []
-        import datetime as _dt
-        for p in passes:
-            rt = p.get("risetime", 0)
-            dur = p.get("duration", 0)
-            result.append({
-                "risetime":     rt,
-                "duration":     dur,
-                "risetime_fmt": _dt.datetime.fromtimestamp(rt).strftime("%d/%m %H:%M"),
-                "duration_min": round(dur / 60.0, 1),
-            })
-        return result
+        line1, line2 = _sgp4_fetch_tle()
+        tle = _sgp4_parse_tle(line1, line2)
+        passes = _sgp4_compute_passes(tle, lat, lon, n=n)
+        logger.debug("[ISS] %d passage(s) calculé(s) via SGP4", len(passes))
+        return passes
     except Exception as e:
-        print("[ISS] Erreur open-notify : %s" % e)
+        logger.error("[ISS] Erreur calcul SGP4 : %s", e)
         return []
-
 
 def _iss_get_latlon():
     """Résout la position station (locator → lat/lon ou manuel)."""
@@ -7077,15 +7499,16 @@ def _iss_pass_worker():
                     for _q in list(listeners):
                         try: _q.put_nowait(frame)
                         except: pass
-                    print("[ISS] Alerte passage dans %.1f min (début %s, durée %s min)" % (
-                        delta / 60.0, p["risetime_fmt"], p["duration_min"]))
+                    logger.info("[ISS] Alerte passage dans %.1f min (début %s, durée %s min)",
+                        delta / 60.0, p["risetime_fmt"], p["duration_min"])
         except Exception as _e:
-            print("[ISS] Erreur worker : %s" % _e)
+            logger.error("[ISS] Erreur worker : %s", _e)
 
 threading.Thread(target=_iss_pass_worker, daemon=True).start()
 
 
 @app.route('/iss_passes')
+@_login_required
 def iss_passes():
     """Retourne les prochains passages ISS pour la position de la station."""
     import json as _j, time as _t
@@ -7100,6 +7523,7 @@ def iss_passes():
 
 
 @app.route('/iss_alert_config', methods=['GET', 'POST'])
+@_login_required
 def iss_alert_config():
     import json as _j
     if request.method == 'POST':
@@ -7116,210 +7540,6 @@ def iss_alert_config():
         return _j.dumps({"status": "ok", "iss_alert": ia}), 200,                {'Content-Type': 'application/json'}
     return _j.dumps(config_manager.data.get("iss_alert", {})), 200,            {'Content-Type': 'application/json'}
 
-# ── Routes Carnet de Trafic ───────────────────────────────────────────────────
-
-@app.route('/logbook/entries')
-def logbook_entries():
-    page      = int(request.args.get('page', 1))
-    per_page  = int(request.args.get('per_page', 50))
-    search    = request.args.get('search', '').strip()
-    direction = request.args.get('direction', '').strip()
-    aprs_type = request.args.get('aprs_type', '').strip()
-    entries, total = logbook.get_entries(page=page, per_page=per_page,
-                                          search=search, direction=direction, aprs_type=aprs_type)
-    return jsonify({"entries": entries, "total": total, "page": page, "per_page": per_page})
-
-@app.route('/logbook/note', methods=['POST'])
-def logbook_note():
-    data = request.get_json(force=True, silent=True) or {}
-    ok = logbook.update_note(int(data.get('id', 0)), data.get('note', ''))
-    return jsonify({"ok": ok})
-
-@app.route('/logbook/delete', methods=['POST'])
-def logbook_delete():
-    data = request.get_json(force=True, silent=True) or {}
-    ok = logbook.delete(int(data.get('id', 0)))
-    return jsonify({"ok": ok})
-
-@app.route('/logbook/clear', methods=['POST'])
-def logbook_clear():
-    logbook.clear_all()
-    return jsonify({"ok": True})
-
-@app.route('/logbook/stats')
-def logbook_stats():
-    return jsonify(logbook.get_stats())
-
-@app.route('/logbook/export/csv')
-def logbook_export_csv():
-    from flask import Response as _Resp
-    search    = request.args.get('search', '')
-    direction = request.args.get('direction', '')
-    aprs_type = request.args.get('aprs_type', '')
-    csv_data  = logbook.export_csv(search=search, direction=direction, aprs_type=aprs_type)
-    fname = "pyaprs_logbook_%s.csv" % time.strftime("%Y%m%d_%H%M%S")
-    return _Resp(csv_data, mimetype='text/csv',
-                 headers={"Content-Disposition": "attachment; filename=%s" % fname})
-
-@app.route('/logbook/export/adif')
-def logbook_export_adif():
-    from flask import Response as _Resp
-    search    = request.args.get('search', '')
-    direction = request.args.get('direction', '')
-    aprs_type = request.args.get('aprs_type', '')
-    adif_data = logbook.export_adif(search=search, direction=direction, aprs_type=aprs_type)
-    fname = "pyaprs_logbook_%s.adi" % time.strftime("%Y%m%d_%H%M%S")
-    return _Resp(adif_data, mimetype='text/plain',
-                 headers={"Content-Disposition": "attachment; filename=%s" % fname})
-
-@app.route('/logbook/import', methods=['POST'])
-def logbook_import():
-    """Import CSV ou ADIF — fusion avec le carnet existant."""
-    import io, csv as _csv
-    file = request.files.get('file')
-    if not file:
-        return jsonify({"error": "Aucun fichier"}), 400
-    raw = file.read().decode('utf-8', errors='replace')
-    fname = (file.filename or '').lower()
-    count = 0
-
-    if fname.endswith('.csv'):
-        reader = _csv.DictReader(io.StringIO(raw))
-        with logbook._lock:
-            for row in reader:
-                entry = {
-                    "id":        logbook._counter,
-                    "ts":        row.get("date","") + " " + row.get("time",""),
-                    "date":      row.get("date",""),
-                    "time":      row.get("time",""),
-                    "direction": row.get("direction","RX"),
-                    "callsign":  (row.get("callsign","") or "").upper()[:20],
-                    "dest":      (row.get("dest","") or "").upper()[:20],
-                    "path":      row.get("path","")[:100],
-                    "aprs_type": row.get("aprs_type","")[:40],
-                    "payload":   row.get("payload","")[:200],
-                    "comment":   row.get("comment","")[:100],
-                    "lat":       _safe_float(row.get("lat")),
-                    "lon":       _safe_float(row.get("lon")),
-                    "speed_kmh": _safe_float(row.get("speed_kmh")),
-                    "alt_m":     _safe_float(row.get("alt_m")),
-                    "symbol":    row.get("symbol","")[:10],
-                    "source":    row.get("source","import"),
-                    "freq":      row.get("freq","144.800"),
-                    "band":      row.get("band","2m"),
-                    "mode":      row.get("mode","APRS"),
-                    "note":      row.get("note","")[:200],
-                }
-                logbook._counter += 1
-                logbook.entries.append(entry)
-                count += 1
-            logbook.entries.sort(key=lambda x: x.get("ts",""), reverse=True)
-            logbook._save()
-
-    elif fname.endswith('.adi') or fname.endswith('.adif'):
-        import re as _re2
-        records = _re2.split(r'<EOR>', raw, flags=_re2.IGNORECASE)
-        with logbook._lock:
-            for rec in records:
-                def _field(tag):
-                    m = _re2.search(r'<%s:\d+(?::[A-Z])?>(.*?)(?=<|\Z)' % tag, rec, _re2.IGNORECASE|_re2.DOTALL)
-                    return m.group(1).strip() if m else ""
-                cs = _field("CALL")
-                if not cs:
-                    continue
-                date_raw = _field("QSO_DATE")
-                time_raw = _field("TIME_ON")
-                date_fmt = "%s-%s-%s" % (date_raw[:4], date_raw[4:6], date_raw[6:8]) if len(date_raw) >= 8 else ""
-                time_fmt = "%s:%s:%s" % (time_raw[:2], time_raw[2:4], time_raw[4:6]) if len(time_raw) >= 4 else ""
-                entry = {
-                    "id":        logbook._counter,
-                    "ts":        date_fmt + " " + time_fmt,
-                    "date":      date_fmt,
-                    "time":      time_fmt,
-                    "direction": "RX",
-                    "callsign":  cs.upper()[:20],
-                    "dest":      "APRS",
-                    "path":      "",
-                    "aprs_type": "Import ADIF",
-                    "payload":   "",
-                    "comment":   _field("COMMENT")[:100],
-                    "lat":       None,
-                    "lon":       None,
-                    "speed_kmh": None,
-                    "alt_m":     None,
-                    "symbol":    "",
-                    "source":    "ADIF",
-                    "freq":      _field("FREQ") or "144.800",
-                    "band":      _field("BAND") or "2m",
-                    "mode":      _field("MODE") or "APRS",
-                    "note":      _field("NOTES")[:200],
-                }
-                logbook._counter += 1
-                logbook.entries.append(entry)
-                count += 1
-            logbook.entries.sort(key=lambda x: x.get("ts",""), reverse=True)
-            logbook._save()
-    else:
-        return jsonify({"error": "Format non supporté (CSV ou ADIF/ADI)"}), 400
-
-    return jsonify({"ok": True, "imported": count})
-
-
-@app.route('/logbook/add', methods=['POST'])
-def logbook_add():
-    """Ajout manuel d'un contact dans le carnet de trafic."""
-    data = request.get_json(force=True, silent=True) or {}
-    cs = (data.get('callsign') or '').upper().strip()[:20]
-    if not cs:
-        return jsonify({"error": "Indicatif requis"}), 400
-
-    # Date/heure : utiliser la valeur saisie ou l'heure actuelle
-    date_str = (data.get('date') or '').strip()
-    time_str = (data.get('time') or '').strip()
-    if not date_str:
-        date_str = time.strftime("%Y-%m-%d")
-    if not time_str:
-        time_str = time.strftime("%H:%M:%S")
-    elif len(time_str) == 5:          # HH:MM → HH:MM:00
-        time_str = time_str + ":00"
-    ts_str = date_str + " " + time_str
-
-    direction = data.get('direction', 'RX').upper()
-    if direction not in ('RX', 'TX'):
-        direction = 'RX'
-
-    with logbook._lock:
-        entry = {
-            "id":         logbook._counter,
-            "ts":         ts_str,
-            "date":       date_str,
-            "time":       time_str,
-            "direction":  direction,
-            "callsign":   cs,
-            "dest":       (data.get('dest') or 'APRS').upper().strip()[:20],
-            "path":       (data.get('path') or '')[:100],
-            "aprs_type":  (data.get('aprs_type') or 'Manuel')[:40],
-            "payload":    '',
-            "comment":    (data.get('comment') or '')[:100],
-            "lat":        _safe_float(data.get('lat')),
-            "lon":        _safe_float(data.get('lon')),
-            "speed_kmh":  None,
-            "alt_m":      None,
-            "symbol":     '',
-            "source":     'Manuel',
-            "freq":       (data.get('freq') or '144.800')[:20],
-            "band":       (data.get('band') or '2m')[:10],
-            "mode":       (data.get('mode') or 'APRS')[:20],
-            "note":       (data.get('note') or '')[:200],
-        }
-        logbook._counter += 1
-        logbook.entries.insert(0, entry)
-        if len(logbook.entries) > 5000:
-            logbook.entries = logbook.entries[:5000]
-        logbook._save()
-
-    return jsonify({"ok": True, "entry": entry})
-
 
 def _safe_float(v):
     try:
@@ -7329,293 +7549,136 @@ def _safe_float(v):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Synchronisation Wavelog
+
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
+# Fermeture propre (Graceful Shutdown)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Séquence d'arrêt garantie lors d'un SIGTERM/SIGINT ou d'un arrêt Flask :
+#   1. Signaler la fin aux threads de fond (flags + events)
+#   2. Attendre la terminaison ordonnée du thread rx-decoder (Dire Wolf + socket KISS)
+#   3. Fermer la socket KISS TX persistante
+#   4. Fermer la connexion iGate APRS-IS
+#   5. Sauvegarder chat.json de façon synchrone + atomique
 
-class WavelogSync:
+import atexit as _atexit
+import signal as _signal
+
+# Durée max d'attente pour la fin du thread rx-decoder (en secondes)
+_RX_THREAD_JOIN_TIMEOUT = 5
+
+# Référence vers le thread rx-decoder (démarré dans APRSModem.start_rx)
+_rx_thread_ref: list = []   # [Thread] – liste à un élément pour le rendre muable depuis l'extérieur
+
+
+# Patch de start_rx pour capturer la référence du thread
+_original_start_rx = APRSModem.start_rx
+
+def _patched_start_rx(self):
+    _original_start_rx(self)
+    # Récupérer le thread nommé « rx-decoder » qui vient d'être démarré
+    import threading as _thr
+    for t in _thr.enumerate():
+        if t.name == "rx-decoder" and t.is_alive():
+            _rx_thread_ref.clear()
+            _rx_thread_ref.append(t)
+            break
+
+APRSModem.start_rx = _patched_start_rx
+
+
+def _graceful_shutdown():
     """
-    Synchronise le carnet de trafic Py-APRS vers Wavelog via son API REST.
-
-    API Wavelog utilisée :
-      POST /index.php/api/qso        — ajout d'un QSO
-      GET  /index.php/api/station_info  — vérification connexion + infos station
-
-    Doc officielle : https://github.com/wavelog/wavelog/wiki/API
+    Fonction de fermeture propre appelée par atexit et les handlers SIGTERM/SIGINT.
+    Idempotente : protégée par un flag pour n'être exécutée qu'une seule fois.
     """
+    import threading as _thr
+    if getattr(_graceful_shutdown, "_done", False):
+        return
+    _graceful_shutdown._done = True
 
-    # Statut exposé en temps réel à l'interface
-    status        = "–"
-    last_sync_ts  = ""
-    synced_count  = 0
-    last_error    = ""
-    connected     = False
+    logger.info("[SHUTDOWN] Fermeture propre en cours...")
 
-    def __init__(self):
-        self._stop   = threading.Event()
-        self._thread = None
-
-    # ── Vérification connexion ─────────────────────────────────────────────
-    def test_connection(self):
-        """
-        Teste la connexion à Wavelog.
-        Retourne (ok: bool, message: str, info: dict|None).
-        """
-        import urllib.request as _ur, json as _j
-        cfg = config_manager.data.get("wavelog", {})
-        url = (cfg.get("url") or "").rstrip("/")
-        key = cfg.get("api_key", "").strip()
-        if not url or not key:
-            return False, "URL ou clé API manquante", None
-        endpoint = url + "/index.php/api/station_info"
-        try:
-            req = _ur.Request(
-                endpoint,
-                data=_j.dumps({"api": key}).encode(),
-                headers={"Content-Type": "application/json", "User-Agent": "Py-APRS/2.2"},
-                method="GET"
-            )
-            with _ur.urlopen(req, timeout=8) as resp:
-                data = _j.loads(resp.read())
-            if data.get("status") == "ok" or "station_name" in data or isinstance(data, list):
-                self.connected = True
-                self.last_error = ""
-                return True, "Connexion OK", data
+    # ── 1. Arrêter le thread rx-decoder (Dire Wolf + socket KISS RX) ──────────
+    global modem
+    if modem is not None:
+        modem.is_rx_running = False
+        logger.info("[SHUTDOWN] Signal d'arrêt envoyé au thread rx-decoder")
+    # Attendre la fin du thread rx-decoder
+    if _rx_thread_ref:
+        t = _rx_thread_ref[0]
+        if t.is_alive():
+            t.join(timeout=_RX_THREAD_JOIN_TIMEOUT)
+            if t.is_alive():
+                logger.warning("[SHUTDOWN] Thread rx-decoder n'a pas terminé dans le délai imparti")
             else:
-                msg = data.get("message") or data.get("error") or "Réponse inattendue"
-                self.connected = False
-                self.last_error = msg
-                return False, msg, data
-        except Exception as e:
-            self.connected = False
-            self.last_error = str(e)
-            return False, str(e), None
+                logger.info("[SHUTDOWN] Thread rx-decoder terminé proprement")
 
-    # ── Envoi d'un QSO ────────────────────────────────────────────────────
-    def _push_qso(self, entry):
-        """
-        Envoie une entrée du carnet vers l'API Wavelog.
-        Retourne True si succès, False sinon.
-        """
-        import urllib.request as _ur, json as _j
-        cfg        = config_manager.data.get("wavelog", {})
-        url        = (cfg.get("url") or "").rstrip("/")
-        key        = cfg.get("api_key", "").strip()
-        station_id = int(cfg.get("station_id", 1) or 1)
-
-        if not url or not key:
-            return False
-
-        cs   = entry.get("callsign", "") or ""
-        if not cs or cs in ("APRS","BEACON","CQ","?",""):
-            return False
-
-        # Formatage des champs Wavelog
-        date_raw = (entry.get("date","") or "").replace("-","")   # YYYYMMDD
-        time_raw = (entry.get("time","") or "").replace(":","")[:6]  # HHMMSS
-        if not date_raw or not time_raw:
-            return False
-
-        band = entry.get("band","2m") or "2m"
-        mode = entry.get("mode","APRS") or "APRS"
-        freq = entry.get("freq","144.800") or "144.800"
-        rst  = "599"
-        comment = entry.get("comment","") or ""
-        note    = entry.get("note","") or ""
-        aprs_t  = entry.get("aprs_type","") or ""
-        my_call = config_manager.data.get("callsign","N0CALL").upper()
-
-        # Wavelog attend le champ "call" (indicatif distant), sans SSID pour la base
-        # mais on envoie le callsign complet dans les notes pour traçabilité APRS
-        qso_body = {
-            "api":            key,
-            "station_id":     station_id,
-            "call":           cs.split("-")[0],   # sans SSID pour compatibilité ADIF
-            "rst_sent":       rst,
-            "rst_rcvd":       rst,
-            "qso_date":       date_raw,
-            "time_on":        time_raw,
-            "band":           band,
-            "mode":           mode,
-            "freq":           freq,
-            "station_callsign": my_call,
-            "comment":        ("[%s] %s %s" % (aprs_t, comment, note)).strip()[:255],
-        }
-
-        # Coordonnées GPS si disponibles
-        if entry.get("lat") is not None and entry.get("lon") is not None:
+    # ── 2. Fermer la socket KISS TX persistante ───────────────────────────────
+    with APRSModem._tx_sock_lock:
+        if APRSModem._tx_sock is not None:
             try:
-                qso_body["gridsquare"] = _latlon_to_maidenhead(float(entry["lat"]), float(entry["lon"]))
+                import socket as _sock
+                APRSModem._tx_sock.shutdown(_sock.SHUT_RDWR)
             except Exception:
                 pass
-
-        endpoint = url + "/index.php/api/qso"
-        try:
-            req = _ur.Request(
-                endpoint,
-                data=_j.dumps(qso_body).encode(),
-                headers={"Content-Type": "application/json", "User-Agent": "Py-APRS/2.2"},
-                method="POST"
-            )
-            with _ur.urlopen(req, timeout=10) as resp:
-                result = _j.loads(resp.read())
-            # Wavelog renvoie {"status":"created"} ou {"status":"ok"} en succès
-            ok = result.get("status") in ("created","ok","success","200")
-            if not ok:
-                print("[WAVELOG] Erreur QSO %s : %s" % (cs, result))
-            return ok
-        except Exception as e:
-            print("[WAVELOG] Exception push_qso %s : %s" % (cs, e))
-            return False
-
-    # ── Synchro par lot ────────────────────────────────────────────────────
-    def sync_pending(self):
-        """
-        Synchronise les nouvelles entrées du carnet (id > last_sync_id).
-        Retourne le nombre de QSO envoyés avec succès.
-        """
-        cfg      = config_manager.data.get("wavelog", {})
-        only_qso = cfg.get("only_qso", True)
-        sync_rx  = cfg.get("sync_rx", True)
-        sync_tx  = cfg.get("sync_tx", True)
-        last_id  = int(cfg.get("last_sync_id", 0) or 0)
-
-        # Types de trames à synchroniser selon le mode "QSO seulement"
-        QSO_TYPES = {"Message", "Mic-E", "Position", "Position+Msg",
-                     "Position+TS", "Position+TS+Msg", "Beacon ISS"}
-
-        with logbook._lock:
-            candidates = [
-                e for e in reversed(logbook.entries)   # du plus ancien au plus récent
-                if e["id"] > last_id
-                and ((e["direction"] == "RX" and sync_rx) or (e["direction"] == "TX" and sync_tx))
-                and (not only_qso or e.get("aprs_type","") in QSO_TYPES)
-                and (e.get("callsign","") not in ("","APRS","BEACON","CQ","?"))
-            ]
-
-        if not candidates:
-            return 0
-
-        pushed   = 0
-        max_id   = last_id
-        for entry in candidates:
-            ok = self._push_qso(entry)
-            if ok:
-                pushed += 1
-            if entry["id"] > max_id:
-                max_id = entry["id"]
-
-        # Mise à jour last_sync_id même si certains échouent (évite boucle infinie)
-        if max_id > last_id:
-            wl_cfg = config_manager.data.get("wavelog", {}).copy()
-            wl_cfg["last_sync_id"] = max_id
-            config_manager.data["wavelog"] = wl_cfg
             try:
-                with open("config.json", "w") as _f:
-                    json.dump(config_manager.data, _f, ensure_ascii=False)
+                APRSModem._tx_sock.close()
             except Exception:
                 pass
+            APRSModem._tx_sock = None
+            logger.info("[SHUTDOWN] Socket KISS TX fermée")
 
-        self.synced_count += pushed
-        self.last_sync_ts  = time.strftime("%H:%M:%S")
-        print("[WAVELOG] Sync : %d/%d QSO envoyés (last_id=%d)" % (pushed, len(candidates), max_id))
-        return pushed
-
-    # ── Thread de synchro automatique ─────────────────────────────────────
-    def start(self):
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="wavelog-sync")
-        self._thread.start()
-
-    def _loop(self):
-        while not self._stop.is_set():
-            try:
-                cfg = config_manager.data.get("wavelog", {})
-                if cfg.get("enabled"):
-                    interval_min = max(1, int(cfg.get("sync_interval", 5) or 5))
-                    ok, msg, _ = self.test_connection()
-                    if ok:
-                        self.status = "✅ Connecté"
-                        pushed = self.sync_pending()
-                        if pushed:
-                            self.status = "✅ Sync OK (%d)" % pushed
-                    else:
-                        self.status = "❌ " + msg
-                    # Attente découpée en tranches de 10 s (réactif aux changements config)
-                    for _ in range(interval_min * 6):
-                        if self._stop.is_set():
-                            break
-                        time.sleep(10)
-                else:
-                    self.status = "–"
-                    time.sleep(15)
-            except Exception as e:
-                self.status = "❌ Erreur: %s" % e
-                print("[WAVELOG] Erreur boucle : %s" % e)
-                time.sleep(30)
-
-    def stop(self):
-        self._stop.set()
-
-
-def _latlon_to_maidenhead(lat, lon):
-    """Conversion lat/lon décimaux → Maidenhead 6 caractères."""
-    lon += 180; lat += 90
-    f1 = chr(65 + int(lon / 20))
-    f2 = chr(65 + int(lat / 10))
-    f3 = str(int((lon % 20) / 2))
-    f4 = str(int(lat % 10))
-    f5 = chr(65 + int((lon % 2) / (2/24.0)))
-    f6 = chr(65 + int((lat % 1) / (1/24.0)))
-    return (f1+f2+f3+f4+f5+f6).upper()
-
-
-wavelog_sync = WavelogSync()
-wavelog_sync.start()
-
-
-# ── Routes Wavelog ────────────────────────────────────────────────────────────
-
-@app.route('/wavelog/status')
-def wavelog_status():
-    return jsonify({
-        "enabled":      config_manager.data.get("wavelog", {}).get("enabled", False),
-        "connected":    wavelog_sync.connected,
-        "status":       wavelog_sync.status,
-        "last_sync":    wavelog_sync.last_sync_ts,
-        "synced_total": wavelog_sync.synced_count,
-        "last_error":   wavelog_sync.last_error,
-        "last_sync_id": config_manager.data.get("wavelog", {}).get("last_sync_id", 0),
-    })
-
-@app.route('/wavelog/test', methods=['POST'])
-def wavelog_test():
-    ok, msg, info = wavelog_sync.test_connection()
-    return jsonify({"ok": ok, "message": msg, "info": info})
-
-@app.route('/wavelog/sync_now', methods=['POST'])
-def wavelog_sync_now():
-    """Force une synchro immédiate (bouton "Synchroniser maintenant")."""
-    cfg = config_manager.data.get("wavelog", {})
-    if not cfg.get("enabled"):
-        return jsonify({"error": "Wavelog non activé"}), 400
-    ok, msg, _ = wavelog_sync.test_connection()
-    if not ok:
-        return jsonify({"error": "Connexion échouée : " + msg}), 502
-    pushed = wavelog_sync.sync_pending()
-    return jsonify({"ok": True, "pushed": pushed, "status": wavelog_sync.status})
-
-@app.route('/wavelog/reset_sync', methods=['POST'])
-def wavelog_reset_sync():
-    """Réinitialise le curseur de synchro (re-enverra tout depuis le début)."""
-    wl = config_manager.data.get("wavelog", {}).copy()
-    wl["last_sync_id"] = 0
-    config_manager.data["wavelog"] = wl
+    # ── 3. Fermer la connexion iGate APRS-IS ──────────────────────────────────
     try:
-        with open("config.json", "w") as f:
-            json.dump(config_manager.data, f, ensure_ascii=False)
-    except Exception:
-        pass
-    return jsonify({"ok": True})
+        igate_client.stop()
+        logger.info("[SHUTDOWN] iGate APRS-IS arrêté")
+    except Exception as e:
+        logger.error("[SHUTDOWN] Erreur arrêt iGate : %s", e)
+
+    # ── 5. Sauvegarder chat.json de façon synchrone et atomique ──────────────
+    try:
+        with chat_manager._lock:
+            chat_manager._save()
+        logger.info("[SHUTDOWN] chat.json sauvegardé")
+    except Exception as e:
+        logger.error("[SHUTDOWN] Erreur sauvegarde chat.json : %s", e)
+
+    # ── 6. Sauvegarder config.json ───────────────────────────────────────────
+    try:
+        _tmp_cfg = "config.json.tmp"
+        with open(_tmp_cfg, "w", encoding="utf-8") as _f:
+            json.dump(config_manager.data, _f, ensure_ascii=False, indent=2)
+        os.replace(_tmp_cfg, "config.json")
+        logger.info("[SHUTDOWN] config.json sauvegardé")
+    except Exception as e:
+        logger.error("[SHUTDOWN] Erreur sauvegarde config.json : %s", e)
+
+    logger.info("[SHUTDOWN] Fermeture propre terminée. 73 !")
+
+
+# ── Enregistrement atexit (exécuté à la fin du processus Python) ──────────────
+_atexit.register(_graceful_shutdown)
+
+
+# ── Handlers POSIX (SIGTERM = systemctl stop | SIGINT = Ctrl-C) ───────────────
+def _signal_handler(signum, frame):
+    sig_name = "SIGTERM" if signum == _signal.SIGTERM else "SIGINT"
+    logger.info("[SHUTDOWN] Signal %s reçu — déclenchement de l'arrêt propre", sig_name)
+    _graceful_shutdown()
+    # Sortie propre après nettoyage
+    raise SystemExit(0)
+
+
+try:
+    _signal.signal(_signal.SIGTERM, _signal_handler)
+    _signal.signal(_signal.SIGINT,  _signal_handler)
+except (OSError, ValueError):
+    # Signal ne peut pas être intercepté dans certains contextes (thread non-principal)
+    pass
 
 
 if __name__ == '__main__':
