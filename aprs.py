@@ -1,3 +1,11 @@
+# WX_APRS_BULLETIN_FIX_v1
+# PATCH_VERSION_268_HTML_APPLIED
+# PATCH_RX_BROADCASTER_CRASH_FIX_APPLIED
+# PATCH_POSITION_REGEX_SPACES_APPLIED
+# PATCH_TRAFFIC_FREEZE_FIX_APPLIED
+# PATCH_VERSION_BUMP_SSTV_REMOVE_APPLIED
+# PATCH_SSTV_REMOVE_APPLIED
+# PATCH_BLACKOUT_ORDER_APPLIED
 # -*- coding: utf-8 -*-
 import os
 import json
@@ -12,21 +20,58 @@ import platform
 import collections
 import queue
 import re as _re
+import re
+import hashlib
 import logging
 import logging.handlers
+import gzip
+import shutil
 
 # ── Configuration du logger APRS ────────────────────────────────────────────
-# Rotation automatique : 5 fichiers de 1 Mo max → ~5 Mo total (adapté Raspberry Pi)
-_log_handler = logging.handlers.RotatingFileHandler(
-    "aprs.log",
-    maxBytes=1_000_000,   # 1 Mo par fichier
-    backupCount=5,        # 5 fichiers de rotation → 5 Mo max
+# Rotation quotidienne à minuit + compression gzip des archives
+# aprs.log (courant) → aprs.log.2025-01-15.gz (archive)
+# Rétention : 2 jours (adapté SD card / Raspberry Pi)
+
+_LOG_FILE = "aprs.log"
+_LOG_BACKUP_COUNT = 2   # 2 jours d'archives gzippées
+
+class _GzipTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """Rotation quotidienne à minuit avec compression gzip automatique."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def rotation_filename(self, default_name):
+        """Ajoute .gz à l'extension pour le fichier archivé."""
+        return default_name + ".gz"
+
+    def rotate(self, source, dest):
+        """Compresse le fichier source vers dest (gzip)."""
+        try:
+            with open(source, "rb") as f_in, gzip.open(dest, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            os.remove(source)
+        except Exception as _e:
+            # Fallback sans compression si erreur
+            shutil.move(source, dest)
+
+
+_log_handler = _GzipTimedRotatingFileHandler(
+    _LOG_FILE,
+    when="midnight",          # rotation à 00h00 heure locale
+    interval=1,               # tous les jours
+    backupCount=_LOG_BACKUP_COUNT,
     encoding="utf-8",
+    delay=False,
+    utc=False,
 )
-_log_handler.setFormatter(logging.Formatter(
+
+_LOG_FORMAT = logging.Formatter(
     "%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-))
+)
+_log_handler.setFormatter(_LOG_FORMAT)
+_log_handler.suffix = "%Y-%m-%d"   # ex: aprs.log.2025-01-15.gz
 
 # Console (stdout) — même format, niveau INFO par défaut
 _console_handler = logging.StreamHandler()
@@ -34,12 +79,16 @@ _console_handler.setFormatter(logging.Formatter(
     "%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 ))
+_console_handler.setLevel(logging.INFO)
 
 logger = logging.getLogger("aprs")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(_log_handler)
 logger.addHandler(_console_handler)
 logger.propagate = False
+
+logger.info("=== APRS Dashboard démarré — log rotation: quotidienne, rétention %d jours ===",
+            _LOG_BACKUP_COUNT)
 
 default_port = "/dev/ttyUSB0" if platform.system() == "Linux" else "COM3"
 
@@ -65,6 +114,13 @@ DEFAULT_CONFIG = {
     "beacon_interval": 0,
     "beacon_type": "station",
     "beacon_schedules": {},
+    "beacon_text1": "",          # Texte libre balise automatique 1
+    "beacon_text2": "",          # Texte libre balise automatique 2
+
+    # ── Mode HF 300 bauds ────────────────────────────────────────────────────
+    "hf_mode":          False,          # True = 300 bauds HF (APRS-HF / USB)
+    "hf_mark_hz":       1600,           # fréquence MARK  (défaut AX.25 HF : 1600 Hz)
+    "hf_space_hz":      1800,           # fréquence SPACE (défaut AX.25 HF : 1800 Hz)
     # ── iGate APRS-IS ────────────────────────────────────────────────────────
     "igate_enabled":  False,
     "igate_server":   "rotate.aprs2.net",
@@ -72,11 +128,37 @@ DEFAULT_CONFIG = {
     "igate_passcode": "-1",
     "igate_filter":   "r/46.5/1.5/200",   # filtre région Centre-Val de Loire
     "igate_rx_only":  True,                # True = RX-iGate seulement, False = TX aussi
-    # ── Alertes passage ISS ──────────────────────────────────────────────────
+    # ── Digipeater ───────────────────────────────────────────────────────────
+    "digi_enabled":   False,
+    "digi_aliases":   ["WIDE1-1", "WIDE1", "RELAY"],  # alias acceptés
+    "digi_limit":     2,                   # nb max de sauts WIDEn-N tolérés
+    # ── Alertes météo (Open-Meteo) ───────────────────────────────────────────
+    "weather_alert": {
+        "enabled":        False,
+        "interval_min":   30,     # intervalle de vérification en minutes
+        "temp_max":       38.0,   # °C  — alerte chaleur extrême
+        "temp_min":       -5.0,   # °C  — alerte gel
+        "wind_max":       60.0,   # km/h (= ~16.7 m/s)
+        "gust_max":       80.0,   # km/h
+        "rain_mm":        10.0,   # mm/h
+        "wmo_severe":     True,   # alertes sur codes WMO ≥ 65 (pluie forte, orages…)
+        "bulletin_aprs":  True,   # émettre bulletin APRS RF (BLNWXn) lors d'une alerte
+    },
+        # ── Alertes passage ISS ──────────────────────────────────────────────────
     "iss_alert": {
         "enabled":      False,
         "advance_min":  10,    # minutes avant le passage pour envoyer l'alerte
     },
+    # ── Alertes propagation / blackout ──────────────────────────────────────
+    "prop_alert": {
+        "enabled":       False,
+        "interval_min":  15,      # vérification toutes les N minutes
+        "kp_max":         5.0,    # alerte tempête géomagnétique
+        "sfi_min":       70.0,    # alerte SFI trop bas (blackout HF)
+        "xray_class":   "M1",     # alerte éruption solaire : M1 | M5 | X1 | X5
+    },
+    # ── API aprs.fi (optionnel) — clé pour /signal_path ───────────────────────
+    "aprsfi_key": "",   # obtenir sur https://aprs.fi/page/api
 }
 
 app = Flask(__name__)
@@ -204,6 +286,7 @@ _LOGIN_HTML = """<!DOCTYPE html>
   </form>
   <div class="footer">APRS Station v{VERSION}</div>
 </div>
+
 </body>
 </html>"""
 
@@ -273,10 +356,166 @@ app.permanent_session_lifetime = _timedelta(days=30)
 
 
 # ── Version applicative ──────────────────────────────────────────────────────
-APP_VERSION = "2.4"
-APP_VERSION_DATE = "2026-05-27"
+APP_VERSION = "2.6.9"
+APP_VERSION_DATE = "2026-06-21"
 APP_CHANGELOG = [
-    {"version": "2.4", "date": "2026-05-27", "label": "current", "changes": [
+        {"version": "2.6.9", "date": "2026-06-21", "label": "current", "changes": [
+            "Bulletin APRS RF alerte meteo : titres sans accents (ex. 'Chaleur extreme' au lieu de 'Chaleur extrême') pour compatibilite TNC/terminaux",
+            "Bulletin APRS RF alerte meteo : retrait du seuil configure du payload RF, conserve uniquement dans l'alerte SSE/web",
+            "Bulletin APRS RF alerte meteo : affichage avec le badge et la couleur Meteo dans le moniteur de trafic au lieu du badge TX generique",
+            "Log systeme : retention reduite de 30 a 2 jours d'archives gzippees",
+        ]},
+        {"version": "2.6.8", "date": "2026-06-18", "label": "", "changes": [
+            "QSO : barre de macros en 3 groupes — QSO standard (CQ/73/QTH/QRZ?/RST/QSL/POTA), APRS direct (?APRST/?APRSV/?WX/?PING?, envoi immediat sans confirmation), ISS/ARISS (CQ ARISS/QTH/73 ISS/PSE QSL/Test)",
+            "QSO : substitution dynamique {MY}/{LOC}/{DEST} dans les macros via _macroExpand",
+            "QSO : envoi direct _chatSendDirect() pour les macros APRS (contourne le champ de saisie)",
+            "QSO : mode ISS isole (openISS) — path ARISS force automatiquement a l envoi, badge path dans la barre de macros",
+            "QSO : panel ISS en vue integre dans la fenetre chat — elevation, azimut, boussole SVG animee, Doppler, frequence corrigee",
+            "QSO : appel general CQ (openCQGeneral) — destination APRS broadcast, bulle dediee avec avatar 📢",
+            "QSO : separateur de date dans l historique des messages (regroupement par jour)",
+        ]},
+        {"version": "2.6.7", "date": "2026-06-16", "label": "", "changes": [
+            "Moniteur de trafic : correction du gel après un certain temps de fonctionnement",
+            "Broadcaster SSE : retrait automatique des listeners dont la queue est saturée (>5 erreurs consécutives)",
+            "Watchdog KISS : redémarrage automatique de Direwolf si aucun octet reçu depuis 120 s",
+            "SSE keepalive réduit à 8 s pour détection rapide des clients déconnectés",
+        ]},
+        {"version": "2.6.6", "date": "2026-06-14", "label": "", "changes": [
+        "Log systeme : rotation quotidienne a minuit avec compression gzip automatique (aprs.log.YYYY-MM-DD.gz, 30 jours de retention)",
+        "Routes /log?n=&level= et /log/archives pour consulter le journal et lister les archives depuis le tableau de bord",
+        "Moniteur de trafic SSE : reconnexion automatique avec backoff exponentiel (3 s -> 30 s) en cas de coupure ou redemarrage serveur",
+        "SSE : handler decoupe en _sseOnMessage / _sseOnError / _handleSseFrame, evite les doublons d'event listener apres reconnexion",
+        "SSE cote Flask : gestion GeneratorExit explicite, compteur consecutive_errors, nettoyage listeners.remove() protege par try/except",
+        "Optimisation dedup : _isDupContent ne purge _contentDedup que toutes les 60 s (pas a chaque trame), _seenFids tronque si > 800",
+        "Beacon ISS : bouton desactive (grise) par defaut, s'active automatiquement (fond indigo pulse) uniquement quand l'ISS est en vue",
+        "Sidebar Trafic : panel ISS EN VUE deplace en haut de la sidebar, avant le badge prochain passage",
+    ]},
+        {"version": "2.6.5", "date": "2026-06-11", "label": "", "changes": [
+        "Suppression du recepteur SSTV integre (decodeur Python, monitoring signal, galerie locale)",
+        "Onglet SSTV remplace par un panneau de liens vers des outils externes : Robot36 WebAssembly, QSSTV (Linux/Raspberry Pi), ColorSSTV/MMSSTV (Windows), galerie ISS SSTV",
+        "Tableau des frequences SSTV usuelles (ISS 145.800, HF 14.230/14.233, signal VIS 1900 Hz)",
+        "Balises texte libre : boutons 📝 Texte1 / Texte2 dans le panneau QSO (visibles uniquement si le texte est configure)",
+        "Routes POST /send_text1 et /send_text2, fonctions _do_send_text1/_do_send_text2",
+    ]},
+    {"version": "2.6.4", "date": "2026-06-11", "label": "", "changes": [
+        "Correction decodage Mic-E : le flag Ouest (West) est lu sur d[5] (spec APRS 1.0.1 §10) et non d[4] — corrige les distances farfelues pour stations françaises a 7°E et stations americaines",
+    ]},
+    {"version": "2.6.3", "date": "2026-06-10", "label": "", "changes": [
+        "Balises texte libre : deux nouvelles balises Text1 et Text2 a parametrer librement (texte + intervalle), visibles dans le panneau Statut Station et dans les Reglages",
+    ]},
+    {"version": "2.6.2", "date": "2026-06-10", "label": "", "changes": [
+        "Badge alertes propagation/blackout dans le header a cote du voyant PTT : 🧲 Kp / 📉 SFI / ☀️ X-ray, pulsation rouge, clic pour fermer toutes les bannieres",
+    ]},
+    {"version": "2.6.1", "date": "2026-06-10", "label": "", "changes": [
+        "Mobile TRAFIC : console APRS en premier sur smartphone (CSS order), panneau Envoyer/Statut en accordeon repliable",
+        "Mobile TRAFIC : header console sticky (compteurs TX/RX/IS + filtre + barre RX), scroll-to-top auto a l'activation de l'onglet",
+        "Mobile TRAFIC : cartes APRS ultra-compactes (8px padding, 9-10px font), hauteur calc(100vh-180px)",
+    ]},
+    {"version": "2.6.0", "date": "2026-06-10", "label": "", "changes": [
+        "Recherche périmétrique : route /nearby_stations (rayon, âge max, filtre mobile) + modale carte avec cercle Leaflet et liste triée par distance",
+    ]},
+    {"version": "2.5.9", "date": "2026-06-09", "label": "", "changes": [
+        "Stats : maillage RF — carte de chaleur SVG des cases Maidenhead 4 car. entendues",
+        "Cases colorées par densité (bleu→cyan→vert), cercles 50/100/200 km, croix station locale",
+        "Compteur de cases distinctes, bouton reset, persistance dans stats.json (gridCells)",
+        "Route POST /stats/reset_mesh pour effacer uniquement les données maillage",
+    ]},
+    {"version": "2.5.8", "date": "2026-06-09", "label": "", "changes": [
+        "Stats : meilleur DX entendu (indicatif, distance, azimut, date) persisté dans stats.json",
+        "Stats : distance maximale atteinte affichée dans un badge dédié",
+        "Stats : 2 nouvelles cartes dans la grille des compteurs (Best DX + Distance max)",
+    ]},
+    {"version": "2.5.7", "date": "2026-06-05", "label": "", "changes": [
+        "ISS 24h : redesign complet des cartes de passage (layout 2 colonnes, zones claires)",
+        "ISS 24h : bloc probabilite contact APRS (barre + % + label qualitatif) sur chaque passage futur",
+        "ISS 24h : passages passes rendus discrets (opacite reduite, probabilite masquee)",
+        "Miroir Reglages ISS : badge 📡XX% inline sur chaque passage",
+    ]},
+    {"version": "2.5.6", "date": "2026-06-03", "label": "", "changes": [
+        "Alertes propagation / blackout : bannière SSE + bip sur tempête géomagnétique (Kp), dégradation SFI et éruption solaire X-ray GOES",
+        "3 seuils configurables : Kp max (G1–G3), SFI min, classe X-ray (C1 à X5)",
+        "Worker thread _prop_alert_worker + routes /prop_alert_config et /prop_alert_test",
+        "Passages ISS 24h glissantes : nouveau bloc dans l'onglet ISS (SGP4, n=20, cache 15 min)",
+        "Widget TRAFIC ISS : passages du jour (minuit→minuit) remplacent les 5 prochains passages",
+        "Correction bugs ISS : countdown sur 1er passage futur, badge PASSÉ/EN COURS, isNext sur bon index, race condition cache dict",
+    ]},
+    {"version": "2.5.5", "date": "2026-06-03", "label": "", "changes": [
+        "HF 300 bauds : forçage automatique path vide si WIDE détecté dans send_packet",
+        "UI : presets path dédiés HF (Direct RF, GATE, RELAY) dans le select Digi Path",
+        "UI : warning visuel si hf_mode actif et path incompatible WIDE",
+    ]},
+    {"version": "2.5.4", "date": "2026-06-02", "label": "", "changes": [
+        "Mode HF 300 bauds : directive Dire Wolf MODEM 300 MARK:SPACE (défaut 1600/1800 Hz)",
+        "TXDELAY automatiquement fixé à 500 ms minimum en mode HF",
+        "Section dédiée dans ⚙️ RÉGLAGES : toggle, tonalités MARK/SPACE configurables, aide fréquences APRS-HF",
+        "config.json : nouveaux champs hf_mode, hf_mark_hz, hf_space_hz",
+    ]},
+    {"version": "2.5.3", "date": "2026-06-02", "label": "", "changes": [
+        "Alertes météo : popup + bip audio sur dépassement de seuils (temp, vent, rafales, pluie, WMO)",
+        "Worker thread vérifiant Open-Meteo selon intervalle configurable",
+        "Routes /weather_alert_config (GET/POST) et /weather_alert_test",
+        "Seuils : température max/min, vitesse vent, rafales, précipitations, codes WMO sévères",
+    ]},
+        {"version": "2.5.2", "date": "2026-06-01", "label": "", "changes": [
+        "Carte : suppression des tracés parasites mobiles — filtre distance > 300 km (rupture de traînée) et filtre vitesse implicite > 500 km/h",
+    ]},
+    {"version": "2.5.1", "date": "2026-06-01", "label": "", "changes": [
+        "ISS : heure de fin de passage affichée (ex : 14:32 → 14:40) dans l'onglet ISS et dans les réglages",
+        "Backend : champ set_fmt ajouté dans /iss_passes (heure locale de fin du passage)",
+    ]},
+    {"version": "2.5.0", "date": "2026-05-31", "label": "", "changes": [
+        "Digipeater APRS logiciel : WIDEn-N, RELAY, WIDE1, aliases configurables",
+        "Anti-dupli SHA1 (fenêtre 30 s), filtre anti-boucle IS, filtre propre station",
+        "Section Digipeater dans ⚙️ RÉGLAGES : toggle, aliases, limite sauts, compteur",
+        "Route /digi/status + polling JS temps réel (voyant vert / compteur session)",
+        "Import hashlib ajouté, re aliasé globalement",
+    ]},
+    {"version": "2.4.9", "date": "2026-05-31", "label": "", "changes": [
+        "Aide mise à jour : section 🔑 Sécurité (changement MDP, stockage hash, session)",
+        "Aide mise à jour : QSO — bouton 🗑️ delete conversation documenté",
+        "Aide mise à jour : MAP — OSM France mentionné",
+        "Dépannage : nouvelle entrée 'Mot de passe oublié' avec commande werkzeug",
+    ]},
+    {"version": "2.4.8", "date": "2026-05-31", "label": "", "changes": [
+        "Changement de mot de passe intégré dans l'onglet ⚙️ RÉGLAGES (section dédiée en bas)",
+        "Validations : longueur min 6 car., confirmation, erreur mot de passe actuel incorrect",
+    ]},
+    {"version": "2.4.7", "date": "2026-05-31", "label": "", "changes": [
+        "Carte mode nuit : retour CartoDB Dark Matter (Stadia nécessite une clé API)",
+        "Mode jour : OSM France osmfr (labels français)",
+    ]},
+    {"version": "2.4.6", "date": "2026-05-31", "label": "", "changes": [
+        "Carte en français : tuiles OSM France (tile.openstreetmap.fr/osmfr) en mode jour",
+        "Labels français : noms de communes, routes, régions en français",
+        "Mode nuit conserve le fond sombre CartoDB Dark",
+    ]},
+    {"version": "2.4.5", "date": "2026-05-31", "label": "", "changes": [
+        "Fonction delete QSO : bouton 🗑️ dans le header chat pour supprimer une conversation",
+        "Route API DELETE /chat/delete/<callsign> avec sauvegarde atomique de chat.json",
+        "Bouton activé/désactivé automatiquement selon l'état du contact sélectionné",
+    ]},
+    {"version": "2.4.4", "date": "2026-05-29", "label": "", "changes": [
+        "Widget météo discret entre header et moniteur de trafic (Open-Meteo, gratuit, sans clé API)",
+        "Affiche : icône WMO, température, ressenti, description, vent (vitesse + direction), humidité, précipitations",
+        "Position : coordonnées de la station (config) en priorité, géolocalisation navigateur en fallback",
+        "Cache localStorage 15 min, rafraîchissement automatique, adaptatif mode jour/nuit",
+    ]},
+    {"version": "2.4.3", "date": "2026-05-29", "label": "", "changes": [
+        "Ville la plus proche : badge 🏙️ affiché sur chaque trame de position (console trafic + popup carte)",
+        "Route API GET /nearest_city?lat=&lon= : reverse geocoding via Nominatim (OSM), cache serveur LRU 2000 entrées",
+        "Requêtes asynchrones — la carte et la console s'affichent immédiatement, la ville apparaît en différé",
+    ]},
+    {"version": "2.4.2", "date": "2026-05-29", "label": "", "changes": [
+        "Mode Jour / Nuit : bouton ☀️/🌙 fixe en haut à droite, persisté via localStorage",
+        "Carte Leaflet : fond sombre (CartoDB Dark) en mode nuit, OSM standard en mode jour",
+        "Toutes les couleurs de l'interface (panneaux, textes, inputs, popups) s'adaptent au thème",
+    ]},
+    {"version": "2.4.1", "date": "2026-05-29", "label": "", "changes": [
+        "Nouveau bouton '〰️ Trajets' sur la carte : efface uniquement les traînées (breadcrumbs) des mobiles sans supprimer les marqueurs",
+        "Route API DELETE /map_clear_trails : remet à zéro le champ 'trail' dans stations_positions côté serveur",
+        "Fonction JS mapClearTrails() : retire les polylines et points du trail de la carte Leaflet",
+    ]},
+    {"version": "2.4", "date": "2026-05-27", "label": "", "changes": [
         "Passage en version 2.4",
         "Mise à jour du changelog intégré",
     ]},
@@ -458,6 +697,16 @@ class APRSChat:
                 m["read"] = True
             if changed:
                 self._save()
+
+    def delete_conversation(self, callsign):
+        """Supprime toute la conversation avec un indicatif. Retourne True si trouvé."""
+        cs = callsign.upper()
+        with self._lock:
+            if cs not in self.conversations:
+                return False
+            del self.conversations[cs]
+            self._save()
+        return True
 
     # ── Retry ACK ─────────────────────────────────────────────────────────────
 
@@ -674,24 +923,34 @@ class APRSModem:
             logger.info("[TX] Nouvelle connexion KISS persistante établie")
         return cls._tx_sock
 
-    def send_packet(self, dest, payload, custom_path=None):
+    def send_packet(self, dest, payload, custom_path=None, custom_src=None):
         """
         Envoie une trame APRS via Dire Wolf (port KISS TCP).
         Utilise une connexion TCP persistante — pas de reconnexion à chaque trame.
+        custom_src : callsign source à substituer (retransmission digipeater).
         """
         import socket as _sock
         with self.tx_lock:
             # ── Encodage AX.25 (sans CRC — Dire Wolf l'ajoute) ───────────────
             def encode_call(call, last=False):
                 parts = call.upper().split('-')
-                base  = parts[0].ljust(6)
-                ssid  = int(parts[1]) if len(parts) > 1 else 0
+                base  = parts[0].strip('*').ljust(6)
+                has_repeated = call.endswith('*')
+                ssid  = int(parts[1].strip('*')) if len(parts) > 1 else 0
                 res   = [(ord(c) << 1) for c in base]
-                res.append((ssid << 1) | (0x61 if last else 0x60))
+                # bit 7 = H (has-been-repeated), bit 0 = end-of-address, bits 1-4 = SSID
+                flags = (0x61 if last else 0x60) | (0x80 if has_repeated else 0x00)
+                res.append((ssid << 1) | flags)
                 return res
 
-            source    = self.cfg.get('callsign', 'N0CALL')
-            path_str  = custom_path if custom_path else self.cfg.get('path', 'WIDE1-1,WIDE2-1')
+            source    = custom_src if custom_src else self.cfg.get('callsign', 'N0CALL')
+            _hf_active = bool(self.cfg.get('hf_mode', False))
+            path_str   = custom_path if custom_path else self.cfg.get('path', 'WIDE1-1,WIDE2-1')
+            # En mode HF 300 bauds, les paths WIDE sont inopérants et inondent le réseau.
+            # On force automatiquement un chemin vide (direct RF uniquement).
+            if _hf_active and 'WIDE' in path_str.upper():
+                logger.warning('[TX] hf_mode actif — path "%s" contient WIDE, forcé à vide (direct RF)', path_str)
+                path_str = ''
             path_list = [p.strip() for p in path_str.split(',') if p.strip()]
 
             frame  = encode_call(dest)
@@ -759,6 +1018,8 @@ class APRSModem:
     @staticmethod
     def _parse_callsign(raw7):
         call = "".join(chr(b >> 1) for b in raw7[:6]).strip()
+        # Filtrer les caractères de padding non imprimables (espaces AX.25, bits parasites)
+        call = "".join(c for c in call if c.isalnum() or c in '-')
         ssid = (raw7[6] >> 1) & 0x0F
         has_been_repeated = bool(raw7[6] & 0x80)
         last = bool(raw7[6] & 0x01)
@@ -797,7 +1058,7 @@ class APRSModem:
     @staticmethod
     def _parse_aprs_position(info):
         result = {}
-        m = _re.search(r'(\d{4}\.\d+)([NS])(.)(\d{5}\.\d+)([EW])(.)', info)
+        m = _re.search(r'(\d{4}\.\d+)\s*([NS])(.)(\d{5}\.\d+)\s*([EW])(.)', info)
         if m:
             lat = APRSModem._nmea_to_dd(m.group(1), m.group(2))
             sym_table = m.group(3)
@@ -836,14 +1097,15 @@ class APRSModem:
                     lat_c = compressed[1:5]
                     sym_code  = compressed[9]
                     lon_c = compressed[5:9]
-                    lat_val = 90 - (ord(lat_c[0])-33)*753571/190000 \
-                                 - (ord(lat_c[1])-33)*8281/190000   \
-                                 - (ord(lat_c[2])-33)*91/190000     \
-                                 - (ord(lat_c[3])-33)/190000
-                    lon_val = -180 + (ord(lon_c[0])-33)*753571/190000 \
-                                   + (ord(lon_c[1])-33)*8281/190000   \
-                                   + (ord(lon_c[2])-33)*91/190000     \
-                                   + (ord(lon_c[3])-33)/190000
+                    # Décodage Base91 — spec APRS 1.0.1 §9
+                    # Lat  : plage 90°  → diviseur 380926 (= 91^4 / 180)
+                    # Lon  : plage 180° → diviseur 190463 (= 91^4 / 360)
+                    lat_raw = ((ord(lat_c[0])-33)*753571 + (ord(lat_c[1])-33)*8281
+                               + (ord(lat_c[2])-33)*91   + (ord(lat_c[3])-33))
+                    lon_raw = ((ord(lon_c[0])-33)*753571 + (ord(lon_c[1])-33)*8281
+                               + (ord(lon_c[2])-33)*91   + (ord(lon_c[3])-33))
+                    lat_val = 90.0  - lat_raw / 380926.0
+                    lon_val = -180.0 + lon_raw / 190463.0
                     result['lat'] = round(lat_val, 6)
                     result['lon'] = round(lon_val, 6)
                     sym_key = sym_table + sym_code
@@ -957,7 +1219,7 @@ class APRSModem:
                 lat_dd   = lat_deg + lat_min / 60.0
 
                 # Hémisphère S si dest[3] in 'SLQZ' (bit de signe)
-                south = d[3] in ('S','L','Z','K')  # standard : S,L = South
+                south = (d[3] == 'L')  # APRS 1.0.1 §10 : seul L = hémisphère Sud (P-Y=North, K/Z=ambiguity North)  # PATCH_MICE_SOUTH_v1
                 if south: lat_dd = -lat_dd
 
                 # Longitude : octets info[1..3]
@@ -966,17 +1228,36 @@ class APRSModem:
                 lon_raw_deg = ord(info[1]) - 28
                 lon_raw_min = ord(info[2]) - 28
                 lon_raw_frc = ord(info[3]) - 28
-                # Offset d'ambiguïté longitude : dest[4]
-                if d[4] in ('P','Q','R','S','T','U','V','W','X','Y'):
+
+                # Sanity check: minutes/centièmes hors plage → trame corrompue
+                if lon_raw_min > 59 or lon_raw_frc > 99 or lon_raw_min < 0 or lon_raw_frc < 0:
+                    raise ValueError("Mic-E lon min/frc hors plage: %d %d" % (lon_raw_min, lon_raw_frc))
+
+                # Offset longitude : dest[4] in P-Y ou L → +100°
+                # (couvre les plages 0°-9° et 100°-109°)
+                # Réf. APRS 1.0.1 §10 Table 10-2
+                if d[4] in ('P','Q','R','S','T','U','V','W','X','Y','L'):
                     lon_raw_deg += 100
+                # Correction de plage (valeur après offset) :
+                #   180-189 → -80  → donne 100-109°
+                #   190-199 → -190 → donne 0-9°
                 if lon_raw_deg >= 180 and lon_raw_deg <= 189:
                     lon_raw_deg -= 80
                 elif lon_raw_deg >= 190 and lon_raw_deg <= 199:
                     lon_raw_deg -= 190
                 lon_min = lon_raw_min + lon_raw_frc / 100.0
                 lon_dd  = lon_raw_deg + lon_min / 60.0
-                west = d[4] in ('L','W')  # bit Ouest
+                # Flag Ouest encodé dans dest[5] (PAS dest[4])
+                # dest[4] = offset +100°, dest[5] = hémisphère Est/Ouest
+                # Réf. APRS 1.0.1 §10 — erreur courante de confondre les deux
+                west = d[5] in ('P','Q','R','S','T','U','V','W','X','Y','L')
                 if west: lon_dd = -lon_dd
+
+                # Sanity check finale : coordonnées dans les plages légales
+                if lon_dd < -180.0 or lon_dd > 180.0:
+                    raise ValueError("Mic-E lon hors plage: %.4f" % lon_dd)
+                if lat_dd < -90.0 or lat_dd > 90.0:
+                    raise ValueError("Mic-E lat hors plage: %.4f" % lat_dd)
 
                 extra['lat'] = round(lat_dd, 6)
                 extra['lon'] = round(lon_dd, 6)
@@ -1262,6 +1543,13 @@ class APRSModem:
     dw_log_lines    = collections.deque(maxlen=80)
     dw_frames_decoded = 0   # trames signalées par Dire Wolf dans stderr
 
+    # ── Suspension Direwolf pour SSTV ────────────────────────────────────────
+    # Setter cet event AVANT de démarrer SSTV pour que _rx_loop tue Direwolf
+    # et attende. Le clearer à l'arrêt SSTV pour que Direwolf redémarre.
+    _dw_pause = threading.Event()          # setté = Direwolf suspendu
+    _current_dw_proc = None               # référence subprocess.Popen Direwolf
+    _dw_proc_lock    = threading.Lock()   # protection de _current_dw_proc
+
     def _find_alsa_device_name(self):
         """
         Retourne le nom ALSA à passer à Dire Wolf pour le device RX.
@@ -1325,10 +1613,31 @@ class APRSModem:
         """
         Genere direwolf.conf pour RX ET TX.
         Dire Wolf gere lui-meme la PTT et l'audio TX via KISS.
+
+        Mode HF 300 bauds (hf_mode=True) :
+          - Vitesse  : 300 baud (AFSK)
+          - Tonalités: MARK 1600 Hz / SPACE 1800 Hz (standard AX.25 HF / APRS-HF)
+          - Modulation: USB (radio réglée en USB, signal audio centré autour de 1700 Hz)
+          - Directive Dire Wolf : MODEM 300 1600:1800
+          - TXDELAY augmenté automatiquement à 500 ms minimum (radio HF plus lente à monter)
+          - Compatible APRS-HF (10.151 MHz USB / 14.105 MHz USB / 144.800 MHz pour tests)
         """
         port     = self.cfg.get("serial_port", "").strip()
         ptt_mode = self.cfg.get("ptt_mode", "RTS").upper()
-        tx_delay = max(100, int(self.cfg.get("tx_delay_ms", 300)))
+        hf_mode  = bool(self.cfg.get("hf_mode", False))
+
+        # ── Sélection de la vitesse et des tonalités ──────────────────────────
+        if hf_mode:
+            mark_hz  = int(self.cfg.get("hf_mark_hz",  1600))
+            space_hz = int(self.cfg.get("hf_space_hz", 1800))
+            modem_line  = "MODEM 300 %d:%d" % (mark_hz, space_hz)
+            # TXDELAY minimum 500 ms en HF (temps de montée de la radio + propagation)
+            tx_delay = max(500, int(self.cfg.get("tx_delay_ms", 500)))
+            logger.info("[DW] Mode HF 300 bauds — MARK %d Hz / SPACE %d Hz — TXDELAY %d ms",
+                        mark_hz, space_hz, tx_delay)
+        else:
+            modem_line = "MODEM 1200"
+            tx_delay   = max(100, int(self.cfg.get("tx_delay_ms", 300)))
 
         # Ligne PTT : "PTT RTS /dev/ttyUSB0" ou "PTT DTR /dev/ttyUSB0"
         if port and ptt_mode in ("RTS", "DTR"):
@@ -1344,7 +1653,7 @@ class APRSModem:
             "ACHANNELS 1",
             "CHANNEL 0",
             "MYCALL %s"    % self.cfg.get("callsign", "N0CALL"),
-            "MODEM 1200",
+            modem_line,
             ptt_line,
             "TXDELAY %d"   % tx_delay,
             "KISSPORT %d"  % APRSModem.DIREWOLF_KISS_PORT,
@@ -1467,6 +1776,9 @@ class APRSModem:
                     stderr=subprocess.PIPE,
                     text=True,
                 )
+                # Exposer la référence pour la suspension SSTV
+                with APRSModem._dw_proc_lock:
+                    APRSModem._current_dw_proc = dw_proc
                 # Thread de capture stderr (erreurs audio, init device…)
                 def _dw_stderr(proc):
                     for line in proc.stderr:
@@ -1516,6 +1828,10 @@ class APRSModem:
                 APRSModem.rx_thread_alive = True
                 logger.info("[RX] Connecté au port KISS -- en écoute...")
 
+                # PATCH_MONITOR_FREEZE_267 — watchdog silence KISS
+                KISS_SILENCE_TIMEOUT = 120   # secondes sans aucun octet → redémarrage
+                _last_data_ts = time.time()
+
                 buf = bytearray()
                 while self.is_rx_running:
                     # ── Niveau audio : estimation via sounddevice ─────────────
@@ -1523,6 +1839,13 @@ class APRSModem:
                     try:
                         data = sock.recv(4096)
                     except socket.timeout:
+                        # Watchdog : si silence trop long, forcer redémarrage Direwolf
+                        if time.time() - _last_data_ts > KISS_SILENCE_TIMEOUT:
+                            logger.warning(
+                                "[RX] Watchdog KISS : aucun octet depuis %ds — redémarrage Direwolf",
+                                KISS_SILENCE_TIMEOUT,
+                            )
+                            break
                         # Pas de donnée, on continue la boucle
                         continue
                     except OSError:
@@ -1530,6 +1853,8 @@ class APRSModem:
 
                     if not data:
                         break
+
+                    _last_data_ts = time.time()
 
                     # Comptage brut des octets reçus comme proxy de "bits"
                     APRSModem.rx_bit_count += len(data) * 8
@@ -1543,7 +1868,10 @@ class APRSModem:
                         frame = self._parse_ax25_kiss(ax25_bytes)
                         if frame:
                             APRSModem.rx_bit_count += len(ax25_bytes) * 8
-                            APRSModem.rx_queue.put(frame)
+                            try:
+                                APRSModem.rx_queue.put_nowait(frame)
+                            except queue.Full:
+                                logger.warning("[KISS] rx_queue pleine — trame ignorée (broadcaster mort ?)")
                             logger.debug("[KISS] Trame RX : %s>%s %s",
                                 frame.get("src","?"), frame.get("dest","?"),
                                 frame.get("aprs_type","?"))
@@ -1572,8 +1900,13 @@ class APRSModem:
                     except:
                         try: dw_proc.kill()
                         except: pass
+                # Effacer la référence process maintenant qu'il est mort
+                with APRSModem._dw_proc_lock:
+                    if APRSModem._current_dw_proc is dw_proc:
+                        APRSModem._current_dw_proc = None
 
             if self.is_rx_running:
+                # ── Vérifier si SSTV a demandé la suspension ─────────────────
                 logger.warning("[RX] Pipeline interrompu -- redémarrage dans 3 s...")
                 time.sleep(3.0)
 
@@ -1625,6 +1958,65 @@ def _enum_audio_devices():
         except Exception:
             pass
 
+    # ── Source 1b : /proc/asound/cards — cartes même si "busy" (tenues par Dire Wolf) ──
+    # arecord -l peut omettre une carte si son device 0 est exclusivement ouvert.
+    # /proc/asound/cards liste TOUTES les cartes présentes, quel que soit leur état.
+    try:
+        with open("/proc/asound/cards", "r") as _fac:
+            for line in _fac:
+                # Format : " N [ID           ]: driver - Nom long"
+                mp = _re.match(r'\s*(\d+)\s+\[(\S+)\s*\]:\s*\S+\s+-\s+(.+)', line)
+                if not mp:
+                    continue
+                card_n   = mp.group(1)
+                card_id  = mp.group(2)
+                card_long = mp.group(3).strip()
+                # Scanner tous les devices PCM disponibles sur cette carte
+                # (pas seulement device 0 -- le MicroHAM et certains USB audio
+                #  exposent leurs PCM sur device 1, 2, etc.)
+                card_dir = "/proc/asound/card%s" % card_n
+                pcm_devs_found = set()
+                if os.path.isdir(card_dir):
+                    for entry in os.listdir(card_dir):
+                        # Les entrees PCM sont nommees pcm0p, pcm0c, pcm1p, pcm1c...
+                        m_pcm = _re.match(r"pcm(\d+)([pc])", entry)
+                        if m_pcm:
+                            pcm_devs_found.add(m_pcm.group(1))
+                # Si aucun PCM trouve via /proc, essayer 0 par defaut
+                if not pcm_devs_found:
+                    pcm_devs_found = {"0"}
+                for dev_n in sorted(pcm_devs_found, key=int):
+                    hw_key = "plughw:%s,%s" % (card_n, dev_n)
+                    if hw_key in seen_hw:
+                        continue
+                    pcm_path   = "/proc/asound/card%s/pcm%sp" % (card_n, dev_n)
+                    pcm_c_path = "/proc/asound/card%s/pcm%sc" % (card_n, dev_n)
+                    has_out = os.path.exists(pcm_path)
+                    has_in  = os.path.exists(pcm_c_path)
+                    if not (has_in or has_out):
+                        if not os.path.isdir(card_dir):
+                            continue
+                        has_in = has_out = True
+                    else:
+                        # Forcer has_in=True : le device peut etre busy (Dire Wolf)
+                        # mais il est physiquement disponible
+                        has_in = True
+                    # Label : distinguer les devices si plusieurs PCM sur la meme carte
+                    if len(pcm_devs_found) > 1:
+                        label = "%s — device %s (plughw:%s,%s)" % (card_long, dev_n, card_n, dev_n)
+                    else:
+                        label = "%s (card %s)" % (card_long, card_n)
+                    seen_hw.add(hw_key)
+                    devices.append({
+                        "id":   hw_key,
+                        "name": label,
+                        "hw":   hw_key,
+                        "in":   has_in,
+                        "out":  has_out,
+                    })
+    except Exception:
+        pass
+
     # ── Source 2 : PortAudio (fallback ou devices supplémentaires) ────────────
     pa_devices = []
     try:
@@ -1632,35 +2024,100 @@ def _enum_audio_devices():
         for i, d in enumerate(dev_list):
             if d['max_output_channels'] > 0 or d['max_input_channels'] > 0:
                 pa_name = d['name']
-                # Vérifier si déjà dans la liste ALSA (correspondance par nom partiel)
-                already = any(
-                    any(w.lower() in pa_name.lower() for w in dev['name'].split() if len(w) >= 4)
-                    for dev in devices
-                )
+                # Mots génériques à ignorer dans la comparaison (évite les faux matchs
+                # sur "USB", "Audio", "CODEC" qui sont communs à des devices différents)
+                _GENERIC = {"usb", "audio", "codec", "device", "input", "output",
+                            "interface", "sound", "card", "default", "plug", "alsa"}
+                def _sig_words(s):
+                    return {w.lower() for w in s.split() if len(w) >= 4 and w.lower() not in _GENERIC}
+                pa_sig = _sig_words(pa_name)
+                # Deduplication par mots significatifs communs.
+                # Si pa_sig est vide (nom full-generique ex. "USB Audio CODEC"),
+                # on compare le nom complet normalise pour eviter les faux doublons
+                # mais on NE SUPPRIME PAS le device -- un nom generique peut correspondre
+                # a une carte completement differente (MicroHAM, SignaLink, etc.)
+                already = False
+                if pa_sig:
+                    for dev in devices:
+                        dev_sig = _sig_words(dev["name"])
+                        if dev_sig and pa_sig & dev_sig:
+                            already = True
+                            break
+                # Cas nom full-generique : dedup uniquement si nom EXACT deja vu
+                # (evite de supprimer deux cartes "USB Audio CODEC" differentes)
+                # -> on ne deduplique pas, on laisse passer avec son index PA
                 if not already:
                     pa_devices.append({
                         "id":   i,
                         "name": pa_name + " (PA:%d)" % i,
                         "hw":   None,
-                        "in":   d['max_input_channels'] > 0,
-                        "out":  d['max_output_channels'] > 0,
+                        "in":   d["max_input_channels"] > 0,
+                        "out":  d["max_output_channels"] > 0,
                     })
     except Exception:
         pass
 
     all_devices = devices + pa_devices
 
-    # S'assurer que le device actuellement configuré est toujours présent
-    # même si ALSA ne le voit plus (Dire Wolf le tient) — on l'ajoute depuis config
-    cfg_rx = config_manager.data.get('audio_device_rx')
-    cfg_tx = config_manager.data.get('audio_device_tx')
+    # ── Source 3 : PulseAudio / PipeWire — sources monitor ───────────────────
+    # Ces sources capturent la sortie audio du système (loopback logiciel),
+    # ce qui permet a SSTV de s'accrocher au meme flux qu'APRS/Dire Wolf.
+    try:
+        import subprocess as _sp2
+        out = _sp2.run(['pactl', 'list', 'sources', 'short'],
+                       capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+            src_name = parts[1].strip()
+            if '.monitor' in src_name or 'monitor' in src_name.lower():
+                label = "Loopback Monitor : " + src_name
+                if not any(d['id'] == src_name for d in all_devices):
+                    all_devices.append({
+                        "id":    src_name,
+                        "name":  label,
+                        "hw":    None,
+                        "in":    True,
+                        "out":   False,
+                        "monitor": True,
+                    })
+    except Exception:
+        pass
+
+    # ── Source 4 : ALSA loopback snd-aloop ───────────────────────────────────
+    try:
+        import subprocess as _sp3
+        aloop_out = _sp3.run(['arecord', '-l'], capture_output=True, text=True).stdout
+        for line in aloop_out.splitlines():
+            if 'Loopback' in line or 'loopback' in line:
+                m2 = _re.search(r'card (\d+).*device (\d+)', line)
+                if m2:
+                    c, d2 = m2.group(1), m2.group(2)
+                    hw_key = "plughw:%s,%s" % (c, d2)
+                    if not any(dev['id'] == hw_key for dev in all_devices):
+                        all_devices.append({
+                            "id":    hw_key,
+                            "name":  "ALSA Loopback : " + hw_key,
+                            "hw":    hw_key,
+                            "in":    True,
+                            "out":   False,
+                            "loopback": True,
+                        })
+    except Exception:
+        pass
+
+    # S'assurer que le device actuellement configure est toujours present
+    # meme si ALSA ne le voit plus (Dire Wolf le tient) -- on l'ajoute depuis config
+    cfg_rx   = config_manager.data.get('audio_device_rx')
+    cfg_tx   = config_manager.data.get('audio_device_tx')
     for cfg_val in set([cfg_rx, cfg_tx]):
         if cfg_val is None:
             continue
         if not any(str(d['id']) == str(cfg_val) for d in all_devices):
             all_devices.insert(0, {
                 "id":   cfg_val,
-                "name": "⚠️ %s (config sauvegardee)" % cfg_val,
+                "name": "config sauvegardee : %s" % cfg_val,
                 "hw":   None, "in": True, "out": True,
             })
 
@@ -1744,7 +2201,14 @@ def index():
         ) for d in devices if d.get("in")
     ])
 
-    return """<!DOCTYPE html>
+    _cfg_json = json.dumps({
+        'maidenhead': config_manager.data.get('maidenhead', ''),
+        'geo_mode':   config_manager.data.get('geo_mode',   'locator'),
+        'lat_manual': config_manager.data.get('lat_manual', ''),
+        'lon_manual': config_manager.data.get('lon_manual', ''),
+    })
+    _callsign_json = json.dumps(config_manager.data.get('callsign', 'N0CALL'))
+    return ("""<!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
@@ -1785,6 +2249,18 @@ def index():
         .prox-switch input:checked + .prox-slider:before { transform:translateX(18px); background:#fbbf24; }
         @keyframes issDotPulse {
             0%,100% { opacity:.55; } 50% { opacity:1; }
+        }
+        @keyframes wxBadgePulse {
+            0%,100% { opacity:.75; box-shadow:0 0 4px #f59e0b44; }
+            50%      { opacity:1;   box-shadow:0 0 10px #f59e0b88; }
+        }
+        @keyframes propBadgePulse {
+            0%,100% { opacity:.80; box-shadow:0 0 5px #ef444455; }
+            50%      { opacity:1;   box-shadow:0 0 12px #ef4444aa; }
+        }
+        @keyframes propPillPulse {
+            0%,100% { box-shadow:0 0 4px #ef444433; }
+            50%      { box-shadow:0 0 10px #ef4444cc; }
         }
         /* ── Mobile optimisations ── */
         * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
@@ -1878,14 +2354,316 @@ def index():
             /* Grilles réglages */
             .grid-cols-3 { grid-template-columns: 1fr !important; }
             .col-span-2 { grid-column: span 1 !important; }
+
+            /* ── Cartes trafic APRS : lisibilité mobile ───────── */
+            /* Conteneur console : padding réduit */
+            #console { padding: 8px !important; }
+            /* En-tête de trame : empilé en 2 lignes propres */
+            .aprs-card { padding: 10px 11px !important; }
+            .aprs-card-hdr {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 5px !important;
+            }
+            .aprs-card-hdr-left {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            .aprs-card-hdr-right {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                justify-content: space-between;
+            }
+            /* Indicatif plus lisible */
+            .aprs-cs-link { font-size: 13px !important; padding: 3px 8px !important; }
+            /* Badges direction TX/RX/IS plus grands */
+            .aprs-dir-badge { font-size: 10px !important; padding: 3px 9px !important; }
+            /* Badge type APRS lisible */
+            .aprs-type-badge { font-size: 10px !important; padding: 3px 8px !important; }
+            /* Heure en gris discret */
+            .aprs-time { font-size: 10px !important; color: #475569; margin-left: auto; }
+            /* Masquer dest/path sur très petit écran */
+            .aprs-dest-path { display: none !important; }
+            /* Champs décodés : badges plus grands */
+            .aprs-fields { margin-top: 8px !important; gap: 5px !important; }
+            .aprs-fields span[style*="font-size:10px"],
+            .aprs-fields span[style*="font-size:9px"] {
+                font-size: 11px !important;
+                padding: 3px 8px !important;
+            }
+            /* Bouton trame brute */
+            .raw-toggle { font-size: 10px !important; padding: 4px 0 !important; }
+
+            /* ── TRAFIC mobile-first : console en premier ─────────────── */
+            /* Reorder : console (col-9) avant panneau (col-3)             */
+            #traffic-console-col  { order: -1; }
+            #traffic-sidebar-col  { order:  1; }
+            /* Console plein écran sans sidebar au-dessus                  */
+            #traffic-console-col .glass { height: calc(100vh - 180px) !important; min-height: 320px; }
+            /* Header console sticky sur mobile                            */
+            #console-sticky-hdr   { position: sticky; top: 0; z-index: 20;
+                                    background: rgba(9,16,32,0.98);
+                                    backdrop-filter: blur(10px);
+                                    border-bottom: 1px solid #1e293b; }
+            /* Cartes APRS ultra-compactes                                 */
+            .aprs-card {
+                padding: 8px 10px !important;
+                border-radius: 9px !important;
+            }
+            /* Header carte : indicatif + badge direction sur une ligne,
+               type + heure sur la deuxième                                */
+            .aprs-card-hdr {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 3px !important;
+            }
+            .aprs-card-hdr-left {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                flex-wrap: nowrap;
+                overflow: hidden;
+            }
+            .aprs-card-hdr-right {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                justify-content: space-between;
+            }
+            .aprs-cs-link  { font-size: 12px !important; padding: 2px 7px !important; }
+            .aprs-dir-badge { font-size: 9px !important; padding: 2px 7px !important; flex-shrink: 0; }
+            .aprs-type-badge { font-size: 9px !important; padding: 2px 6px !important; }
+            .aprs-time  { font-size: 9px !important; color: #475569; margin-left: auto; flex-shrink: 0; }
+            .aprs-dest-path { display: none !important; }
+            .aprs-fields { margin-top: 6px !important; gap: 4px !important; flex-wrap: wrap; }
+            .aprs-fields span { font-size: 10px !important; padding: 2px 6px !important; }
+            /* Panneau gauche : réduit avec accordéon                      */
+            #traffic-sidebar-toggle { display: flex; }
+            #traffic-sidebar-body   { display: none; }
+            #traffic-sidebar-body.open { display: block; }
+            /* Barre filtre/compteur intégrée dans le sticky header        */
+            #monitor-filter-row { flex-wrap: wrap; gap: 5px; }
         }
         @media (min-width: 768px) {
             #mobile-nav { display: none !important; }
         }
+
+        /* ══════════════════════════════════════════════════════
+           MODE JOUR / NUIT  —  DAYNIGHT_PATCH_APPLIED
+           ══════════════════════════════════════════════════════ */
+        /* -- Bouton toggle -- */
+        #daynight-btn {
+            position: fixed; top: 12px; right: 16px; z-index: 2000;
+            background: rgba(30,41,59,.85); border: 1px solid #334155;
+            border-radius: 50%; width: 38px; height: 38px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; font-size: 18px; line-height: 1;
+            box-shadow: 0 2px 10px #0005; transition: background .2s, border-color .2s;
+        }
+        #daynight-btn:hover { background: rgba(51,65,85,.95); }
+
+        /* ── Palette "Brume" — bleu-gris très pâle, reposant ────────────────
+           Fond global    : #eceff5  (brume bleue très pâle)
+           Fond panneaux  : #f4f6fa  (blanc bleuté)
+           Fond inputs    : #f8f9fc  (blanc quasi pur, teinté bleu)
+           Bordures       : #d4d9e6  (gris-bleu doux)
+           Texte principal: #242c3a  (ardoise foncée, jamais noir)
+           Texte secondaire: #6a7490 (gris-bleu moyen)
+           Texte tertiaire : #8a92a8 (gris-bleu clair)
+           Accent bleu     : #6a9acc (bleu acier pastel)
+           Accent vert     : #5a9e78 (vert doux)
+           Accent violet   : #8878b8 (indigo poudré)
+        ── */
+        /* -- Mode jour (classe .day-mode sur <body>) -- */
+        body.day-mode {
+            background-color: #eceff5 !important;
+            color: #242c3a !important;
+        }
+        body.day-mode #daynight-btn {
+            background: rgba(244,246,250,0.96);
+            border-color: #c8cedc;
+            box-shadow: 0 2px 8px rgba(36,44,58,.08);
+        }
+        /* Panneaux glass */
+        body.day-mode .glass {
+            background: rgba(244,246,250,0.86) !important;
+            border-color: rgba(200,206,220,0.55) !important;
+            backdrop-filter: blur(12px);
+        }
+        /* Fond principal des cartes/sections */
+        body.day-mode .bg-slate-900,
+        body.day-mode .bg-slate-900\/80,
+        body.day-mode [class*="bg-slate-900"] {
+            background-color: #f4f6fa !important;
+        }
+        body.day-mode .bg-slate-800,
+        body.day-mode [class*="bg-slate-800"] {
+            background-color: #eceff5 !important;
+        }
+        body.day-mode .bg-\[\#020617\],
+        body.day-mode .bg-\[#020617\] {
+            background-color: #eceff5 !important;
+        }
+        body.day-mode .bg-\[#0f172a\],
+        body.day-mode .bg-\[#0f172a\]\/80 {
+            background-color: #f4f6fa !important;
+        }
+        /* Textes — ardoise douce, jamais noir pur */
+        body.day-mode .text-slate-300 { color: #54607a !important; }
+        body.day-mode .text-slate-400 { color: #6a7490 !important; }
+        body.day-mode .text-slate-500 { color: #8a92a8 !important; }
+        body.day-mode .text-white     { color: #242c3a !important; }
+        body.day-mode .text-slate-200 { color: #2e3850 !important; }
+        /* Accents désaturés et froids */
+        body.day-mode .text-blue-400  { color: #6a9acc !important; }
+        body.day-mode .text-blue-500  { color: #5280b8 !important; }
+        body.day-mode .text-emerald-400 { color: #5a9e78 !important; }
+        body.day-mode .text-violet-400  { color: #8878b8 !important; }
+        /* Bordures légères */
+        body.day-mode .border-slate-800 { border-color: #d4d9e6 !important; }
+        body.day-mode .border-slate-700 { border-color: #c8cedc !important; }
+        body.day-mode .border-\[#1e3a5f\] { border-color: #bacad8 !important; }
+        /* Inputs */
+        body.day-mode input, body.day-mode select, body.day-mode textarea {
+            background-color: #f8f9fc !important;
+            color: #242c3a !important;
+            border-color: #c8cedc !important;
+        }
+        body.day-mode input:focus, body.day-mode select:focus, body.day-mode textarea:focus {
+            border-color: #8878b8 !important;
+            box-shadow: 0 0 0 2px rgba(136,120,184,.15) !important;
+            outline: none !important;
+        }
+        /* Console trafic */
+        body.day-mode .rx-entry {
+            background: rgba(244,246,250,0.90) !important;
+            border-left-color: #6a9acc !important;
+        }
+        body.day-mode .aprs-card:hover {
+            background: rgba(232,236,244,0.78) !important;
+        }
+        /* Bottom nav mobile */
+        body.day-mode #mobile-nav {
+            background: rgba(244,246,250,0.97) !important;
+            border-top-color: #d4d9e6 !important;
+        }
+        body.day-mode #mobile-nav button { color: #8a92a8; }
+        body.day-mode #mobile-nav button.active { color: #5280b8; background: rgba(82,128,184,.10); }
+        /* Leaflet popups */
+        body.day-mode .leaflet-popup-content-wrapper {
+            background: #f4f6fa !important;
+            color: #242c3a !important;
+            border-color: #c8cedc !important;
+        }
+        body.day-mode .leaflet-popup-tip { background: #f4f6fa !important; }
+        /* Marqueurs labels */
+        body.day-mode .aprs-marker-label {
+            background: rgba(244,246,250,0.93) !important;
+            color: #3e5882 !important;
+            border-color: #bacad8 !important;
+        }
+        /* Trail tooltip */
+        body.day-mode .aprs-trail-tip {
+            background: rgba(244,246,250,0.97) !important;
+            border-color: #c8cedc !important;
+            color: #54607a !important;
+        }
+        /* Nav desktop */
+        body.day-mode nav.desktop-nav {
+            background: rgba(236,239,245,0.90) !important;
+            border-color: #d4d9e6 !important;
+        }
+        /* Scrollbar */
+        body.day-mode .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #c8cedc;
+        }
+        /* ── Boutons — texte lisible en mode jour ──────────────────────────── */
+        /* Nav desktop : inactifs */
+        body.day-mode nav.desktop-nav button {
+            color: #2e3850 !important;
+        }
+        /* Nav desktop : survol */
+        body.day-mode nav.desktop-nav button:hover {
+            color: #0f1a2e !important;
+            background: rgba(82,128,184,.12) !important;
+        }
+        /* Nav desktop : actif (bg-blue-600) */
+        body.day-mode nav.desktop-nav button.bg-blue-600 {
+            background: #3a6aaa !important;
+            color: #ffffff !important;
+        }
+        /* Tous les boutons génériques dans les panneaux */
+        body.day-mode button {
+            color: #2e3850 !important;
+        }
+        /* Boutons action (texte gris slate) */
+        body.day-mode .text-slate-600 { color: #3a4460 !important; }
+        body.day-mode .hover\:text-slate-200:hover { color: #0f1a2e !important; }
+        body.day-mode .hover\:text-red-400:hover   { color: #b83232 !important; }
+        body.day-mode .hover\:text-blue-400:hover  { color: #3a6aaa !important; }
+        body.day-mode .hover\:text-orange-400:hover{ color: #b86a1a !important; }
+        body.day-mode .hover\:text-emerald-300:hover{ color: #2a7a50 !important; }
+        body.day-mode .hover\:text-amber-300:hover { color: #a06010 !important; }
+        body.day-mode .hover\:text-blue-300:hover  { color: #2a5a9a !important; }
+        body.day-mode .hover\:text-violet-300:hover{ color: #5a42a8 !important; }
+        body.day-mode .hover\:text-yellow-300:hover{ color: #906800 !important; }
+        /* Boutons mobiles */
+        body.day-mode #mobile-nav button { color: #6a7490 !important; }
+        body.day-mode #mobile-nav button.active { color: #3a6aaa !important; }
+        /* Login card */
+        body.day-mode .card {
+            background: #f4f6fa !important;
+            border-color: #c8cedc !important;
+        }
     </style>
 <script>
+    /* ── Mode Jour / Nuit ─────────────────────────────────────────────────── */
+    (function() {
+        var _DN_KEY = 'aprs_daymode';
+        function _applyTheme(day) {
+            if (day) {
+                document.body.classList.add('day-mode');
+            } else {
+                document.body.classList.remove('day-mode');
+            }
+            var btn = document.getElementById('daynight-btn');
+            if (btn) btn.textContent = day ? '🌙' : '☀️';
+            btn && (btn.title = day ? 'Passer en mode nuit' : 'Passer en mode jour');
+            // Changer le fond de la carte Leaflet si elle est initialisée
+            if (typeof _map !== 'undefined' && _map) {
+                _map.eachLayer(function(l) {
+                    if (l._url) _map.removeLayer(l);
+                });
+                var tileUrl = day
+                    ? 'https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png'
+                    : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+                L.tileLayer(tileUrl, { maxZoom: 20, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributeurs' }).addTo(_map);
+            }
+        }
+        window._isDayMode = function() {
+            return document.body.classList.contains('day-mode');
+        };
+        window.toggleDayNight = function() {
+            var day = !_isDayMode();
+            localStorage.setItem(_DN_KEY, day ? '1' : '0');
+            _applyTheme(day);
+        };
+        // Appliquer au chargement (avant render pour éviter le flash)
+        document.addEventListener('DOMContentLoaded', function() {
+            var saved = localStorage.getItem(_DN_KEY);
+            _applyTheme(saved === '1');
+        });
+    })();
+
     function switchTab(tabId) {
-        ['terminal', 'config', 'qso', 'map', 'iss', 'stats'].forEach(function(t) {
+        ['terminal', 'config', 'qso', 'map', 'iss', 'sstv', 'stats', 'notes'].forEach(function(t) {
             var el  = document.getElementById('tab-' + t);
             var btn = document.getElementById('btn-' + t);
             var mbn = document.getElementById('mnav-' + t);
@@ -1904,6 +2682,9 @@ def index():
         if (tabId === 'iss') {
             var iframe = document.getElementById('iss-iframe');
             if (iframe && iframe.src === 'about:blank') iframe.src = iframe.dataset.src;
+            // Rafraîchir le bandeau prochain passage à chaque ouverture de l'onglet ISS
+            if (typeof issPassRefresh === 'function') issPassRefresh();
+            if (typeof iss24hRefresh === 'function') iss24hRefresh();
         }
         document.dispatchEvent(new CustomEvent('aprs-switchtab', {detail: tabId}));
         /* Scroll top sur mobile */
@@ -1912,6 +2693,8 @@ def index():
 </script>
 </head>
 <body class="bg-[#020617] text-slate-300 min-h-screen font-sans">
+<!-- ── Bouton Mode Jour / Nuit ── DAYNIGHT_PATCH_APPLIED -->
+<button id="daynight-btn" onclick="toggleDayNight()" title="Passer en mode jour">☀️</button>
 <div class="max-w-6xl mx-auto p-4 lg:p-8">
 
     <header class="flex flex-col lg:flex-row items-center justify-between mb-4 lg:mb-10 gap-2 lg:gap-6">
@@ -1921,7 +2704,7 @@ def index():
                 <i class="fas fa-broadcast-tower text-3xl text-white"></i>
             </a>
             <div>
-                <h1 class="text-3xl font-black tracking-tight text-white italic">Py-APRS <span id="app-version-badge" class="text-blue-500 text-sm not-italic font-medium ml-2 cursor-pointer hover:text-blue-300 transition-colors" onclick="document.getElementById('modal-aide').classList.remove('hidden');aideShowTab('changelog')" title="Voir le changelog">v2.4</span></h1>
+                <h1 class="text-3xl font-black tracking-tight text-white italic">Py-APRS <span id="app-version-badge" class="text-blue-500 text-sm not-italic font-medium ml-2 cursor-pointer hover:text-blue-300 transition-colors" onclick="document.getElementById('modal-aide').classList.remove('hidden');aideShowTab('changelog')" title="Voir le changelog">v2.6.9</span></h1>
                 <div class="flex items-center gap-2 mt-1">
                     <span class="relative flex h-2 w-2">
                         <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -1945,6 +2728,44 @@ def index():
                     <span id="ptt-label" class="font-black text-[10px] tracking-widest uppercase transition-colors duration-200"
                           style="color:#334155;letter-spacing:.15em">PTT</span>
                 </div>
+                <!-- ── Badge alertes météo (à côté du PTT) ── -->
+                <div id="wx-alert-badge" title=""
+                     style="display:none;align-items:center;gap:4px;padding:3px 9px;border-radius:10px;
+                            background:rgba(120,53,15,0.55);border:1px solid #f59e0b55;
+                            cursor:pointer;transition:all .3s"
+                     onclick="_wxAlertBadgeClick()">
+                    <span id="wx-alert-badge-icon" style="font-size:14px;line-height:1">⚠️</span>
+                    <span id="wx-alert-badge-txt"  style="font-size:9px;font-weight:900;color:#fcd34d;
+                           letter-spacing:.12em;text-transform:uppercase;white-space:nowrap"></span>
+                </div>
+                <!-- Badge alertes propagation / blackout HF -->
+                <div id="prop-alert-badge" title=""
+                     style="display:none;align-items:center;gap:4px;padding:3px 9px;border-radius:10px;background:rgba(120,20,20,0.6);border:1px solid #ef444455;cursor:pointer;transition:all .3s"
+                     onclick="_propAlertBadgeClick()">
+                    <span id="prop-alert-badge-icon" style="font-size:14px;line-height:1">📶</span>
+                    <span id="prop-alert-badge-txt"  style="font-size:9px;font-weight:900;color:#fca5a5;letter-spacing:.12em;text-transform:uppercase;white-space:nowrap"></span>
+                </div>
+                <!-- Pill propagation discrète (toujours visible) -->
+                <div id="prop-status-pill"
+                     title="Indices de propagation HF — Kp / SFI / X-ray"
+                     style="display:flex;align-items:center;gap:6px;padding:3px 8px;border-radius:10px;
+                            background:rgba(15,23,42,0.7);border:1px solid #1e293b;
+                            cursor:default;transition:border-color .4s,box-shadow .4s">
+                    <span id="prop-pill-kp"
+                          style="font-size:9px;font-weight:800;font-family:monospace;
+                                 color:#64748b;letter-spacing:.05em;white-space:nowrap;
+                                 transition:color .3s">🧲 –</span>
+                    <span style="color:#1e293b;font-size:9px">·</span>
+                    <span id="prop-pill-sfi"
+                          style="font-size:9px;font-weight:800;font-family:monospace;
+                                 color:#64748b;letter-spacing:.05em;white-space:nowrap;
+                                 transition:color .3s">📻 –</span>
+                    <span style="color:#1e293b;font-size:9px">·</span>
+                    <span id="prop-pill-xray"
+                          style="font-size:9px;font-weight:800;font-family:monospace;
+                                 color:#64748b;letter-spacing:.05em;white-space:nowrap;
+                                 transition:color .3s">☀️ –</span>
+                </div>
             </div>
         </div>
         <nav class="desktop-nav flex bg-slate-900/80 p-1.5 rounded-2xl border border-slate-800 shadow-inner">
@@ -1958,7 +2779,9 @@ def index():
                 <span id="map-badge" class="hidden ml-1 bg-emerald-500 text-white text-[9px] font-black rounded-full px-1.5 py-0.5">0</span>
             </button>
             <button id="btn-iss"      onclick="switchTab('iss')"      class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-slate-200">🛰️ ISS</button>
+            <button id="btn-sstv"     onclick="switchTab('sstv')"     class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-slate-200">📷 SSTV</button>
             <button id="btn-stats"    onclick="switchTab('stats')"    class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-slate-200">📊 STATS</button>
+            <button id="btn-notes"    onclick="switchTab('notes')"    class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-slate-200">📝 NOTES</button>
             <button onclick="document.getElementById('modal-aide').classList.remove('hidden')" class="px-6 py-2.5 rounded-xl font-bold transition-all text-slate-500 hover:text-amber-300">❓ AIDE</button>
         </nav>
     </header>
@@ -1987,9 +2810,17 @@ def index():
             <span class="nav-icon">🛰️</span>
             <span>ISS</span>
         </button>
+        <button id="mnav-sstv" onclick="switchTab('sstv')">
+            <span class="nav-icon">📷</span>
+            <span>SSTV</span>
+        </button>
         <button id="mnav-stats" onclick="switchTab('stats')">
             <span class="nav-icon">📊</span>
             <span>STATS</span>
+        </button>
+        <button id="mnav-notes" onclick="switchTab('notes')">
+            <span class="nav-icon">📝</span>
+            <span>NOTES</span>
         </button>
         <button onclick="document.getElementById('modal-aide').classList.remove('hidden')">
             <span class="nav-icon">❓</span>
@@ -1997,10 +2828,43 @@ def index():
         </button>
     </nav>
 
+    <!-- ── Météo discrète ── WEATHER_PATCH_APPLIED ──────────────────────────────
+         Données : Open-Meteo (gratuit, sans clé API)
+         Position: coordonnées de la station (config) ou géolocalisation navigateur
+    ──────────────────────────────────────────────────────────────────────────── -->
+    <div id="weather-bar" style="
+        display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+        background:rgba(15,23,42,0.45); border:1px solid rgba(148,163,184,0.08);
+        border-radius:1rem; padding:8px 18px; margin-bottom:18px;
+        font-size:11px; color:#94a3b8; backdrop-filter:blur(8px);
+        min-height:36px; transition:opacity .3s;
+    ">
+        <span id="wx-icon"  style="font-size:18px;line-height:1">⏳</span>
+        <span id="wx-temp"  style="font-weight:700;color:#e2e8f0;font-size:13px"></span>
+        <span id="wx-feels" style="color:#64748b;font-size:10px"></span>
+        <span id="wx-sep1"  style="color:#334155">│</span>
+        <span id="wx-desc"  style="color:#94a3b8;font-style:italic"></span>
+        <span id="wx-sep2"  style="color:#334155">│</span>
+        <span id="wx-wind"  style="color:#7dd3fc"></span>
+        <span id="wx-sep3"  style="color:#334155">│</span>
+        <span id="wx-hum"   style="color:#86efac"></span>
+        <span id="wx-sep4"  style="color:#334155">│</span>
+        <span id="wx-rain"  style="color:#93c5fd"></span>
+        <span id="wx-loc"   style="margin-left:auto;color:#475569;font-size:9px;white-space:nowrap;cursor:pointer" onclick="_wxRefresh()" title="Actualiser">📍 <span id="wx-loc-name">…</span></span>
+    </div>
+
     <main>
         <!-- ═══════════════════════════════ TRAFIC ═══════════════════════════════ -->
         <div id="tab-terminal" class="grid grid-cols-1 lg:grid-cols-12 gap-8">
-            <div class="lg:col-span-3 space-y-6">
+            <div class="lg:col-span-3 space-y-6" id="traffic-sidebar-col">
+                <!-- Bouton accordéon mobile (masqué desktop) -->
+                <button id="traffic-sidebar-toggle"
+                        onclick="(function(){var b=document.getElementById('traffic-sidebar-body');b.classList.toggle('open');this.querySelector('.tsb-arrow').textContent=b.classList.contains('open')?'▴':'▾'}).call(this)"
+                        style="display:none;width:100%;background:rgba(15,23,42,0.6);border:1px solid #1e293b;border-radius:12px;padding:10px 14px;color:#94a3b8;font-size:12px;font-weight:700;text-align:left;cursor:pointer;align-items:center;gap:8px;justify-content:space-between;">
+                    <span>📤 Envoyer / Statut station</span>
+                    <span class="tsb-arrow" style="color:#475569;font-size:14px;">▾</span>
+                </button>
+                <div id="traffic-sidebar-body">
                 <section class="glass p-6 rounded-[2rem] shadow-2xl">
                     <h2 class="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-6 flex items-center gap-2">
                         📨 Envoyer un Message
@@ -2018,9 +2882,6 @@ def index():
                             📡 ENVOYER QSO
                         </button>
                         <div class="grid grid-cols-1 gap-3 pt-2">
-                            <button onclick="sendISS()" class="bg-slate-800/50 hover:bg-indigo-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
-                                🛸 BEACON ISS
-                            </button>
                             <button onclick="sendBeacon()" class="bg-slate-800/50 hover:bg-blue-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
                                 📡 BEACON STATION
                             </button>
@@ -2033,6 +2894,8 @@ def index():
                             <button onclick="sendStatus()" class="bg-slate-800/50 hover:bg-purple-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
                                 🛰️ ENVOYER STATUT
                             </button>
+                            """ + (('<button onclick="sendText1(this)" class="bg-slate-800/50 hover:bg-emerald-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">📝 ' + (config_manager.data.get('beacon_text1') or '')[:32] + '</button>') if config_manager.data.get('beacon_text1', '').strip() else '') + """
+                            """ + (('<button onclick="sendText2(this)" class="bg-slate-800/50 hover:bg-teal-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">📝 ' + (config_manager.data.get('beacon_text2') or '')[:32] + '</button>') if config_manager.data.get('beacon_text2', '').strip() else '') + """
                         </div>
                     </div>
                 </section>
@@ -2083,6 +2946,22 @@ def index():
                                     </div>
                                     <span id="countdown-propagation" class="text-[10px] font-mono tabular-nums"></span>
                                 </div>
+                                <!-- Texte 1 -->
+                                <div id="badge-text1" class="flex items-center justify-between px-2.5 py-1.5 rounded-xl border transition-all bg-slate-800/40 border-slate-700/50 text-slate-600">
+                                    <div class="flex items-center gap-1.5">
+                                        <span id="led-text1" class="w-2 h-2 rounded-full bg-slate-700 flex-shrink-0"></span>
+                                        <span class="text-[11px]">📝 Texte 1</span>
+                                    </div>
+                                    <span id="countdown-text1" class="text-[10px] font-mono tabular-nums"></span>
+                                </div>
+                                <!-- Texte 2 -->
+                                <div id="badge-text2" class="flex items-center justify-between px-2.5 py-1.5 rounded-xl border transition-all bg-slate-800/40 border-slate-700/50 text-slate-600">
+                                    <div class="flex items-center gap-1.5">
+                                        <span id="led-text2" class="w-2 h-2 rounded-full bg-slate-700 flex-shrink-0"></span>
+                                        <span class="text-[11px]">📝 Texte 2</span>
+                                    </div>
+                                    <span id="countdown-text2" class="text-[10px] font-mono tabular-nums"></span>
+                                </div>
                             </div>
                         </div>
 
@@ -2092,37 +2971,34 @@ def index():
                     </div>
                 </div>
 
-                <!-- ── Passages ISS ── # ── ISS_DISPLAY_PATCH_APPLIED ── ── -->
+
+                <!-- ── Prochain passage ISS (badge léger) ── -->
                 <div style="border-radius:1.5rem;overflow:hidden;box-shadow:0 10px 30px #0006;background:rgba(15,23,42,0.6);border:1px solid #1e293b">
-                    <div style="padding:10px 16px;background:rgba(15,23,42,0.5);border-bottom:1px solid #1e293b;display:flex;align-items:center;justify-content:space-between">
-                        <div style="display:flex;align-items:center;gap:8px">
-                            <span style="font-size:10px;font-weight:900;color:#a78bfa;text-transform:uppercase;letter-spacing:.1em">🛸 Passages ISS</span>
+                    <div style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between">
+                        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                            <span style="font-size:10px;font-weight:900;color:#a78bfa;text-transform:uppercase;letter-spacing:.1em">🛸 ISS</span>
                             <span id="iss-next-countdown" style="font-size:9px;font-weight:700;color:#c4b5fd;background:rgba(167,139,250,.12);border:1px solid #7c3aed44;border-radius:6px;padding:1px 6px;display:none"></span>
+                            <span id="iss-next-az-badge" style="display:none;font-size:9px;font-weight:700;color:#67e8f9;background:rgba(103,232,249,.08);border:1px solid rgba(103,232,249,.2);border-radius:6px;padding:1px 7px;font-family:monospace"></span>
                         </div>
-                        <button type="button" onclick="issPassRefresh()" id="iss-refresh-btn"
-                            style="font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.08em;background:none;border:none;cursor:pointer;padding:0">
-                            ↺ MAJ
-                        </button>
-                    </div>
-                    <div style="padding:10px 12px;display:flex;flex-direction:column;gap:5px">
-                        <div id="iss-pass-list" style="font-size:10px;color:#475569;font-style:italic;text-align:center;min-height:32px">
-                            ⏳ Chargement...
-                        </div>
-                        <div id="iss-pass-status" style="font-size:8px;color:#334155;text-align:center;margin-top:2px"></div>
+                        <a onclick="switchTab('iss')" href="#"
+                           style="font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.08em;text-decoration:none">
+                            ↗ Voir
+                        </a>
                     </div>
                 </div>
 
-            </div>
+            </div><!-- /traffic-sidebar-body -->
+          </div><!-- /traffic-sidebar-col -->
 
-            <div class="lg:col-span-9">
+            <div class="lg:col-span-9" id="traffic-console-col">
                 <div class="glass rounded-[2.5rem] overflow-hidden flex flex-col h-[780px] shadow-2xl">
-                    <div class="px-6 py-4 bg-slate-900/50 border-b border-slate-800">
+                    <div class="px-6 py-4 bg-slate-900/50 border-b border-slate-800" id="console-sticky-hdr">
                         <div class="flex justify-between items-center mb-3">
                             <div class="flex items-center gap-3">
                                 <span id="rx-led" class="w-2.5 h-2.5 rounded-full bg-slate-700 inline-block transition-colors duration-300"></span>
                                 <span class="text-xs font-black text-slate-400 uppercase tracking-widest">📻 Moniteur de Trafic APRS</span>
                             </div>
-                            <div class="flex items-center gap-3 flex-wrap">
+                            <div class="flex items-center gap-3 flex-wrap" id="monitor-filter-row">
                                 <span class="text-[10px] font-mono text-slate-600">
                                     📤 TX&thinsp;<span id="tx-count" class="text-blue-400 font-bold">0</span>
                                     &ensp;📥 RX&thinsp;<span id="rx-count" class="text-emerald-400 font-bold">0</span>
@@ -2152,7 +3028,7 @@ def index():
                             <span id="rx-status-text" class="text-[10px] text-slate-600 shrink-0 w-24">⏳ En attente...</span>
                         </div>
                     </div>
-                    <div id="console" class="flex-grow p-6 font-mono text-sm overflow-y-auto custom-scrollbar space-y-3 bg-slate-950/30">
+                    <div id="console" class="flex-grow p-6 font-mono text-sm overflow-y-auto custom-scrollbar space-y-3 bg-slate-950/30" style="padding:12px;gap:8px">
                         <div class="text-slate-500 italic opacity-50 border-b border-slate-800 pb-2">📻 -- Session Py-APRS demarree --</div>
                     </div>
                 </div>
@@ -2168,8 +3044,27 @@ def index():
                 <form id="configForm" class="space-y-8">
                     <div class="grid grid-cols-3 gap-8">
                         <div>
-                            <label class="block text-[10px] font-black text-slate-500 uppercase mb-3 ml-1">📻 Mon Indicatif (SSID)</label>
+                            <label class="block text-[10px] font-black text-slate-500 uppercase mb-3 ml-1">📻 Mon Indicatif (SSID)
+                                <button type="button" onclick="document.getElementById('ssid-popover').classList.toggle('hidden')"
+                                        class="ml-2 normal-case font-normal text-blue-400 hover:text-blue-300 transition-colors align-middle">❓</button>
+                            </label>
                             <input type="text" name="callsign" value='""" + config_manager.data['callsign'] + """' class="w-full bg-slate-900 border border-slate-800 rounded-xl p-4 text-white outline-none focus:border-blue-500 transition-all">
+                            <div id="ssid-popover" class="hidden mt-2 bg-slate-950 border border-slate-700 rounded-xl p-3 text-[10px] text-slate-500 shadow-xl">
+                                <div class="text-slate-400 font-bold mb-2">SSID — Suffixe d'identification secondaire</div>
+                                <div class="grid grid-cols-2 gap-x-4 gap-y-0.5 font-mono">
+                                    <span><span class="text-slate-300">-0</span> Station principale</span>
+                                    <span><span class="text-slate-300">-7</span> Portable / HT</span>
+                                    <span><span class="text-slate-300">-5</span> Autre équipement</span>
+                                    <span><span class="text-slate-300">-9</span> Mobile (voiture)</span>
+                                    <span><span class="text-slate-300">-6</span> Satellite / ballon</span>
+                                    <span><span class="text-slate-300">-10</span> iGate Internet</span>
+                                    <span><span class="text-slate-300">-11</span> Avion</span>
+                                    <span><span class="text-slate-300">-13</span> Station météo</span>
+                                    <span><span class="text-slate-300">-12</span> Portable (autre)</span>
+                                    <span><span class="text-slate-300">-15</span> Station fixe</span>
+                                </div>
+                                <div class="pt-2 text-slate-600">Ex : <span class="text-slate-400 font-mono">F1RIQ-9</span> mobile · <span class="text-slate-400 font-mono">F1RIQ-7</span> portable</div>
+                            </div>
                         </div>
                         <div>
                             <label class="block text-[10px] font-black text-slate-500 uppercase mb-3 ml-1">🔌 Port PTT</label>
@@ -2264,6 +3159,11 @@ def index():
                                         <option value="">— Sans digipeat (direct RF) —</option>
                                         <option value="NOGATE">NOGATE &nbsp;(pas de passerelle IS)</option>
                                         <option value="custom">✏️ Personnalise...</option>
+                                        <optgroup label="─── Mode HF 300 bauds ───">
+                                        <option value="">Direct RF (recommandé HF)</option>
+                                        <option value="GATE">GATE &nbsp;(passerelle HF→IS)</option>
+                                        <option value="RELAY">RELAY &nbsp;(digi HF ancien)</option>
+                                        </optgroup>
                                     </select>
                                     <input type="text" id="pathCustom" name="path" value='""" + config_manager.data.get('path','WIDE1-1,WIDE2-1') + """' class="w-full bg-slate-900 border border-slate-800 rounded-xl p-4 text-white outline-none focus:border-blue-500 transition-all font-mono text-sm" placeholder="WIDE1-1,WIDE2-1">
                                 </div>
@@ -2292,6 +3192,35 @@ def index():
                                                     ('propagation', '📶 Propagation'),
                                                 ]
                                             ]) + """
+                                            <div class="mt-3 space-y-2">
+                                              <div class="text-[9px] font-black text-slate-600 uppercase tracking-widest mb-1">📝 Textes libres</div>
+                                              <!-- Text1 -->
+                                              <div class="bg-slate-900/60 rounded-xl px-3 py-2 space-y-1.5">
+                                                <div class="flex items-center justify-between gap-3">
+                                                  <span class="text-[11px] font-bold text-slate-300 w-32">📝 Texte 1</span>
+                                                  """ + _interval_select("text1", _scheds) + """
+                                                </div>
+                                                <input type="text" name="beacon_text1"
+                                                       value='""" + (config_manager.data.get("beacon_text1") or "") + """'
+                                                       maxlength="62" placeholder="ex: F1RIQ QRP portable JN07II"
+                                                       class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-2 py-1.5
+                                                              text-[11px] text-white outline-none focus:border-blue-500 transition-all
+                                                              font-mono placeholder-slate-600">
+                                              </div>
+                                              <!-- Text2 -->
+                                              <div class="bg-slate-900/60 rounded-xl px-3 py-2 space-y-1.5">
+                                                <div class="flex items-center justify-between gap-3">
+                                                  <span class="text-[11px] font-bold text-slate-300 w-32">📝 Texte 2</span>
+                                                  """ + _interval_select("text2", _scheds) + """
+                                                </div>
+                                                <input type="text" name="beacon_text2"
+                                                       value='""" + (config_manager.data.get("beacon_text2") or "") + """'
+                                                       maxlength="62" placeholder="ex: 73 de F1RIQ - En ecoute VHF"
+                                                       class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-2 py-1.5
+                                                              text-[11px] text-white outline-none focus:border-blue-500 transition-all
+                                                              font-mono placeholder-slate-600">
+                                              </div>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -2422,6 +3351,341 @@ def index():
 
 
 
+                    <!-- ── Digipeater APRS ── -->
+                    <div class="border-t border-slate-800/60 pt-8">
+                        <div class="flex items-center justify-between mb-5">
+                            <h2 class="text-sm font-black text-white uppercase tracking-widest">🔁 Digipeater APRS</h2>
+                            <div id="digi-counter-badge" class="flex items-center gap-2 text-[10px] font-mono text-slate-500">
+                                <span id="digi-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#334155"></span>
+                                <span id="digi-count-txt">0 retransmissions</span>
+                            </div>
+                        </div>
+
+                        <!-- Toggle activer/désactiver -->
+                        <div class="flex items-center justify-between bg-slate-900/60 rounded-2xl px-4 py-3 mb-4">
+                            <div>
+                                <div class="text-white font-bold text-xs">Activer le digipeater</div>
+                                <div class="text-slate-500 text-[10px] mt-0.5">Retransmet les trames RF reçues (WIDEn-N, RELAY, WIDE1)</div>
+                            </div>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" name="digi_enabled" id="digi_enabled"
+                                    """ + ('checked' if config_manager.data.get('digi_enabled') else '') + """
+                                    class="sr-only peer">
+                                <div class="w-11 h-6 bg-slate-700 peer-focus:ring-2 peer-focus:ring-emerald-500 rounded-full peer
+                                    peer-checked:after:translate-x-full peer-checked:bg-emerald-600
+                                    after:content-[''] after:absolute after:top-[2px] after:left-[2px]
+                                    after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                            </label>
+                        </div>
+
+                        <!-- Aliases -->
+                        <div class="mb-4">
+                            <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">
+                                Alias acceptés <span class="text-slate-700 normal-case">(séparés par des virgules)</span>
+                            </label>
+                            <input type="text" name="digi_aliases" id="digi_aliases"
+                                value='""" + ','.join(config_manager.data.get('digi_aliases', ['WIDE1-1','WIDE1','RELAY'])) + """'
+                                class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-emerald-500 transition-all"
+                                placeholder="WIDE1-1,WIDE1,RELAY">
+                            <p class="text-slate-600 text-[9px] mt-1 ml-1">Alias standards : <span class="text-slate-500">WIDE1-1, WIDE1, RELAY, TRACE</span></p>
+                        </div>
+
+                        <!-- Limite de sauts -->
+                        <div class="mb-4">
+                            <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">
+                                Limite WIDEn-N <span class="text-slate-700 normal-case">(n max accepté)</span>
+                            </label>
+                            <div class="flex items-center gap-3">
+                                <input type="number" name="digi_limit" id="digi_limit" min="1" max="7"
+                                    value='""" + str(config_manager.data.get('digi_limit', 2)) + """'
+                                    class="w-24 bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-emerald-500 transition-all text-center">
+                                <span class="text-slate-500 text-[10px]">Recommandé : 2 · WIDE3-3 et au-delà = flood</span>
+                            </div>
+                        </div>
+
+                        <!-- Compteur -->
+                        <div class="bg-slate-900/60 rounded-xl px-4 py-3 text-center">
+                            <div class="text-slate-500 text-[9px] uppercase mb-1">Trames retransmises (session)</div>
+                            <div id="digi-count-big" class="text-emerald-400 font-black text-2xl tabular-nums">0</div>
+                        </div>
+                    </div>
+
+                    <!-- ── Mode HF 300 bauds ── -->
+                    <div class="border-t border-slate-800/60 pt-8">
+                        <div class="flex items-center justify-between mb-5">
+                            <h2 class="text-sm font-black text-amber-400 uppercase tracking-widest">📻 Mode HF 300 bauds</h2>
+                            <span class="text-[10px] font-mono text-slate-600 bg-slate-900 rounded-lg px-2 py-1">AX.25 / APRS-HF</span>
+                        </div>
+                        <p class="text-slate-500 text-[10px] mb-5">
+                            Active la transmission <strong class="text-amber-300">HF 300 bauds</strong> (AFSK AX.25 — fréquences de référence APRS-HF).<br>
+                            Réglez la radio en <span class="text-amber-300 font-mono">USB</span> · fréquences recommandées :
+                            <span class="font-mono text-slate-400">10.151 MHz</span> · <span class="font-mono text-slate-400">14.105 MHz</span><br>
+                            Le modem Dire Wolf passe automatiquement en <span class="font-mono text-amber-300">MODEM 300 MARK:SPACE</span>.
+                        </p>
+
+                        <!-- Toggle HF mode -->
+                        <div class="flex items-center justify-between bg-slate-900/60 rounded-2xl px-4 py-3 mb-5">
+                            <div>
+                                <div class="text-white font-bold text-xs">Activer le mode HF 300 bauds</div>
+                                <div class="text-slate-500 text-[10px] mt-0.5">Remplace 1200 bauds VHF — redémarrage Dire Wolf requis</div>
+                            </div>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" name="hf_mode" id="hf_mode"
+                                    """ + ('checked' if config_manager.data.get('hf_mode') else '') + """
+                                    onchange="document.getElementById('hf_tone_fields').style.display=this.checked?'block':'none';checkHfPathWarn()"
+                                    class="sr-only peer">
+                                <div class="w-11 h-6 bg-slate-700 peer-focus:ring-2 peer-focus:ring-amber-500 rounded-full peer
+                                    peer-checked:after:translate-x-full peer-checked:bg-amber-600
+                                    after:content-[''] after:absolute after:top-[2px] after:left-[2px]
+                                    after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                            </label>
+                        </div>
+
+                        <!-- Tonalités MARK / SPACE -->
+                        <div id="hf_tone_fields" """ + ('' if config_manager.data.get('hf_mode') else 'style="display:none"') + """>
+                            <div class="grid grid-cols-2 gap-4 mb-4">
+                                <div>
+                                    <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">
+                                        Tonalité MARK (Hz)
+                                    </label>
+                                    <input type="number" name="hf_mark_hz" id="hf_mark_hz"
+                                        min="300" max="3000" step="10"
+                                        value='""" + str(config_manager.data.get('hf_mark_hz', 1600)) + """'
+                                        class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-amber-500 transition-all text-center">
+                                    <p class="text-slate-600 text-[9px] mt-1 ml-1">Standard AX.25 HF : <span class="text-amber-500">1600 Hz</span></p>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">
+                                        Tonalité SPACE (Hz)
+                                    </label>
+                                    <input type="number" name="hf_space_hz" id="hf_space_hz"
+                                        min="300" max="3000" step="10"
+                                        value='""" + str(config_manager.data.get('hf_space_hz', 1800)) + """'
+                                        class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-amber-500 transition-all text-center">
+                                    <p class="text-slate-600 text-[9px] mt-1 ml-1">Standard AX.25 HF : <span class="text-amber-500">1800 Hz</span></p>
+                                </div>
+                            </div>
+                            <div class="bg-amber-900/20 border border-amber-800/40 rounded-xl px-4 py-3 text-[10px] text-amber-300/80">
+                                ⚠️ <strong>Rappel :</strong> en mode HF, le TXDELAY minimum est automatiquement fixé à 500 ms.
+                                Vérifiez que votre radio est en mode <strong>USB</strong> et que le niveau audio est calibré.
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ── Warning HF path WIDE ── HF_TX_PATH_PATCH_APPLIED -->
+                    <div id="hf_wide_warn" style="display:none" class="mt-2 bg-red-900/30 border border-red-700/50 rounded-xl px-4 py-2 text-[10px] text-red-300">
+                        ⚠️ <strong>Path incompatible :</strong> le chemin contient <code>WIDE</code>, inutile en HF 300 bauds (pas de digis HF WIDE). Utilisez un path <strong>vide</strong> (direct RF) ou <code>GATE</code>. En mode HF, le patch forcera automatiquement un chemin vide à l'émission.
+                    </div>
+
+                    <!-- ── API aprs.fi ── -->
+                    <div class="border-t border-slate-800/60 pt-8">
+                        <h2 class="text-sm font-black text-white uppercase tracking-widest mb-1">🌐 API aprs.fi</h2>
+                        <p class="text-slate-500 text-[10px] mb-5">
+                            Optionnel — enrichit le panneau «&nbsp;Mon signal&nbsp;» avec l'historique aprs.fi (24h).
+                            Clé gratuite sur
+                            <a href="https://aprs.fi/page/api" target="_blank"
+                               class="text-blue-400 hover:text-blue-300 underline">aprs.fi/page/api</a>.
+                        </p>
+                        <div class="mb-2">
+                            <label class="block text-[10px] font-black text-slate-500 uppercase mb-2 ml-1">
+                                Clé API <span class="text-slate-700 normal-case">(laisser vide si inutilisée)</span>
+                            </label>
+                            <input type="text" name="aprsfi_key" id="aprsfi_key"
+                                value='""" + (config_manager.data.get('aprsfi_key') or '') + """'
+                                class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-white text-sm font-mono outline-none focus:border-sky-500 transition-all"
+                                placeholder="XXXXXX.XXXXXXXXXXXXXXXXX"
+                                autocomplete="off" spellcheck="false">
+                            <p class="text-slate-600 text-[9px] mt-2 ml-1">
+                                La clé est transmise uniquement depuis le serveur (Raspberry Pi) — jamais exposée au navigateur.
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- ── Alertes Météo ── WX_ALERT_UI_PATCH_v1 ── -->
+                    <div class="border-t border-slate-800/60 pt-8">
+                        <h3 class="text-[10px] font-black text-yellow-400 uppercase tracking-widest mb-6 flex items-center gap-2">
+                            🌡️ Alertes Météo (Open-Meteo)
+                        </h3>
+                        <div class="space-y-5">
+
+                            <!-- Toggle principal -->
+                            <div class="flex items-center justify-between">
+                                <label class="text-slate-300 text-xs font-semibold" for="wx-alert-toggle">Activer les alertes météo</label>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="wx-alert-toggle" onchange="wxAlertToggle()" class="sr-only peer">
+                                    <div class="w-9 h-5 bg-slate-700 rounded-full peer peer-checked:bg-yellow-500 transition-colors duration-200 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-4"></div>
+                                </label>
+                            </div>
+
+                            <!-- Température max -->
+                            <div class="flex items-center justify-between gap-4">
+                                <label class="text-slate-400 text-[11px] w-48 shrink-0" for="wx-temp-max">🌡️ Alerte chaleur (°C)</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="number" id="wx-temp-max" min="-10" max="60" step="1"
+                                        onchange="wxAlertSave()"
+                                        class="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs text-right focus:outline-none focus:border-yellow-500">
+                                    <span class="text-slate-500 text-[10px]">°C si temp ≥ seuil</span>
+                                </div>
+                            </div>
+
+                            <!-- Température min (gel) -->
+                            <div class="flex items-center justify-between gap-4">
+                                <label class="text-slate-400 text-[11px] w-48 shrink-0" for="wx-temp-min">🧊 Alerte gel (°C)</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="number" id="wx-temp-min" min="-30" max="15" step="1"
+                                        onchange="wxAlertSave()"
+                                        class="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs text-right focus:outline-none focus:border-yellow-500">
+                                    <span class="text-slate-500 text-[10px]">°C si temp ≤ seuil</span>
+                                </div>
+                            </div>
+
+                            <!-- Vent moyen -->
+                            <div class="flex items-center justify-between gap-4">
+                                <label class="text-slate-400 text-[11px] w-48 shrink-0" for="wx-wind-max">💨 Vent fort (km/h)</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="number" id="wx-wind-max" min="10" max="200" step="5"
+                                        onchange="wxAlertSave()"
+                                        class="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs text-right focus:outline-none focus:border-yellow-500">
+                                    <span class="text-slate-500 text-[10px]">km/h</span>
+                                </div>
+                            </div>
+
+                            <!-- Rafales -->
+                            <div class="flex items-center justify-between gap-4">
+                                <label class="text-slate-400 text-[11px] w-48 shrink-0" for="wx-gust-max">🌪️ Rafales (km/h)</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="number" id="wx-gust-max" min="10" max="250" step="5"
+                                        onchange="wxAlertSave()"
+                                        class="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs text-right focus:outline-none focus:border-yellow-500">
+                                    <span class="text-slate-500 text-[10px]">km/h</span>
+                                </div>
+                            </div>
+
+                            <!-- Précipitations -->
+                            <div class="flex items-center justify-between gap-4">
+                                <label class="text-slate-400 text-[11px] w-48 shrink-0" for="wx-rain-mm">🌧️ Pluie intense (mm/h)</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="number" id="wx-rain-mm" min="1" max="100" step="1"
+                                        onchange="wxAlertSave()"
+                                        class="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs text-right focus:outline-none focus:border-yellow-500">
+                                    <span class="text-slate-500 text-[10px]">mm</span>
+                                </div>
+                            </div>
+
+                            <!-- WMO sévère -->
+                            <div class="flex items-center justify-between">
+                                <label class="text-slate-400 text-[11px]" for="wx-wmo-severe">⛈️ Alerte code météo sévère (orage, neige…)</label>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="wx-wmo-severe" onchange="wxAlertSave()" class="sr-only peer">
+                                    <div class="w-9 h-5 bg-slate-700 rounded-full peer peer-checked:bg-yellow-500 transition-colors duration-200 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-4"></div>
+                                </label>
+                            </div>
+
+                            <!-- Intervalle -->
+                            <div class="flex items-center justify-between gap-4">
+                                <label class="text-slate-400 text-[11px] w-48 shrink-0" for="wx-interval-min">🕐 Intervalle vérification</label>
+                                <select id="wx-interval-min" onchange="wxAlertSave()"
+                                    class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-yellow-500">
+                                    <option value="15">15 min</option>
+                                    <option value="30">30 min</option>
+                                    <option value="60">1 h</option>
+                                    <option value="120">2 h</option>
+                                </select>
+                            </div>
+
+                            <!-- Checkbox bulletin APRS RF -->
+                            <div class="flex items-center justify-between">
+                                <label class="text-slate-400 text-[11px]" for="wx-bulletin-aprs">📡 Émettre bulletin APRS RF lors d'une alerte</label>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="wx-bulletin-aprs" onchange="wxAlertSave()" class="sr-only peer">
+                                    <div class="w-9 h-5 bg-slate-700 rounded-full peer peer-checked:bg-yellow-500 transition-colors duration-200 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-4"></div>
+                                </label>
+                            </div>
+
+                            <!-- Bouton test + statut -->
+                            <div class="flex items-center gap-3 pt-2">
+                                <button onclick="wxAlertTest(this)"
+                                    class="px-3 py-1.5 bg-yellow-900/60 hover:bg-yellow-800 border border-yellow-700 text-yellow-300 text-[11px] font-bold rounded transition-colors">
+                                    🧪 Tester les alertes maintenant
+                                </button>
+                                <span id="wx-alert-status" class="text-[10px] text-slate-500"></span>
+                            </div>
+
+                        </div><!-- /space-y-5 -->
+                    </div><!-- /section wx-alert -->
+
+                    <!-- ── Alertes propagation / blackout ── -->
+                    <div class="border-t border-slate-800/60 pt-8">
+                        <h3 class="text-[10px] font-black text-orange-400 uppercase tracking-widest mb-6 flex items-center gap-2">
+                            📶 Alertes Propagation &amp; Blackout HF
+                        </h3>
+                        <div class="space-y-5">
+                            <!-- Toggle principal -->
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <div class="text-sm font-bold text-white">Surveillance propagation</div>
+                                    <div class="text-[10px] text-slate-500 mt-0.5">Bannière + bip sur tempête Kp, blackout SFI ou éruption solaire X-ray</div>
+                                </div>
+                                <label class="prox-switch" title="Activer / désactiver les alertes propagation">
+                                    <input type="checkbox" id="prop-alert-toggle" onchange="propAlertToggle()">
+                                    <span class="prox-slider" style="--sw-on:#c2410c"></span>
+                                </label>
+                            </div>
+                            <!-- Seuil Kp -->
+                            <div class="flex items-center gap-4">
+                                <label class="text-[10px] text-slate-500 uppercase font-bold shrink-0 w-40">🧲 Kp max (tempête)</label>
+                                <select id="prop-kp-max" onchange="propAlertSave()"
+                                    class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-2 text-white text-sm font-mono outline-none focus:border-orange-500 transition-all">
+                                    <option value="3">≥ 3 — Agité</option>
+                                    <option value="4">≥ 4 — Actif</option>
+                                    <option value="5" selected>≥ 5 — Tempête G1</option>
+                                    <option value="6">≥ 6 — Tempête G2</option>
+                                    <option value="7">≥ 7 — Tempête G3</option>
+                                </select>
+                            </div>
+                            <!-- Seuil SFI -->
+                            <div class="flex items-center gap-4">
+                                <label class="text-[10px] text-slate-500 uppercase font-bold shrink-0 w-40">📉 SFI min (blackout)</label>
+                                <select id="prop-sfi-min" onchange="propAlertSave()"
+                                    class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-2 text-white text-sm font-mono outline-none focus:border-orange-500 transition-all">
+                                    <option value="60">< 60 — Très mauvais</option>
+                                    <option value="70" selected>< 70 — Mauvais</option>
+                                    <option value="80">< 80 — Faible</option>
+                                    <option value="90">< 90 — Médiocre</option>
+                                </select>
+                            </div>
+                            <!-- Seuil X-ray -->
+                            <div class="flex items-center gap-4">
+                                <label class="text-[10px] text-slate-500 uppercase font-bold shrink-0 w-40">☀️ Éruption X-ray min</label>
+                                <select id="prop-xray-class" onchange="propAlertSave()"
+                                    class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-2 text-white text-sm font-mono outline-none focus:border-orange-500 transition-all">
+                                    <option value="C1">≥ C1 — Faible</option>
+                                    <option value="M1" selected>≥ M1 — Modérée</option>
+                                    <option value="M5">≥ M5 — Forte</option>
+                                    <option value="X1">≥ X1 — Majeure</option>
+                                    <option value="X5">≥ X5 — Extrême</option>
+                                </select>
+                            </div>
+                            <!-- Intervalle vérification -->
+                            <div class="flex items-center gap-4">
+                                <label class="text-[10px] text-slate-500 uppercase font-bold shrink-0 w-40">⏱ Vérification</label>
+                                <select id="prop-interval-min" onchange="propAlertSave()"
+                                    class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-2 text-white text-sm font-mono outline-none focus:border-orange-500 transition-all">
+                                    <option value="5">Toutes les 5 min</option>
+                                    <option value="10">Toutes les 10 min</option>
+                                    <option value="15" selected>Toutes les 15 min</option>
+                                    <option value="30">Toutes les 30 min</option>
+                                    <option value="60">Toutes les heures</option>
+                                </select>
+                            </div>
+                            <!-- Bouton test -->
+                            <button onclick="propAlertTest(this)"
+                                class="w-full bg-slate-800 hover:bg-orange-900/30 border border-slate-700 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all">
+                                🔬 Tester les alertes propagation
+                            </button>
+                        </div>
+                    </div>
+
                     <!-- ── Alertes passage ISS ── -->
                     <div class="border-t border-slate-800/60 pt-8">
                         <h3 class="text-[10px] font-black text-violet-400 uppercase tracking-widest mb-6 flex items-center gap-2">
@@ -2447,7 +3711,7 @@ def index():
                             </div>
                             <!-- Prochains passages en aperçu -->
                             <div>
-                                <div class="text-[10px] text-slate-500 uppercase font-bold mb-2">📅 Prochains passages</div>
+                                <div class="text-[10px] text-slate-500 uppercase font-bold mb-2">📅 Passages du jour</div>
                                 <div id="iss-pass-list-cfg" class="bg-slate-900/60 rounded-xl p-3 text-[10px] text-slate-500 italic">
                                     ⏳ Chargement...
                                 </div>
@@ -2455,7 +3719,39 @@ def index():
                         </div>
                     </div>
 
-                    <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-500 p-5 rounded-2xl font-black text-white shadow-xl transition-all active:scale-95 mt-6">
+                <!-- ── Changement de mot de passe ── -->
+                <div class="mt-6 glass rounded-2xl p-6">
+                    <h3 class="text-[10px] font-black text-yellow-400 uppercase tracking-widest mb-5 flex items-center gap-2">🔑 Changer le mot de passe</h3>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Mot de passe actuel</label>
+                            <input id="passwd-current" type="password" autocomplete="current-password"
+                                   class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500 transition-colors"
+                                   placeholder="••••••••">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Nouveau mot de passe</label>
+                            <input id="passwd-new" type="password" autocomplete="new-password"
+                                   class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500 transition-colors"
+                                   placeholder="••••••••">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Confirmer</label>
+                            <input id="passwd-confirm" type="password" autocomplete="new-password"
+                                   class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500 transition-colors"
+                                   placeholder="••••••••"
+                                   onkeydown="if(event.key==='Enter')submitPasswd()">
+                        </div>
+                        <div id="passwd-msg" class="hidden text-xs rounded-xl px-4 py-2.5 font-bold"></div>
+                        <button onclick="submitPasswd()"
+                                class="w-full bg-yellow-600 hover:bg-yellow-500 active:scale-95 text-white font-black py-3 rounded-xl transition-all text-sm tracking-wide">
+                            🔑 Changer le mot de passe
+                        </button>
+                    </div>
+                </div>
+
+                    <!-- ── Bouton appliquer (fin de page) ── -->
+                    <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-500 p-5 rounded-2xl font-black text-white shadow-xl transition-all active:scale-95 mt-2">
                         ✅ APPLIQUER LES MODIFICATIONS
                     </button>
                 </form>
@@ -2476,6 +3772,16 @@ def index():
                                         class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/30 hover:text-white"
                                         title="Appel général — destination APRS (broadcast)">
                                     📢 CQ
+                                </button>
+                                <button onclick="openISS()"
+                                        class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-indigo-500/15 border border-indigo-500/40 text-indigo-300 hover:bg-indigo-500/30 hover:text-white"
+                                        title="Contact ISS — path ARISS, dest RS0ISS-4, QRG 145.825 MHz">
+                                    🛸 ISS
+                                </button>
+                                <button id="btn-iss-send" onclick="sendISS()"
+                                        title="Envoyer un beacon ARISS — actif uniquement si ISS en vue"
+                                        class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-slate-800/50 border border-slate-700 text-slate-400 hover:bg-indigo-700/40 hover:border-indigo-500 hover:text-indigo-200">
+                                    📡 BEACON
                                 </button>
                                 <button onclick="refreshContacts()" class="text-[10px] text-slate-600 hover:text-blue-400 transition-colors">
                                     🔄
@@ -2502,9 +3808,82 @@ def index():
                     <div class="glass rounded-[2rem] overflow-hidden flex flex-col h-[600px] shadow-2xl">
                         <div class="px-6 py-4 bg-slate-900/50 border-b border-slate-800 flex items-center gap-3">
                             <div id="chat-avatar" class="w-9 h-9 rounded-xl bg-slate-800 flex items-center justify-center text-sm font-black text-blue-400">?</div>
-                            <div>
+                            <div class="flex-1 min-w-0">
                                 <div id="chat-title" class="font-black text-white text-sm">Selectionner un contact</div>
                                 <div id="chat-subtitle" class="text-[10px] text-slate-500">APRS Point-a-Point</div>
+                            </div>
+                            <button id="chat-delete-btn"
+                                    onclick="deleteQso()"
+                                    title="Supprimer cette conversation"
+                                    disabled
+                                    class="w-8 h-8 flex items-center justify-center rounded-lg bg-red-950/40 border border-red-900/50 text-red-400 hover:bg-red-700 hover:text-white hover:border-red-500 transition-all active:scale-95 disabled:opacity-20 disabled:cursor-not-allowed shrink-0">
+                                🗑️
+                            </button>
+                        </div>
+                        <!-- ── ISS EN VUE (visible uniquement pendant le passage) ── -->
+                        <div id="iss-live-panel" style="display:none;border-top:1px solid #7c3aed55;background:rgba(15,23,42,0.92);animation:issLivePulse 3s ease-in-out infinite">
+                            <!-- Header -->
+                            <div style="padding:8px 14px;background:rgba(124,58,237,.18);border-bottom:1px solid #7c3aed40;display:flex;align-items:center;justify-content:space-between">
+                                <div style="display:flex;align-items:center;gap:7px">
+                                    <span id="iss-live-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#a78bfa;box-shadow:0 0 7px #a78bfa;flex-shrink:0"></span>
+                                    <span style="font-size:10px;font-weight:900;color:#c4b5fd;text-transform:uppercase;letter-spacing:.1em">🛸 ISS EN VUE</span>
+                                </div>
+                                <span id="iss-live-timer" style="font-size:10px;font-weight:700;color:#a78bfa;font-family:monospace"></span>
+                            </div>
+                            <!-- Élévation + Azimut + Boussole -->
+                            <div style="padding:8px 14px 4px;display:grid;grid-template-columns:1fr 1fr 90px;gap:8px;align-items:center">
+                                <div style="background:rgba(124,58,237,.1);border:1px solid #7c3aed30;border-radius:10px;padding:6px 10px;text-align:center">
+                                    <div style="font-size:9px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1px">▲ Élévation</div>
+                                    <div id="iss-live-el" style="font-size:20px;font-weight:900;color:#c4b5fd;font-family:monospace;line-height:1">--°</div>
+                                </div>
+                                <div style="background:rgba(124,58,237,.1);border:1px solid #7c3aed30;border-radius:10px;padding:6px 10px;text-align:center">
+                                    <div style="font-size:9px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1px">➤ Azimut</div>
+                                    <div id="iss-live-az" style="font-size:20px;font-weight:900;color:#c4b5fd;font-family:monospace;line-height:1">--°</div>
+                                    <div id="iss-live-az-card" style="font-size:10px;font-weight:700;color:#a78bfa;margin-top:1px">--</div>
+                                </div>
+                                <svg id="iss-compass-svg" width="90" height="90" viewBox="0 0 90 90">
+                                    <circle cx="45" cy="45" r="42" fill="rgba(15,23,42,.7)" stroke="#3730a3" stroke-width="1.5"/>
+                                    <circle cx="45" cy="45" r="34" fill="none" stroke="#1e1b4b" stroke-width="0.5"/>
+                                    <text x="45" y="9"  text-anchor="middle" fill="#a78bfa" font-size="8" font-weight="700">N</text>
+                                    <text x="45" y="86" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">S</text>
+                                    <text x="85" y="49" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">E</text>
+                                    <text x="5"  y="49" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">O</text>
+                                    <circle cx="45" cy="45" r="22" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="2,3"/>
+                                    <circle cx="45" cy="45" r="11" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="2,3"/>
+                                    <g id="iss-compass-ptr" transform="rotate(0,45,45)">
+                                        <polygon points="45,8 42,45 45,42 48,45" fill="#a78bfa" opacity="0.9"/>
+                                        <polygon points="45,82 42,45 45,48 48,45" fill="#3730a3" opacity="0.6"/>
+                                    </g>
+                                    <circle id="iss-compass-dot" cx="45" cy="23" r="4" fill="#a78bfa" stroke="#7c3aed" stroke-width="1.5" style="filter:drop-shadow(0 0 4px #a78bfa)"/>
+                                    <text id="iss-compass-icon" x="45" y="26" text-anchor="middle" font-size="6" fill="white">🛸</text>
+                                </svg>
+                            </div>
+                            <!-- Télémétrie compacte -->
+                            <div style="padding:2px 14px 6px;display:grid;grid-template-columns:repeat(4,1fr);gap:5px;font-size:10px;font-family:monospace">
+                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Dist.</div>
+                                    <div id="iss-live-dist" style="color:#94a3b8;font-weight:700">-- km</div>
+                                </div>
+                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Alt.</div>
+                                    <div id="iss-live-alt" style="color:#94a3b8;font-weight:700">-- km</div>
+                                </div>
+                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Doppler</div>
+                                    <div id="iss-live-doppler" style="color:#fbbf24;font-weight:700">-- Hz</div>
+                                </div>
+                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Fréq.</div>
+                                    <div id="iss-live-freq" style="color:#34d399;font-weight:700">-- kHz</div>
+                                </div>
+                            </div>
+                            <!-- Footer APRS params -->
+                            <div style="padding:2px 14px 8px">
+                                <div id="iss-live-az-footer" style="display:none;margin-bottom:4px;background:rgba(103,232,249,.06);border:1px solid rgba(103,232,249,.18);border-radius:8px;padding:4px 10px;font-size:9px;font-family:monospace;color:#67e8f9;text-align:center;font-weight:700;letter-spacing:.04em"></div>
+                                <div style="background:rgba(124,58,237,.08);border:1px solid #7c3aed25;border-radius:8px;padding:5px 10px;font-size:9px;font-family:monospace;color:#7c3aed;text-align:center;font-weight:700;letter-spacing:.03em">
+                                    APRS : 145.825 MHz FM · 1200 Bd AFSK
+                                    <br><span style="color:#a78bfa">Path : ARISS  ·  Appel : RS0ISS-4</span>
+                                </div>
                             </div>
                         </div>
                         <div id="chat-messages" class="flex-grow overflow-y-auto custom-scrollbar p-6 space-y-3 bg-slate-950/30">
@@ -2551,7 +3930,10 @@ def index():
                                 <button onclick="mapClearAll()" class="text-[10px] text-slate-600 hover:text-red-400 font-bold uppercase tracking-widest transition-colors">
                                     🗑️ Effacer
                                 </button>
-                                <button onclick="mapFitAll()" class="text-[10px] text-slate-400 hover:text-blue-400 font-bold uppercase tracking-widest transition-colors">
+                                <button onclick="mapClearTrails()" class="text-[10px] text-slate-600 hover:text-orange-400 font-bold uppercase tracking-widest transition-colors" title="Supprime uniquement les traînées (trajets) des mobiles, conserve les marqueurs">
+                                    〰️ Trajets
+                                </button>
+                                <button onclick="openNearbyModal()" id="btn-nearby" class="text-[10px] text-slate-400 hover:text-cyan-400 font-bold uppercase tracking-widest transition-colors" title="Recherche périmétrique des stations">                                    📡 Périm.                                </button>                                <button onclick="mapFitAll()" class="text-[10px] text-slate-400 hover:text-blue-400 font-bold uppercase tracking-widest transition-colors">
                                     🎯 Centrer
                                 </button>
                             </div>
@@ -2619,6 +4001,23 @@ def index():
         <div id="tab-iss" class="hidden">
             <div class="grid grid-cols-1 gap-6">
 
+                <!-- ── Passages 24h ── -->
+                <div class="glass rounded-[2rem] overflow-hidden shadow-2xl">
+                    <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
+                        <span class="text-[10px] font-black text-violet-400 uppercase tracking-widest">📅 Passages ISS — 24 heures</span>
+                        <button type="button" onclick="iss24hRefresh()" id="iss-24h-btn"
+                                class="text-[9px] font-bold uppercase tracking-widest text-slate-500 hover:text-violet-300 transition-colors bg-slate-800/60 rounded-lg px-3 py-1.5">
+                            ↺ MAJ
+                        </button>
+                    </div>
+                    <div id="iss-24h-list" data-alias="iss-pass-list" class="p-4 space-y-2">
+                        <span class="text-slate-500 text-[10px] italic">Chargement…</span>
+                    </div>
+                    <div class="px-5 py-2 bg-slate-900/30 border-t border-slate-800">
+                        <span id="iss-24h-status" class="text-[9px] font-mono text-slate-600">—</span>
+                    </div>
+                </div>
+
                 <!-- Carte OrbTrack -->
                 <div class="glass rounded-[2rem] overflow-hidden shadow-2xl">
                     <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
@@ -2660,7 +4059,112 @@ def index():
             </div>
         </div>
 
-        <!-- ══════════════════════════════ STATS ═══════════════════════════════ -->
+        <!-- ══════════════════════════════ SSTV ════════════════════════════════ -->
+        <div id="tab-sstv" class="hidden">
+            <div class="grid grid-cols-1 gap-6">
+
+
+                <!-- ── Sites en ligne ── -->
+                <div class="glass rounded-2xl p-5 space-y-4">
+                    <div class="text-[10px] font-black text-yellow-400 uppercase tracking-widest mb-3">🌐 Sites de réception SSTV en ligne</div>
+
+                    <!-- Robot36 Web Decoder -->
+                    <div class="bg-slate-900/60 rounded-2xl p-4 flex items-start gap-4">
+                        <div class="w-9 h-9 rounded-xl flex items-center justify-center text-xl shrink-0"
+                             style="background:rgba(99,102,241,.12);border:1px solid #6366f130">🔊</div>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-xs font-black text-indigo-300 mb-1">Robot36 — SSTV Image Decoder (WebAssembly)</div>
+                            <div class="text-[11px] text-slate-400 mb-3">Décodeur WebAssembly dans le navigateur. Supporte Robot36, Scottie, Martin et PD. Utilise le micro de votre PC directement.</div>
+                            <a href="https://robot36.netlify.app" target="_blank" rel="noopener"
+                               class="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-[11px] font-bold text-white transition-all"
+                               style="background:rgba(99,102,241,.25);border:1px solid #6366f140">
+                                🔗 Ouvrir robot36.netlify.app
+                            </a>
+                        </div>
+                    </div>
+
+                    <!-- SSTV Demodulator (colorssstv) -->
+                    <div class="bg-slate-900/60 rounded-2xl p-4 flex items-start gap-4">
+                        <div class="w-9 h-9 rounded-xl flex items-center justify-center text-xl shrink-0"
+                             style="background:rgba(16,185,129,.12);border:1px solid #10b98130">🖼️</div>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-xs font-black text-emerald-300 mb-1">ColorSSTV / MMSSTV</div>
+                            <div class="text-[11px] text-slate-400 mb-3">Logiciels PC classiques, très complets. ColorSSTV est gratuit (Windows). MMSSTV supporte tous les modes courants.</div>
+                            <div class="flex flex-wrap gap-2">
+                                <a href="https://www.colorsstv.com" target="_blank" rel="noopener"
+                                   class="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-[11px] font-bold text-white transition-all"
+                                   style="background:rgba(16,185,129,.20);border:1px solid #10b98130">
+                                    🔗 colorsstv.com
+                                </a>
+                                <a href="https://hamsoft.ca/pages/mmsstv.php" target="_blank" rel="noopener"
+                                   class="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-[11px] font-bold text-white transition-all"
+                                   style="background:rgba(16,185,129,.20);border:1px solid #10b98130">
+                                    🔗 MMSSTV
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SSTV sur Raspberry Pi -->
+                    <div class="bg-slate-900/60 rounded-2xl p-4 flex items-start gap-4">
+                        <div class="w-9 h-9 rounded-xl flex items-center justify-center text-xl shrink-0"
+                             style="background:rgba(239,68,68,.12);border:1px solid #ef444430">🍓</div>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-xs font-black text-red-300 mb-1">QSSTV — Linux / Raspberry Pi</div>
+                            <div class="text-[11px] text-slate-400 mb-3">Décodeur Linux natif, disponible dans apt. Idéal sur Raspberry Pi. Interface graphique complète.</div>
+                            <div class="bg-slate-950/60 rounded-xl px-3 py-2 font-mono text-[11px] text-emerald-400 mb-2">
+                                sudo apt install qsstv
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ISS SSTV -->
+                    <div class="bg-slate-900/60 rounded-2xl p-4 flex items-start gap-4">
+                        <div class="w-9 h-9 rounded-xl flex items-center justify-center text-xl shrink-0"
+                             style="background:rgba(124,58,237,.12);border:1px solid #7c3aed30">🛸</div>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-xs font-black text-purple-300 mb-1">ISS SSTV — Galerie des images reçues</div>
+                            <div class="text-[11px] text-slate-400 mb-3">La station ISS émet régulièrement des images SSTV sur 145.800 MHz FM (mode PD120). Consultez la galerie communautaire en ligne.</div>
+                            <a href="https://ariss-sstv.blogspot.com" target="_blank" rel="noopener"
+                               class="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-[11px] font-bold text-white transition-all"
+                               style="background:rgba(124,58,237,.20);border:1px solid #7c3aed30">
+                                🔗 ariss-sstv.blogspot.com
+                            </a>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ── Info fréquences ── -->
+                <div class="glass rounded-2xl p-5">
+                    <div class="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-4">📻 Fréquences SSTV usuelles</div>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <div class="p-3 rounded-xl text-center" style="background:rgba(234,179,8,.08);border:1px solid #eab30830">
+                            <div class="text-[8px] font-black text-yellow-400 uppercase tracking-widest mb-1">ISS</div>
+                            <div class="font-mono text-sm font-black text-yellow-300">145.800</div>
+                            <div class="text-[8px] text-slate-500">FM — mode PD120</div>
+                        </div>
+                        <div class="p-3 rounded-xl text-center" style="background:rgba(59,130,246,.08);border:1px solid #3b82f630">
+                            <div class="text-[8px] font-black text-blue-400 uppercase tracking-widest mb-1">14 MHz HF</div>
+                            <div class="font-mono text-sm font-black text-blue-300">14.230</div>
+                            <div class="text-[8px] text-slate-500">USB — Scottie / Martin</div>
+                        </div>
+                        <div class="p-3 rounded-xl text-center" style="background:rgba(16,185,129,.08);border:1px solid #10b98130">
+                            <div class="text-[8px] font-black text-emerald-400 uppercase tracking-widest mb-1">20 m DX</div>
+                            <div class="font-mono text-sm font-black text-emerald-300">14.233</div>
+                            <div class="text-[8px] text-slate-500">USB — PD180</div>
+                        </div>
+                        <div class="p-3 rounded-xl text-center" style="background:rgba(99,102,241,.08);border:1px solid #6366f130">
+                            <div class="text-[8px] font-black text-indigo-400 uppercase tracking-widest mb-1">VIS sync</div>
+                            <div class="font-mono text-sm font-black text-indigo-300">1900 Hz</div>
+                            <div class="text-[8px] text-slate-500">Leader signal</div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+                <!-- ══════════════════════════════ STATS ═══════════════════════════════ -->
         <div id="tab-stats" class="hidden">
             <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
 
@@ -2712,9 +4216,218 @@ def index():
                     </div>
                 </div>
 
+                <!-- Best DX + Distance max -->
+                <div class="xl:col-span-3 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <!-- Best DX -->
+                    <div class="glass rounded-2xl p-5">
+                        <div class="text-[10px] font-black text-rose-400 uppercase tracking-widest mb-3 flex items-center justify-between"><span>🏅 Meilleur DX entendu</span><button onclick="window._resetDx&&window._resetDx()" class="text-[9px] font-mono text-slate-500 hover:text-rose-400 transition-colors border border-slate-700 rounded-lg px-2 py-0.5">🗑️ reset</button></div>
+                        <div class="flex items-center justify-between gap-4">
+                            <div>
+                                <div id="stats-bestdx-cs" class="text-xl font-black text-rose-300 font-mono">–</div>
+                                <div class="text-[9px] font-mono text-slate-500 mt-0.5" id="stats-bestdx-date"></div>
+                            </div>
+                            <div class="text-right">
+                                <div id="stats-bestdx-dist" class="text-2xl font-black text-rose-400">–</div>
+                                <div id="stats-bestdx-brng" class="text-[10px] font-mono text-slate-400 mt-0.5"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Distance max -->
+                    <div class="glass rounded-2xl p-5 text-center flex flex-col items-center justify-center">
+                        <div class="text-[10px] font-black text-pink-400 uppercase tracking-widest mb-2 flex items-center justify-between w-full"><span>📡 Distance max atteinte</span><button onclick="window._resetDx&&window._resetDx()" class="text-[9px] font-mono text-slate-500 hover:text-pink-400 transition-colors border border-slate-700 rounded-lg px-2 py-0.5">🗑️ reset</button></div>
+                        <div id="stats-bestdx-dist-badge" class="text-4xl font-black text-pink-300">–</div>
+                        <div class="text-[9px] font-mono text-slate-500 mt-1">toutes trames de position RX/IS</div>
+                    </div>
+                </div>
+
+                <!-- Maillage RF (cases Maidenhead entendues) -->
+                <div class="xl:col-span-3 glass rounded-[2rem] overflow-hidden shadow-2xl" id="stats-mesh-panel">
+                    <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
+                        <div class="flex items-center gap-3">
+                            <span class="text-[10px] font-black text-cyan-400 uppercase tracking-widest">🗺️ Maillage RF — cases Maidenhead entendues</span>
+                            <span id="stats-mesh-count" class="text-[9px] font-mono text-slate-500 bg-slate-800 px-2 py-0.5 rounded-full">–</span>
+                        </div>
+                        <button onclick="(function(){_gridCells={};fetch('/stats/reset_mesh',{method:'POST'});_renderMesh();document.getElementById('stats-mesh-count').textContent='0 case';})()" class="text-[9px] font-mono text-slate-500 hover:text-rose-400 transition-colors border border-slate-700 rounded-lg px-2 py-0.5">🗑️ reset</button>
+                    </div>
+                    <div class="p-4">
+                        <svg id="stats-mesh-svg" viewBox="0 0 700 380" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                            <text x="350" y="195" text-anchor="middle" font-size="11" fill="#475569">En attente de positions…</text>
+                        </svg>
+                        <div class="flex flex-wrap gap-4 justify-center mt-2 text-[9px] font-mono text-slate-500">
+                            <span class="flex items-center gap-1"><span style="display:inline-block;width:12px;height:12px;background:rgba(30,160,200,0.35);border:1px solid rgba(56,189,248,0.3);border-radius:2px"></span>1–2 trames</span>
+                            <span class="flex items-center gap-1"><span style="display:inline-block;width:12px;height:12px;background:rgba(40,200,220,0.6);border:1px solid rgba(56,189,248,0.3);border-radius:2px"></span>fréquent</span>
+                            <span class="flex items-center gap-1"><span style="display:inline-block;width:12px;height:12px;background:rgba(50,240,200,0.75);border:1px solid rgba(56,189,248,0.3);border-radius:2px"></span>très actif</span>
+                            <span class="flex items-center gap-1"><span style="display:inline-block;width:14px;height:2px;background:#f59e0b;border-radius:1px"></span>Ma station</span>
+                            <span class="flex items-center gap-1"><span style="display:inline-block;width:14px;height:1px;border-top:1px dashed #475569"></span>50 / 100 / 200 km</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Historique météo 48h -->
+                <div class="xl:col-span-3 glass rounded-[2rem] overflow-hidden shadow-2xl" id="wxhist-panel">
+                    <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
+                        <span class="text-[10px] font-black text-sky-400 uppercase tracking-widest">🌤️ Météo locale — 48h</span>
+                        <span id="wxhist-status" class="text-[9px] font-mono text-slate-600">chargement…</span>
+                    </div>
+                    <div class="p-4 space-y-4">
+                        <!-- Graphe température -->
+                        <div>
+                            <div class="text-[9px] font-mono text-orange-400 uppercase tracking-widest mb-1">🌡️ Température (°C)</div>
+                            <svg id="wxhist-temp" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                            </svg>
+                        </div>
+                        <!-- Graphe vent -->
+                        <div>
+                            <div class="text-[9px] font-mono text-sky-400 uppercase tracking-widest mb-1">💨 Vent (km/h)</div>
+                            <svg id="wxhist-wind" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                            </svg>
+                        </div>
+                        <!-- Graphe précipitations -->
+                        <div>
+                            <div class="text-[9px] font-mono text-blue-400 uppercase tracking-widest mb-1">🌧️ Précipitations (mm)</div>
+                            <svg id="wxhist-rain" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                            </svg>
+                        </div>
+                        <!-- Graphe orage LPI + CAPE -->
+                        <div>
+                            <div class="flex items-center justify-between mb-1">
+                                <span class="text-[9px] font-mono text-yellow-400 uppercase tracking-widest">⚡ Potentiel orage — LPI (J/kg) &amp; CAPE (J/kg)</span>
+                                <span id="wxhist-lightning-max" class="text-[9px] font-mono text-yellow-300 opacity-70"></span>
+                            </div>
+                            <svg id="wxhist-lightning" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                            </svg>
+                            <div class="flex gap-4 mt-1">
+                                <span class="text-[9px] font-mono flex items-center gap-1">
+                                    <span style="display:inline-block;width:10px;height:10px;background:#facc15;border-radius:2px"></span>LPI (axe gauche)
+                                </span>
+                                <span class="text-[9px] font-mono flex items-center gap-1">
+                                    <span style="display:inline-block;width:14px;height:2px;background:#f97316"></span>CAPE (axe droit)
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Alertes Propagation & Blackout HF -->
+                <div class="xl:col-span-3 glass rounded-[2rem] overflow-hidden shadow-2xl" id="propalert-hist-panel">
+                    <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
+                        <span class="text-[10px] font-black text-orange-400 uppercase tracking-widest">☀️ Alertes Propagation &amp; Blackout HF</span>
+                        <div class="flex items-center gap-3">
+                            <button onclick="loadPropAlertHistory()" class="text-[9px] font-mono text-slate-500 hover:text-orange-400 transition-colors px-2 py-0.5 rounded border border-slate-700 hover:border-orange-700">↺ rafraîchir</button>
+                            <span id="propalert-hist-status" class="text-[9px] font-mono text-slate-600">–</span>
+                        </div>
+                    </div>
+                    <div class="p-4">
+                        <div id="propalert-hist-list" class="space-y-2">
+                            <p class="text-slate-600 text-[10px] italic text-center py-4">Aucune alerte enregistrée depuis le démarrage.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Mon signal sur le réseau APRS -->
+                <div class="xl:col-span-3 glass rounded-[2rem] overflow-hidden shadow-2xl" id="sigpath-panel">
+                    <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
+                        <span class="text-[10px] font-black text-emerald-400 uppercase tracking-widest">📡 Mon signal — chemins réseau APRS</span>
+                        <div class="flex items-center gap-3">
+                            <span id="sigpath-callsign" class="text-[9px] font-mono text-slate-500"></span>
+                            <button onclick="loadSignalPath(true)" class="text-[9px] font-mono text-slate-500 hover:text-emerald-400 transition-colors px-2 py-0.5 rounded border border-slate-700 hover:border-emerald-700">↺ rafraîchir</button>
+                            <span id="sigpath-status" class="text-[9px] font-mono text-slate-600">–</span>
+                        </div>
+                    </div>
+                    <div class="p-4 space-y-4">
+
+                        <!-- Dernier chemin + compteurs digis -->
+                        <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+
+                            <!-- Dernier chemin complet -->
+                            <div>
+                                <div class="text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-2">🔗 Dernier chemin observé</div>
+                                <div id="sigpath-last" class="flex flex-wrap items-center gap-1 min-h-[32px]">
+                                    <span class="text-slate-600 text-[10px] italic">En attente de données…</span>
+                                </div>
+                            </div>
+
+                            <!-- Top digis -->
+                            <div>
+                                <div class="text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-2">🏆 Digipeaté par (24h)</div>
+                                <div id="sigpath-digis" class="space-y-1.5"></div>
+                            </div>
+                        </div>
+
+                        <!-- Historique des chemins récents -->
+                        <div>
+                            <div class="text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-2">📋 Historique des chemins (20 derniers)</div>
+                            <div id="sigpath-history" class="space-y-1 max-h-64 overflow-y-auto pr-1"></div>
+                        </div>
+
+                    </div>
+                </div>
+
+
             </div>
         </div>
 
+        <!-- ═══════════════════════════ NOTES ════════════════════════════════════ -->
+        <div id="tab-notes" class="hidden">
+            <div class="max-w-3xl mx-auto space-y-4">
+
+                <!-- Titre -->
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-[11px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                        📝 <span>Notes de l'opérateur</span>
+                    </h2>
+                    <span id="notes-char-count"
+                          style="font-size:9px;font-family:monospace;color:#334155">0 car.</span>
+                </div>
+
+                <!-- Éditeur -->
+                <div class="glass rounded-2xl p-4" style="border:1px solid rgba(148,163,184,0.1)">
+                    <textarea id="notes-editor"
+                        placeholder="Notes libres — fréquences, contacts, rappels, infos QSO…"
+                        spellcheck="false"
+                        style="
+                            width:100%; min-height:420px; resize:vertical;
+                            background:transparent; border:none; outline:none;
+                            color:#e2e8f0; font-family:'JetBrains Mono','Fira Mono',monospace;
+                            font-size:13px; line-height:1.7; padding:4px 0;
+                            caret-color:#60a5fa;
+                        "
+                    ></textarea>
+                </div>
+
+                <!-- Barre d'actions -->
+                <div class="flex items-center gap-3 flex-wrap">
+                    <button id="notes-save-btn"
+                            onclick="_notesSave()"
+                            class="px-4 py-2 rounded-xl font-bold text-[11px] uppercase tracking-wider
+                                   bg-blue-600 hover:bg-blue-500 text-white transition-all shadow-lg">
+                        💾 Sauvegarder
+                    </button>
+                    <button onclick="_notesCopy()"
+                            class="px-4 py-2 rounded-xl font-bold text-[11px] uppercase tracking-wider
+                                   bg-slate-700 hover:bg-slate-600 text-slate-200 transition-all">
+                        📋 Copier
+                    </button>
+                    <button onclick="_notesClear()"
+                            class="px-4 py-2 rounded-xl font-bold text-[11px] uppercase tracking-wider
+                                   bg-slate-800 hover:bg-red-900 text-slate-400 hover:text-red-300 transition-all">
+                        🗑 Effacer
+                    </button>
+                    <span id="notes-status"
+                          style="font-size:10px;font-family:monospace;color:#334155;margin-left:auto"></span>
+                </div>
+
+                <!-- Info persistance -->
+                <p class="text-[9px] text-slate-600 text-center mt-2">
+                    Sauvegarde automatique dans le navigateur (localStorage) · données locales uniquement
+                </p>
+
+            </div>
+        </div>
         <!-- ═══════════════════════════ LOGBOOK ═══════════════════════════════ -->
 
 </div>
@@ -2749,7 +4462,7 @@ def index():
     var _stationLat = null, _stationLon = null;
     (function() {
         try {
-            var cfg = """ + json.dumps({'maidenhead': config_manager.data.get('maidenhead',''), 'geo_mode': config_manager.data.get('geo_mode','locator'), 'lat_manual': config_manager.data.get('lat_manual',''), 'lon_manual': config_manager.data.get('lon_manual','')}) + """;
+            var cfg = __CFG_JSON__;
             if (cfg.geo_mode === 'coords' && cfg.lat_manual !== '' && cfg.lon_manual !== '') {
                 _stationLat = parseFloat(cfg.lat_manual);
                 _stationLon = parseFloat(cfg.lon_manual);
@@ -2776,6 +4489,10 @@ def index():
     var _stationPosBearing = {};   // callsign → azimut (°) vers la station distante
 
     function haversineKm(lat1, lon1, lat2, lon2) {
+        if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return null;
+        if (isNaN(lat1) || isNaN(lon1) || isNaN(lat2) || isNaN(lon2)) return null;
+        if (Math.abs(lat1) > 90 || Math.abs(lat2) > 90) return null;
+        if (Math.abs(lon1) > 180 || Math.abs(lon2) > 180) return null;
         var R = 6371;
         var dLat = (lat2 - lat1) * Math.PI / 180;
         var dLon = (lon2 - lon1) * Math.PI / 180;
@@ -2806,34 +4523,57 @@ def index():
         var e = frame.extra || {};
         var parts = [];
         if (e.lat !== undefined && e.lon !== undefined) {
+            var _posBadgeId = 'city-' + (frame.src || 'x').replace(/[^a-z0-9]/gi,'_')
+                              + '_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
             parts.push('<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:2px 7px;font-family:monospace;font-size:10px">'
                      + '<span style="color:#10b981;font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.08em">📍pos</span>'
                      + coordLink(e.lat, e.lon) + '</span>');
+            // Badge ville (injecté de façon asynchrone après geocoding)
+            parts.push('<span id="' + _posBadgeId + '" style="display:inline-flex;align-items:center;gap:4px;background:rgba(14,165,233,0.08);border:1px solid rgba(14,165,233,0.18);border-radius:6px;padding:2px 7px;font-size:10px;color:#7dd3fc;font-style:italic">🏙️&nbsp;<span style="opacity:.5">…</span></span>');
+            // Requête asynchrone vers /nearest_city (via proxy serveur → Nominatim)
+            (function(badgeId, lat, lon) {
+                fetch('/nearest_city?lat=' + lat + '&lon=' + lon)
+                    .then(function(r){ return r.ok ? r.json() : null; })
+                    .then(function(d) {
+                        var el = document.getElementById(badgeId);
+                        if (!el) return;
+                        if (d && d.display) {
+                            el.innerHTML = '🏙️&nbsp;<span style="color:#bae6fd;font-style:normal">' + esc(d.display) + '</span>';
+                            el.title = d.city + (d.state ? ', ' + d.state : '') + (d.country ? ' (' + d.country + ')' : '');
+                        } else {
+                            el.style.display = 'none';
+                        }
+                    })
+                    .catch(function(){ var el=document.getElementById(badgeId); if(el) el.style.display='none'; });
+            })(_posBadgeId, e.lat, e.lon);
             if (_stationLat !== null && _stationLon !== null) {
                 var _isObj = (frame.aprs_type === 'Objet');
                 var _src   = (frame.src || '').toUpperCase();
                 var _dist, _brng;
                 if (_isObj && _stationPosDistKm[_src] !== undefined) {
-                    // Objet iGaté : afficher la distance/azimut de la station émettrice
                     _dist = _stationPosDistKm[_src];
                     _brng = _stationPosBearing[_src];
                 } else {
                     _dist = haversineKm(_stationLat, _stationLon, e.lat, e.lon);
-                    _brng = bearingDeg(_stationLat, _stationLon, e.lat, e.lon);
-                    // Mémoriser si c'est une trame de position propre
-                    if (!_isObj) { _stationPosDistKm[_src] = _dist; _stationPosBearing[_src] = _brng; }
+                    _brng = (_dist !== null) ? bearingDeg(_stationLat, _stationLon, e.lat, e.lon) : undefined;
+                    if (!_isObj && _dist !== null) {
+                        _stationPosDistKm[_src]  = _dist;
+                        _stationPosBearing[_src] = _brng;
+                    }
                 }
-                var _distStr = _dist < 10 ? _dist.toFixed(1) + ' km' : Math.round(_dist) + ' km';
-                var _distCls = _dist < 50 ? 'text-emerald-300' : _dist < 150 ? 'text-yellow-300' : 'text-orange-300';
-                var _brngStr = _brng !== undefined ? bearingArrow(_brng) + ' ' + Math.round(_brng) + '°' : '';
-                var _bearingBadge = _brngStr ? badge('🧭', _distStr + ' · ' + _brngStr, _distCls) : badge('📏', _distStr, _distCls);
-                if (_isObj && _stationPosDistKm[_src] !== undefined) {
-                    _bearingBadge = _brngStr
-                        ? badge('🧭', _distStr + ' · ' + _brngStr + ' ·sta', _distCls)
-                        : badge('📏', _distStr + ' ·sta', _distCls);
+                if (_dist !== null && !isNaN(_dist)) {
+                    var _distStr = _dist < 10 ? _dist.toFixed(1) + ' km' : Math.round(_dist) + ' km';
+                    var _distCls = _dist < 50 ? 'text-emerald-300' : _dist < 150 ? 'text-yellow-300' : 'text-orange-300';
+                    var _brngStr = (_brng !== undefined && !isNaN(_brng)) ? bearingArrow(_brng) + ' ' + Math.round(_brng) + '°' : '';
+                    var _bearingBadge = _brngStr ? badge('🧭', _distStr + ' · ' + _brngStr, _distCls) : badge('📏', _distStr, _distCls);
+                    if (_isObj && _stationPosDistKm[_src] !== undefined) {
+                        _bearingBadge = _brngStr
+                            ? badge('🧭', _distStr + ' · ' + _brngStr + ' ·sta', _distCls)
+                            : badge('📏', _distStr + ' ·sta', _distCls);
+                    }
+                    parts.push(_bearingBadge);
                 }
-                parts.push(_bearingBadge);
-            }
+        }
         }
         if (e.symbol) parts.push(badge('sym', e.symbol));
         if (e.mice_status) parts.push(badge('📱', e.mice_status, 'text-fuchsia-300'));
@@ -2993,7 +4733,7 @@ def index():
 
             // Texte libre restant (QTH, nom du relais…)
             var txt = stripped
-                .replace(/\b\d+\.\s*/g, '')   // numéros résiduels type "36."
+                .replace(/\b\d+\.\s{0,}/g, '')   // numéros résiduels type "36."
                 .replace(/\s{2,}/g, ' ')
                 .trim();
             if (txt) parts.push('<span class="text-slate-300 text-xs">' + esc(txt) + '</span>');
@@ -3094,20 +4834,20 @@ def index():
             destPath += '<span style="color:#334155;font-size:9px;font-family:monospace;margin-left:3px">' + esc(frame.path) + '</span>';
         }
 
-        var typeBadge = '<span style="display:inline-flex;align-items:center;gap:3px;background:' + typeBg + ';border:1px solid rgba(148,163,184,0.1);border-radius:6px;padding:2px 7px;font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap">'
+        var typeBadge = '<span class="aprs-type-badge" style="display:inline-flex;align-items:center;gap:3px;background:' + typeBg + ';border:1px solid rgba(148,163,184,0.1);border-radius:6px;padding:2px 7px;font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap">'
                       + aprsTypeEmoji(frame.aprs_type) + ' ' + esc(frame.aprs_type || '?') + '</span>';
 
-        var dirBadge = '<span style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:5px;font-size:9px;font-weight:900;letter-spacing:.1em;background:' + dirBg + ';color:' + dirText + ';border:1px solid ' + dirBorder + '">' + dirLabel + '</span>';
+        var dirBadge = '<span class="aprs-dir-badge" style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:5px;font-size:9px;font-weight:900;letter-spacing:.1em;background:' + dirBg + ';color:' + dirText + ';border:1px solid ' + dirBorder + '">' + dirLabel + '</span>';
 
-        var header = '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:space-between">'
-            + '<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:0">'
+        var header = '<div class="aprs-card-hdr" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:space-between">'
+            + '<div class="aprs-card-hdr-left" style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:0">'
             + dirBadge
-            + qrzLink(frame.src || '?', {cls:'text-[11px] font-black font-mono px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-blue-300 transition-colors border border-slate-700/50'})
-            + destPath
+            + qrzLink(frame.src || '?', {cls:'aprs-cs-link text-[11px] font-black font-mono px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-blue-300 transition-colors border border-slate-700/50'})
+            + '<span class="aprs-dest-path" style="display:inline-flex;align-items:center;gap:3px">' + destPath + '</span>'
             + '</div>'
-            + '<div style="display:flex;align-items:center;gap:6px;flex-shrink:0">'
+            + '<div class="aprs-card-hdr-right" style="display:flex;align-items:center;gap:6px;flex-shrink:0">'
             + typeBadge
-            + '<span style="font-size:9px;font-family:monospace;color:#475569;white-space:nowrap">' + timeStr + '</span>'
+            + '<span class="aprs-time" style="font-size:9px;font-family:monospace;color:#475569;white-space:nowrap">' + timeStr + '</span>'
             + '</div>'
             + '</div>';
 
@@ -3133,7 +4873,7 @@ def index():
             + 'border-radius:12px;border:1px solid rgba(30,41,59,0.9);border-left-width:3px;border-left-color:' + accentColor + ';'
             + 'padding:10px 14px;animation:aprsCardIn .18s ease-out';
         div.innerHTML = header
-            + (fieldsHtml ? '<div style="margin-top:7px">' + fieldsHtml.replace(/^<div[^>]*>/, '').replace(/<\/div>$/, '') + '</div>' : '')
+            + (fieldsHtml ? '<div class="aprs-fields" style="margin-top:7px">' + fieldsHtml.replace(/^<div[^>]*>/, '').replace(/<\/div>$/, '') + '</div>' : '')
             + rawHtml;
         con.prepend(div);
 
@@ -3144,7 +4884,35 @@ def index():
 
     // ── Restauration de l'historique après F5 ─────────────────────────────
     var rxFrameCount = 0;
-    var _seenFids = new Set();   // fids déjà affichés via rx_history
+    var _seenFids = new Set();   // fids déjà affichés via rx_history  # PATCH_DISPLAY_DEDUP_v1
+    // Déduplication par contenu (src + payload) sur 45 s — évite les doubles
+    // affichages quand une même trame arrive via plusieurs chemins (digipeat).
+    var _contentDedup = {};  // key → timestamp_ms
+    var _CONTENT_TTL  = 45000; // 45 secondes
+    function _contentKey(frame) {
+        var p = (frame.payload || '').substring(0, 80);
+        return (frame.src || '') + '|' + p;
+    }
+    var _dupPurgeTimer = 0;
+    function _isDupContent(frame) {
+        var k = _contentKey(frame);
+        var now = Date.now();
+        // Purger les entrées expirées toutes les 60 s seulement (pas à chaque trame)
+        if (now - _dupPurgeTimer > 60000) {
+            _dupPurgeTimer = now;
+            Object.keys(_contentDedup).forEach(function(ck) {
+                if (now - _contentDedup[ck] > _CONTENT_TTL) delete _contentDedup[ck];
+            });
+            // Purger _seenFids si trop grand
+            if (_seenFids.size > 800) {
+                var _it = _seenFids.values();
+                for (var _i = 0; _i < 400; _i++) { var nx = _it.next(); if (!nx.done) _seenFids.delete(nx.value); }
+            }
+        }
+        if (_contentDedup.hasOwnProperty(k)) return true;
+        _contentDedup[k] = now;
+        return false;
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // 📊 STATISTIQUES — défini avant fetch('/rx_history') et EventSource
@@ -3156,6 +4924,9 @@ def index():
         var _stations   = {};                          // { callsign: {rx,tx,is} }
         var _totalRx = 0, _totalTx = 0, _totalIs = 0;
         var _statsDirty = false;
+        var _bestDx       = null;   // {cs, distKm, brng, ts}
+        var _maxDistKm    = 0;
+        var _gridCells    = {};     // grid4 → {count, stations:{cs:1}, last, lat, lon}
     
         function _bucketIdx() {
             var now = new Date();
@@ -3198,16 +4969,218 @@ def index():
             }
             var uniq = Object.keys(_stations).length;
             _setTxt('stats-total-stations', uniq);
+            // ── Best DX (RF uniquement — exclut IS/Internet) ─────────────────
+            if (type === 'RX' && _stationLat !== null && _stationLon !== null && frame && frame.extra) {
+                var _ex = frame.extra;
+                if (_ex.lat !== undefined && _ex.lon !== undefined && frame.aprs_type !== 'Objet') {
+                    var _d = haversineKm(_stationLat, _stationLon, _ex.lat, _ex.lon);
+                    if (_d !== null && _d > 0) {
+                        if (_bestDx === null || _d > _bestDx.distKm) {
+                            var _br = bearingDeg(_stationLat, _stationLon, _ex.lat, _ex.lon);
+                            _bestDx = {cs: frame.src || '?', distKm: _d, brng: Math.round(_br), ts: Date.now()};
+                            _renderBestDx();
+                        }
+                    }
+                }
+            }
+            // ── Distance max toutes trames (RX + IS) ──────────────────────────
+            if ((type === 'RX' || type === 'IS') && _stationLat !== null && _stationLon !== null && frame && frame.extra) {
+                var _exm = frame.extra;
+                if (_exm.lat !== undefined && _exm.lon !== undefined && frame.aprs_type !== 'Objet') {
+                    var _dm = haversineKm(_stationLat, _stationLon, _exm.lat, _exm.lon);
+                    if (_dm !== null && _dm > _maxDistKm) {
+                        _maxDistKm = _dm;
+                        _renderMaxDist();
+                    }
+                }
+            }
+            // ── Grille Maidenhead (maillage) ─────────────────────────────────
+            if (frame && frame.extra) {
+                var _ex2 = frame.extra;
+                if (_ex2.lat !== undefined && _ex2.lon !== undefined && frame.aprs_type !== 'Objet') {
+                    var _g4 = _latLonToGrid4(_ex2.lat, _ex2.lon);
+                    if (_g4) {
+                        if (!_gridCells[_g4]) {
+                            _gridCells[_g4] = {count:0, stations:{}, last:0,
+                                               lat:_ex2.lat, lon:_ex2.lon};
+                        }
+                        _gridCells[_g4].count++;
+                        if (src) _gridCells[_g4].stations[src] = 1;
+                        _gridCells[_g4].last = Date.now();
+                    }
+                }
+            }
             // Mise à jour différée (pas à chaque trame pour les perfs)
             _statsDirty = true;
             if (window._statsRenderTimer) clearTimeout(window._statsRenderTimer);
             window._statsRenderTimer = setTimeout(_statsRender, 800);
         };
     
+        // ── Maidenhead helpers ────────────────────────────────────────────
+        function _latLonToGrid4(lat, lon) {
+            try {
+                var lo = lon + 180, la = lat + 90;
+                var A = String.fromCharCode(65 + Math.floor(lo / 20));
+                var B = String.fromCharCode(65 + Math.floor(la / 10));
+                var C = String(Math.floor((lo % 20) / 2));
+                var D = String(Math.floor(la % 10));
+                return A + B + C + D;
+            } catch(e) { return null; }
+        }
+
+        function _grid4Center(g4) {
+            // Retourne {lat, lon} centre de la case Maidenhead 4 car.
+            g4 = g4.toUpperCase();
+            var lon = (g4.charCodeAt(0) - 65) * 20 - 180 + parseInt(g4[2]) * 2 + 1;
+            var lat = (g4.charCodeAt(1) - 65) * 10 - 90  + parseInt(g4[3]) + 0.5;
+            return {lat: lat, lon: lon};
+        }
+
+        // ── Rendu carte de maillage ───────────────────────────────────────
+        function _renderMesh() {
+            var svg = document.getElementById('stats-mesh-svg');
+            if (!svg) return;
+            var keys = Object.keys(_gridCells);
+
+            // Résumé texte
+            var elCount = document.getElementById('stats-mesh-count');
+            if (elCount) elCount.textContent = keys.length + ' case' + (keys.length > 1 ? 's' : '');
+
+            if (!keys.length || _stationLat === null || _stationLon === null) {
+                svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#475569">En attente de positions…</text>';
+                return;
+            }
+
+            // Dimensions
+            var W = 700, H = 380;
+            var PL = 30, PR = 10, PT = 14, PB = 24;
+            var cW = W - PL - PR, cH = H - PT - PB;
+
+            // Étendue géographique : centrer sur la station, ±SPAN degrés
+            var SPAN_LON = 12, SPAN_LAT = 7;   // fenêtre ±
+            var lonMin = _stationLon - SPAN_LON, lonMax = _stationLon + SPAN_LON;
+            var latMin = _stationLat - SPAN_LAT, latMax = _stationLat + SPAN_LAT;
+
+            function toX(lon) { return PL + (lon - lonMin) / (lonMax - lonMin) * cW; }
+            function toY(lat) { return PT + (1 - (lat - latMin) / (latMax - latMin)) * cH; }
+
+            // Largeur/hauteur d'une case Maidenhead 4 car. en pixels
+            var cellW = Math.abs(toX(lonMin + 2) - toX(lonMin));
+            var cellH = Math.abs(toY(latMin + 1) - toY(latMin));
+
+            // Densité max pour l'échelle de couleur
+            var maxCount = 1;
+            keys.forEach(function(k) { if (_gridCells[k].count > maxCount) maxCount = _gridCells[k].count; });
+
+            var out = '';
+
+            // ── Grille de fond (toutes les 2° lon / 1° lat dans la fenêtre) ──
+            for (var glon = Math.ceil(lonMin / 2) * 2; glon < lonMax; glon += 2) {
+                var x = toX(glon);
+                if (x < PL || x > W - PR) continue;
+                out += '<line x1="' + x.toFixed(1) + '" y1="' + PT + '" x2="' + x.toFixed(1) + '" y2="' + (PT + cH) + '" stroke="#1e293b" stroke-width="0.5"/>';
+                out += '<text x="' + x.toFixed(1) + '" y="' + (PT + cH + 13) + '" text-anchor="middle" font-size="7" fill="#334155">' + glon + '°</text>';
+            }
+            for (var glat = Math.ceil(latMin); glat < latMax; glat++) {
+                var y = toY(glat);
+                if (y < PT || y > PT + cH) continue;
+                out += '<line x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '" stroke="#1e293b" stroke-width="0.5"/>';
+                out += '<text x="' + (PL - 3) + '" y="' + (y + 3).toFixed(1) + '" text-anchor="end" font-size="7" fill="#334155">' + glat + '°</text>';
+            }
+
+            // ── Cases entendues ───────────────────────────────────────────
+            keys.forEach(function(g4) {
+                var c   = _grid4Center(g4);
+                var cx  = toX(c.lon - 1);   // coin SO : lon centre - 1°
+                var cy  = toY(c.lat + 0.5); // coin SO : lat centre + 0.5°
+                // Filtrer les cases hors fenêtre
+                if (cx + cellW < PL || cx > W - PR || cy + cellH < PT || cy > PT + cH) return;
+                var cell = _gridCells[g4];
+                var t    = cell.count / maxCount;              // 0..1
+                // Couleur : bleu pâle → cyan → vert clair selon densité
+                var r = Math.round(30  + t * 20);
+                var g = Math.round(140 + t * 100);
+                var b = Math.round(200 + (1-t) * 55);
+                var alpha = (0.25 + t * 0.55).toFixed(2);
+                var fill  = 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+                var nSta  = Object.keys(cell.stations).length;
+                var title = g4 + ' · ' + cell.count + ' trame' + (cell.count>1?'s':'')
+                          + ' · ' + nSta + ' sta' + (nSta>1?'tions':'tion');
+                out += '<rect x="' + cx.toFixed(1) + '" y="' + cy.toFixed(1)
+                     + '" width="' + cellW.toFixed(1) + '" height="' + cellH.toFixed(1)
+                     + '" fill="' + fill + '" stroke="rgba(56,189,248,0.3)" stroke-width="0.8" rx="1">'
+                     + '<title>' + title + '</title></rect>';
+                // Label indicatif si case assez grande
+                if (cellW > 28) {
+                    var lx = (cx + cellW / 2).toFixed(1);
+                    var ly = (cy + cellH / 2 + 3).toFixed(1);
+                    out += '<text x="' + lx + '" y="' + ly + '" text-anchor="middle" font-size="8" fill="rgba(186,230,253,0.85)" font-family="monospace">' + g4 + '</text>';
+                    if (cell.count > 1 && cellH > 14) {
+                        out += '<text x="' + lx + '" y="' + (parseFloat(ly)+9).toFixed(1) + '" text-anchor="middle" font-size="7" fill="rgba(148,163,184,0.7)">' + cell.count + '</text>';
+                    }
+                }
+            });
+
+            // ── Station locale (croix) ────────────────────────────────────
+            var sx = toX(_stationLon), sy = toY(_stationLat);
+            out += '<line x1="' + (sx-7) + '" y1="' + sy + '" x2="' + (sx+7) + '" y2="' + sy + '" stroke="#f59e0b" stroke-width="2"/>';
+            out += '<line x1="' + sx + '" y1="' + (sy-7) + '" x2="' + sx + '" y2="' + (sy+7) + '" stroke="#f59e0b" stroke-width="2"/>';
+            out += '<circle cx="' + sx + '" cy="' + sy + '" r="4" fill="none" stroke="#f59e0b" stroke-width="1.5"/>';
+
+            // ── Cercles de distance (50 / 100 / 200 km) ──────────────────
+            var KM_RINGS = [50, 100, 200];
+            KM_RINGS.forEach(function(km) {
+                var dLat = km / 111.0;
+                var dLon = km / (111.0 * Math.cos(_stationLat * Math.PI / 180));
+                var rx   = Math.abs(toX(_stationLon + dLon) - sx);
+                var ry   = Math.abs(toY(_stationLat + dLat) - sy);
+                if (rx < 3 || ry < 3) return;
+                out += '<ellipse cx="' + sx.toFixed(1) + '" cy="' + sy.toFixed(1)
+                     + '" rx="' + rx.toFixed(1) + '" ry="' + ry.toFixed(1)
+                     + '" fill="none" stroke="rgba(71,85,105,0.5)" stroke-width="0.8" stroke-dasharray="3,4"/>';
+                out += '<text x="' + (sx + rx + 2).toFixed(1) + '" y="' + (sy - 2).toFixed(1)
+                     + '" font-size="7" fill="#475569">' + km + ' km</text>';
+            });
+
+            svg.innerHTML = out;
+        }
+
         // ── Rendu ─────────────────────────────────────────────────────────
+        function _renderBestDx() {
+            var elCs   = document.getElementById('stats-bestdx-cs');
+            var elDist = document.getElementById('stats-bestdx-dist');
+            var elBrng = document.getElementById('stats-bestdx-brng');
+            var elDate = document.getElementById('stats-bestdx-date');
+            if (!elCs) return;
+            if (!_bestDx) {
+                elCs.textContent   = '–';
+                elDist.textContent = '–';
+                elBrng.textContent = '';
+                if (elDate) elDate.textContent = '';
+                return;
+            }
+            elCs.innerHTML = qrzLink(_bestDx.cs, {cls:'font-mono font-black text-rose-300 hover:text-rose-200 transition-colors'});
+            elDist.textContent = _bestDx.distKm < 10 ? _bestDx.distKm.toFixed(1) + ' km' : Math.round(_bestDx.distKm) + ' km';
+            elBrng.textContent = bearingArrow(_bestDx.brng) + ' ' + _bestDx.brng + '°';
+            if (elDate) {
+                var d = new Date(_bestDx.ts);
+                elDate.textContent = d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+            }
+        }
+
+        function _renderMaxDist() {
+            var elBadge = document.getElementById('stats-bestdx-dist-badge');
+            if (!elBadge) return;
+            if (_maxDistKm <= 0) { elBadge.textContent = '–'; return; }
+            elBadge.textContent = _maxDistKm < 10 ? _maxDistKm.toFixed(1) + ' km' : Math.round(_maxDistKm) + ' km';
+        }
+
         function _statsRender() {
             _renderChart();
             _renderTop10();
+            _renderBestDx();
+            _renderMaxDist();
+            _renderMesh();
             var el = document.getElementById('stats-last-update');
             if (el) el.textContent = 'màj ' + new Date().toLocaleTimeString();
         }
@@ -3220,6 +5193,8 @@ def index():
             }
             return {buckets: bSave, stations: _stations,
                     totalRx: _totalRx, totalTx: _totalTx, totalIs: _totalIs,
+                    bestDx: _bestDx, maxDistKm: _maxDistKm,
+                    gridCells: _gridCells,
                     savedAt: Date.now()};
         }
 
@@ -3246,6 +5221,9 @@ def index():
                 if (d.totalRx) { _totalRx = d.totalRx; _s('stats-total-rx', _totalRx); }
                 if (d.totalTx) { _totalTx = d.totalTx; _s('stats-total-tx', _totalTx); }
                 if (d.totalIs) { _totalIs = d.totalIs; _s('stats-total-is', _totalIs); }
+                if (d.maxDistKm) { _maxDistKm = d.maxDistKm; _renderMaxDist(); }
+                if (d.bestDx)    { _bestDx    = d.bestDx; _renderBestDx(); }
+                if (d.gridCells) { _gridCells = d.gridCells; }
                 _s('stats-total-stations', Object.keys(_stations).length);
                 _statsRender();
             }).catch(function(){});
@@ -3363,16 +5341,635 @@ def index():
     
         // Brancher sur l'ouverture de l'onglet via event
         document.addEventListener('aprs-switchtab', function(e) {
-            if (e.detail === 'stats') setTimeout(_statsRender, 50);
+            if (e.detail === 'stats') {
+                setTimeout(_statsRender, 50);
+                _loadWeatherHistory();
+            }
+        });
+
+        // ── Exports publics (utilisés par les boutons reset inline) ──────────
+        window._renderBestDx = _renderBestDx;
+        window._resetDx = function() {
+            _bestDx = null;
+            _maxDistKm = 0;
+            fetch('/stats/reset_dx', {method: 'POST'}).catch(function(){});
+            _renderBestDx();
+            _renderMaxDist();
+        };
+    })();
+
+    // ── Historique météo 48h ──────────────────────────────────────────────────
+    (function() {
+        var _wxHistLoaded = false;
+
+        function _wxLinePath(values, minV, maxV, W, H, PL, PR, PT, PB) {
+            var cW = W - PL - PR, cH = H - PT - PB;
+            var n = values.length;
+            var pts = [];
+            for (var i = 0; i < n; i++) {
+                var v = values[i];
+                var x = PL + (i / (n - 1)) * cW;
+                var y = (maxV === minV)
+                    ? PT + cH / 2
+                    : PT + cH - ((v - minV) / (maxV - minV)) * cH;
+                pts.push(x.toFixed(1) + ',' + y.toFixed(1));
+            }
+            return pts.join(' ');
+        }
+
+        function _wxAreaPath(values, minV, maxV, W, H, PL, PR, PT, PB) {
+            var cW = W - PL - PR, cH = H - PT - PB;
+            var n = values.length;
+            var top = [];
+            for (var i = 0; i < n; i++) {
+                var v = values[i];
+                var x = PL + (i / (n - 1)) * cW;
+                var y = (maxV === minV)
+                    ? PT + cH / 2
+                    : PT + cH - ((v - minV) / (maxV - minV)) * cH;
+                top.push(x.toFixed(1) + ',' + y.toFixed(1));
+            }
+            var xFirst = (PL).toFixed(1), xLast = (PL + cW).toFixed(1), yBase = (PT + cH).toFixed(1);
+            return 'M ' + xFirst + ',' + yBase + ' L ' + top.join(' L ') + ' L ' + xLast + ',' + yBase + ' Z';
+        }
+
+        function _wxRenderSvg(svgId, values, color, areaColor, unit, decimals) {
+            var svg = document.getElementById(svgId);
+            if (!svg || !values || !values.length) return;
+            var W = 800, H = 90, PL = 38, PR = 6, PT = 8, PB = 22;
+            var cW = W - PL - PR, cH = H - PT - PB;
+            var n = values.length;
+
+            var minV = Math.min.apply(null, values);
+            var maxV = Math.max.apply(null, values);
+            if (maxV === minV) { minV -= 1; maxV += 1; }
+            // Léger padding vertical
+            var pad = (maxV - minV) * 0.12;
+            minV -= pad; maxV += pad;
+
+            var out = '';
+
+            // Grille Y (3 niveaux)
+            for (var step = 0; step <= 2; step++) {
+                var yv  = minV + (step / 2) * (maxV - minV);
+                var ypy = PT + cH - (step / 2) * cH;
+                out += '<line x1="' + PL + '" y1="' + ypy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + ypy.toFixed(1)
+                     + '" stroke="#1e293b" stroke-width="1" stroke-dasharray="2,4"/>';
+                out += '<text x="' + (PL - 3) + '" y="' + (ypy + 3).toFixed(1)
+                     + '" text-anchor="end" font-size="8" fill="#475569">'
+                     + yv.toFixed(decimals) + '</text>';
+            }
+
+            // Axe X : étiquettes toutes les 6h
+            // n = 48 points = 48h; point i = (47-i)h avant maintenant
+            var now = new Date();
+            for (var i = 0; i < n; i += 6) {
+                var xTick = PL + (i / (n - 1)) * cW;
+                var msBack = (n - 1 - i) * 3600 * 1000;
+                var d = new Date(now.getTime() - msBack);
+                var hLabel = String(d.getHours()).padStart(2, '0') + 'h';
+                var dayLabel = (d.getDate() !== now.getDate()) ? (d.getDate() + '/' + (d.getMonth()+1) + ' ') : '';
+                out += '<line x1="' + xTick.toFixed(1) + '" y1="' + PT + '" x2="' + xTick.toFixed(1)
+                     + '" y2="' + (PT + cH) + '" stroke="#1e293b" stroke-width="1"/>';
+                out += '<text x="' + xTick.toFixed(1) + '" y="' + (PT + cH + 14)
+                     + '" text-anchor="middle" font-size="7" fill="#475569">' + dayLabel + hLabel + '</text>';
+            }
+
+            // Aire de remplissage
+            out += '<path d="' + _wxAreaPath(values, minV, maxV, W, H, PL, PR, PT, PB)
+                 + '" fill="' + areaColor + '" />';
+
+            // Ligne principale
+            out += '<polyline points="' + _wxLinePath(values, minV, maxV, W, H, PL, PR, PT, PB)
+                 + '" fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>';
+
+            // Ligne de base
+            out += '<line x1="' + PL + '" y1="' + (PT + cH) + '" x2="' + (W - PR) + '" y2="' + (PT + cH)
+                 + '" stroke="#334155" stroke-width="1"/>';
+
+            svg.innerHTML = out;
+        }
+
+        function _wxRenderBars(svgId, values, color, areaColor) {
+            // Barres verticales pour les précipitations
+            var svg = document.getElementById(svgId);
+            if (!svg || !values || !values.length) return;
+            var W = 800, H = 90, PL = 38, PR = 6, PT = 8, PB = 22;
+            var cW = W - PL - PR, cH = H - PT - PB;
+            var n = values.length;
+            var maxV = Math.max.apply(null, values);
+            if (maxV <= 0) maxV = 1;
+            var barW = Math.max(1.5, cW / n - 1);
+            var out = '';
+
+            // Grille Y
+            for (var step = 0; step <= 2; step++) {
+                var yv  = (step / 2) * maxV;
+                var ypy = PT + cH - (step / 2) * cH;
+                out += '<line x1="' + PL + '" y1="' + ypy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + ypy.toFixed(1)
+                     + '" stroke="#1e293b" stroke-width="1" stroke-dasharray="2,4"/>';
+                out += '<text x="' + (PL - 3) + '" y="' + (ypy + 3).toFixed(1)
+                     + '" text-anchor="end" font-size="8" fill="#475569">' + yv.toFixed(1) + '</text>';
+            }
+
+            // Axe X
+            var now = new Date();
+            for (var i = 0; i < n; i += 6) {
+                var xTick = PL + (i / (n - 1)) * cW;
+                var msBack = (n - 1 - i) * 3600 * 1000;
+                var d = new Date(now.getTime() - msBack);
+                var hLabel = String(d.getHours()).padStart(2, '0') + 'h';
+                var dayLabel = (d.getDate() !== now.getDate()) ? (d.getDate() + '/' + (d.getMonth()+1) + ' ') : '';
+                out += '<line x1="' + xTick.toFixed(1) + '" y1="' + PT + '" x2="' + xTick.toFixed(1)
+                     + '" y2="' + (PT + cH) + '" stroke="#1e293b" stroke-width="1"/>';
+                out += '<text x="' + xTick.toFixed(1) + '" y="' + (PT + cH + 14)
+                     + '" text-anchor="middle" font-size="7" fill="#475569">' + dayLabel + hLabel + '</text>';
+            }
+
+            // Barres
+            for (var i = 0; i < n; i++) {
+                var v = values[i];
+                if (v <= 0) continue;
+                var x   = PL + (i / (n - 1)) * cW - barW / 2;
+                var bH  = Math.max(1, (v / maxV) * cH);
+                var y   = PT + cH - bH;
+                out += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1)
+                     + '" width="' + barW.toFixed(1) + '" height="' + bH.toFixed(1)
+                     + '" fill="' + color + '" rx="1"/>';
+            }
+
+            // Ligne de base
+            out += '<line x1="' + PL + '" y1="' + (PT + cH) + '" x2="' + (W - PR) + '" y2="' + (PT + cH)
+                 + '" stroke="#334155" stroke-width="1"/>';
+
+            svg.innerHTML = out;
+        }
+
+        // ── Graphe LPI + CAPE dual-axis ────────────────────────────────────────
+        function _wxRenderLightning(svgId, lpiArr, capeArr) {
+            var svg = document.getElementById(svgId);
+            if (!svg) return;
+            var W = 800, H = 90, PL = 38, PR = 48, PT = 8, PB = 22;
+            var cW = W - PL - PR, cH = H - PT - PB;
+            var n = lpiArr.length;
+            if (n === 0) return;
+
+            // Valeurs LPI (filtrer null)
+            var lpiClean = lpiArr.map(function(v){ return (v === null || v === undefined) ? 0 : v; });
+            var maxLpi = Math.max.apply(null, lpiClean); if (maxLpi <= 0) maxLpi = 1;
+
+            // Valeurs CAPE
+            var capeClean = (capeArr && capeArr.length === n)
+                ? capeArr.map(function(v){ return (v === null || v === undefined) ? 0 : v; })
+                : lpiArr.map(function(){ return 0; });
+            var maxCape = Math.max.apply(null, capeClean); if (maxCape <= 0) maxCape = 1;
+
+            var out = '';
+
+            // Grille Y LPI (gauche) — 3 niveaux
+            for (var step = 0; step <= 2; step++) {
+                var yv  = (step / 2) * maxLpi;
+                var ypy = PT + cH - (step / 2) * cH;
+                out += '<line x1="' + PL + '" y1="' + ypy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + ypy.toFixed(1)
+                     + '" stroke="#1e293b" stroke-width="1" stroke-dasharray="2,4"/>';
+                out += '<text x="' + (PL - 3) + '" y="' + (ypy + 3).toFixed(1)
+                     + '" text-anchor="end" font-size="8" fill="#ca8a04">' + yv.toFixed(1) + '</text>';
+            }
+            // Axe Y CAPE (droite)
+            for (var step = 0; step <= 2; step++) {
+                var yv  = (step / 2) * maxCape;
+                var ypy = PT + cH - (step / 2) * cH;
+                out += '<text x="' + (W - PR + 3) + '" y="' + (ypy + 3).toFixed(1)
+                     + '" text-anchor="start" font-size="8" fill="#f97316">' + Math.round(yv) + '</text>';
+            }
+
+            // Axe X
+            var now = new Date();
+            for (var i = 0; i < n; i += 6) {
+                var xTick = PL + (i / (n - 1)) * cW;
+                var msBack = (n - 1 - i) * 3600 * 1000;
+                var d2 = new Date(now.getTime() - msBack);
+                var hLabel = String(d2.getHours()).padStart(2, '0') + 'h';
+                var dayLabel = (d2.getDate() !== now.getDate()) ? (d2.getDate() + '/' + (d2.getMonth()+1) + ' ') : '';
+                out += '<line x1="' + xTick.toFixed(1) + '" y1="' + PT + '" x2="' + xTick.toFixed(1)
+                     + '" y2="' + (PT + cH) + '" stroke="#1e293b" stroke-width="1"/>';
+                out += '<text x="' + xTick.toFixed(1) + '" y="' + (PT + cH + 14)
+                     + '" text-anchor="middle" font-size="7" fill="#475569">' + dayLabel + hLabel + '</text>';
+            }
+
+            // Barres LPI — couleur par intensité
+            var barW = Math.max(2, cW / n - 1);
+            for (var i = 0; i < n; i++) {
+                var v = lpiClean[i];
+                if (v <= 0) continue;
+                var x  = PL + (i / (n - 1)) * cW - barW / 2;
+                var bH = Math.max(1, (v / maxLpi) * cH);
+                var y  = PT + cH - bH;
+                // Rouge > 5, orange 1-5, jaune < 1
+                var col = v > 5 ? '#ef4444' : v > 1 ? '#f97316' : '#facc15';
+                out += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1)
+                     + '" width="' + barW.toFixed(1) + '" height="' + bH.toFixed(1)
+                     + '" fill="' + col + '" rx="1" opacity="0.85"/>';
+            }
+
+            // Ligne CAPE (orange, axe droit)
+            if (maxCape > 0) {
+                var capePts = [];
+                for (var i = 0; i < n; i++) {
+                    var cx = PL + (i / (n - 1)) * cW;
+                    var cy = PT + cH - (capeClean[i] / maxCape) * cH;
+                    capePts.push(cx.toFixed(1) + ',' + cy.toFixed(1));
+                }
+                out += '<polyline points="' + capePts.join(' ')
+                     + '" fill="none" stroke="#f97316" stroke-width="1.5"'
+                     + ' stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="3,2" opacity="0.7"/>';
+            }
+
+            // Ligne de base
+            out += '<line x1="' + PL + '" y1="' + (PT + cH) + '" x2="' + (W - PR) + '" y2="' + (PT + cH)
+                 + '" stroke="#334155" stroke-width="1"/>';
+
+            svg.innerHTML = out;
+        }
+
+        window._loadWeatherHistory = function() {
+            if (_wxHistLoaded) return;   // déjà chargé dans cette session
+            var st = document.getElementById('wxhist-status');
+            fetch('/weather_history')
+                .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
+                .then(function(d) {
+                    if (!d || !d.temperature_2m || !d.temperature_2m.length) {
+                        if (st) st.textContent = 'données indisponibles';
+                        return;
+                    }
+                    _wxHistLoaded = true;
+
+                    // température
+                    _wxRenderSvg('wxhist-temp', d.temperature_2m, '#fb923c', 'rgba(251,146,60,0.10)', '°C', 1);
+
+                    // vent en km/h (API retourne m/s → ×3.6)
+                    var windKmh = d.wind_speed_10m.map(function(v){ return +(v * 3.6).toFixed(1); });
+                    _wxRenderSvg('wxhist-wind', windKmh, '#38bdf8', 'rgba(56,189,248,0.10)', 'km/h', 0);
+
+                    // précipitations barres
+                    _wxRenderBars('wxhist-rain', d.precipitation, '#60a5fa', 'rgba(96,165,250,0.15)');
+
+                    // orage : LPI + CAPE dual-axis
+                    if (d.lightning_potential && d.lightning_potential.length) {
+                        _wxRenderLightning('wxhist-lightning', d.lightning_potential, d.cape || []);
+                        // badge max LPI
+                        var maxLpi = Math.max.apply(null, d.lightning_potential.filter(function(v){ return v !== null; }));
+                        var el = document.getElementById('wxhist-lightning-max');
+                        if (el && maxLpi > 0) {
+                            var sev = maxLpi > 5 ? 'text-red-400' : maxLpi > 1 ? 'text-orange-400' : 'text-yellow-500';
+                            el.innerHTML = '<span class="' + sev + '">max LPI ' + maxLpi.toFixed(2) + ' J/kg</span>';
+                        }
+                    }
+
+                    // statut
+                    if (st) {
+                        var loc = d.location ? ' · ' + d.location : '';
+                        st.textContent = 'màj ' + new Date().toLocaleTimeString() + loc;
+                    }
+                })
+                .catch(function(err) {
+                    if (st) st.textContent = 'erreur (' + err + ')';
+                });
+        };
+
+        // Chargement automatique si l'onglet stats est déjà actif à l'ouverture
+        window.addEventListener('load', function() {
+            var tab = document.getElementById('tab-stats');
+            if (tab && !tab.classList.contains('hidden')) {
+                _loadWeatherHistory();
+                setTimeout(function() { if (window.loadSignalPath) loadSignalPath(false); }, 0);
+                if (window.loadPropAlertHistory) loadPropAlertHistory();
+            }
         });
     })();
+
+    // ── Signal Path — chemins réseau APRS ────────────────────────────────────
+    (function() {
+        var _spTimer = null;
+
+        // Couleur par source
+        function _srcCls(src) {
+            if (src === 'RF')     return 'text-emerald-300';
+            if (src === 'IS')     return 'text-violet-300';
+            if (src === 'aprsfi') return 'text-sky-300';
+            return 'text-slate-400';
+        }
+        function _srcBadge(src) {
+            var map = { RF: ['RF', 'bg-emerald-900/40 border-emerald-700/40'],
+                        IS: ['IS', 'bg-violet-900/40 border-violet-700/40'],
+                        aprsfi: ['aprs.fi', 'bg-sky-900/40 border-sky-700/40'] };
+            var info = map[src] || [src, 'bg-slate-800/80 border-slate-700/40'];
+            return '<span class="inline-flex items-center ' + info[1]
+                 + ' border rounded px-1.5 py-0.5 text-[8px] font-bold font-mono uppercase tracking-wide '
+                 + _srcCls(src) + '">' + info[0] + '</span>';
+        }
+
+        // Nœud chaîné (callsign pill)
+        function _nodePill(call, role) {
+            var roleStyle = {
+                'me':    'background:rgba(16,185,129,0.2);border-color:rgba(16,185,129,0.5);color:#6ee7b7',
+                'digi':  'background:rgba(245,158,11,0.15);border-color:rgba(245,158,11,0.4);color:#fcd34d',
+                'igate': 'background:rgba(139,92,246,0.15);border-color:rgba(139,92,246,0.4);color:#c4b5fd',
+                'wide':  'background:rgba(71,85,105,0.3);border-color:rgba(71,85,105,0.5);color:#94a3b8',
+            };
+            var st = roleStyle[role] || roleStyle['wide'];
+            var link = (role !== 'wide')
+                ? '<a href="https://qrz.com/db/' + call.replace(/[^A-Z0-9]/gi,'') + '" target="_blank"'
+                  + ' style="' + st + ';font-family:monospace;font-size:11px;font-weight:700;'
+                  + 'padding:2px 8px;border-radius:6px;border:1px solid;display:inline-block;'
+                  + 'text-decoration:none">' + esc(call) + '</a>'
+                : '<span style="' + st + ';font-family:monospace;font-size:11px;font-weight:500;'
+                  + 'padding:2px 8px;border-radius:6px;border:1px solid;display:inline-block">'
+                  + esc(call) + '</span>';
+            return link;
+        }
+
+        function _arrow() {
+            return '<span style="color:#475569;margin:0 2px;font-size:12px">→</span>';
+        }
+
+        // Rendu d'un chemin complet sous forme de nœuds chaînés
+        function _renderChain(pathObj, myCall) {
+            // pathObj = { src, nodes: ['F1RIQ-9', 'F5ZKB*', 'WIDE2-1', 'qAR', 'F5XAJ-10'], source }
+            var nodes = pathObj.nodes || [];
+            var parts = [];
+            // Moi en premier
+            parts.push(_nodePill(myCall, 'me'));
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                if (!n) continue;
+                var upper = n.toUpperCase();
+                parts.push(_arrow());
+                if (upper === 'QAR' || upper === 'QAC' || upper === 'QAS') {
+                    parts.push('<span style="color:#64748b;font-size:10px;font-family:monospace">' + esc(n) + '</span>');
+                } else if (/^WIDE\d/.test(upper)) {
+                    parts.push(_nodePill(n, 'wide'));
+                } else if (n.endsWith('*') || i === 0) {
+                    parts.push(_nodePill(n.replace('*','') + (n.endsWith('*') ? '*' : ''), 'digi'));
+                } else {
+                    // iGate (après qAR) ou digi non marqué
+                    var role = (i > 0 && (nodes[i-1] || '').toUpperCase().startsWith('Q')) ? 'igate' : 'digi';
+                    parts.push(_nodePill(n, role));
+                }
+            }
+            return parts.join('');
+        }
+
+        window.loadSignalPath = function(force) {
+            var st = document.getElementById('sigpath-status');
+            if (st) st.textContent = 'chargement…';
+            fetch('/signal_path' + (force ? '?refresh=1' : ''))
+                .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
+                .then(function(d) {
+                    if (!d) return;
+
+                    // Callsign
+                    var csEl = document.getElementById('sigpath-callsign');
+                    if (csEl) csEl.textContent = d.callsign || '';
+
+                    // ── Dernier chemin ──────────────────────────────────────
+                    var lastEl = document.getElementById('sigpath-last');
+                    if (lastEl) {
+                        if (d.last_path) {
+                            lastEl.innerHTML = _renderChain(d.last_path, d.callsign)
+                                + '&ensp;' + _srcBadge(d.last_path.source)
+                                + '<span class="text-[9px] font-mono text-slate-600 ml-2">'
+                                + esc(d.last_path.time_str || '') + '</span>';
+                        } else {
+                            lastEl.innerHTML = '<span class="text-slate-600 text-[10px] italic">Aucune trame de votre station observée</span>';
+                        }
+                    }
+
+                    // ── Top digis ───────────────────────────────────────────
+                    var digiEl = document.getElementById('sigpath-digis');
+                    if (digiEl) {
+                        if (d.digi_counts && d.digi_counts.length) {
+                            var maxC = d.digi_counts[0].count || 1;
+                            digiEl.innerHTML = d.digi_counts.slice(0, 8).map(function(e) {
+                                var pct = Math.round((e.count / maxC) * 100);
+                                var srcB = _srcBadge(e.source || 'RF');
+                                return '<div class="space-y-0.5">'
+                                     + '<div class="flex items-center justify-between gap-2">'
+                                     + '<span class="text-[10px] font-mono font-bold text-amber-300">'
+                                     + _nodePill(e.digi, 'digi') + '</span>'
+                                     + '<span class="flex items-center gap-1">'
+                                     + srcB
+                                     + '<span class="text-[9px] font-mono text-slate-500">' + e.count + '×</span>'
+                                     + '</span>'
+                                     + '</div>'
+                                     + '<div style="height:3px;background:#1e293b;border-radius:2px;overflow:hidden">'
+                                     + '<div style="height:100%;width:' + pct + '%;'
+                                     + 'background:linear-gradient(90deg,#f59e0b,#fbbf24);border-radius:2px;transition:width .4s"></div>'
+                                     + '</div></div>';
+                            }).join('');
+                        } else {
+                            digiEl.innerHTML = '<p class="text-slate-600 text-[10px] italic">Aucun digipeat observé</p>';
+                        }
+                    }
+
+                    // ── Historique ──────────────────────────────────────────
+                    var histEl = document.getElementById('sigpath-history');
+                    if (histEl) {
+                        if (d.history && d.history.length) {
+                            histEl.innerHTML = d.history.map(function(h) {
+                                return '<div class="flex items-center gap-2 py-1 border-b border-slate-800/60">'
+                                     + '<span class="text-[9px] font-mono text-slate-600 w-14 shrink-0">'
+                                     + esc(h.time_str) + '</span>'
+                                     + _srcBadge(h.source)
+                                     + '<span class="flex-1 flex flex-wrap items-center gap-0.5 text-[10px]">'
+                                     + _renderChain(h, d.callsign)
+                                     + '</span>'
+                                     + '</div>';
+                            }).join('');
+                        } else {
+                            histEl.innerHTML = '<p class="text-slate-600 text-[10px] italic py-2">Aucun historique disponible</p>';
+                        }
+                    }
+
+                    if (st) {
+                        var src_info = [];
+                        if (d.rf_count)     src_info.push(d.rf_count + ' RF');
+                        if (d.is_count)     src_info.push(d.is_count + ' IS');
+                        if (d.aprsfi_count) src_info.push(d.aprsfi_count + ' aprs.fi');
+                        st.textContent = 'màj ' + new Date().toLocaleTimeString()
+                            + (src_info.length ? ' · ' + src_info.join(', ') : '');
+                    }
+                })
+                .catch(function(err) {
+                    if (st) st.textContent = 'erreur (' + err + ')';
+                });
+        };
+
+        // Brancher sur ouverture onglet stats + polling 60 s
+        document.addEventListener('aprs-switchtab', function(e) {
+            if (e.detail === 'stats') {
+                loadSignalPath(false);
+                if (_spTimer) clearInterval(_spTimer);
+                _spTimer = setInterval(function(){ loadSignalPath(false); }, 60000);
+                loadPropAlertHistory();
+            }
+        });
+    })();
+
+
+    // ── Onglet Notes ─────────────────────────────────────────────────────────
+    (function() {
+        var STORAGE_KEY = 'aprs_operator_notes';
+        var _autoSaveTimer = null;
+
+        function _notesLoad() {
+            var ed = document.getElementById('notes-editor');
+            if (!ed) return;
+            try {
+                ed.value = localStorage.getItem(STORAGE_KEY) || '';
+            } catch(e) { ed.value = ''; }
+            _notesUpdateCount();
+        }
+
+        function _notesUpdateCount() {
+            var ed  = document.getElementById('notes-editor');
+            var el  = document.getElementById('notes-char-count');
+            if (!ed || !el) return;
+            var n = ed.value.length;
+            el.textContent = n.toLocaleString('fr-FR') + ' car.';
+            el.style.color = n > 8000 ? '#f87171' : n > 4000 ? '#fcd34d' : '#334155';
+        }
+
+        function _notesSetStatus(msg, color) {
+            var el = document.getElementById('notes-status');
+            if (!el) return;
+            el.textContent = msg;
+            el.style.color  = color || '#475569';
+            clearTimeout(el._clr);
+            el._clr = setTimeout(function(){ el.textContent = ''; }, 3000);
+        }
+
+        window._notesSave = function() {
+            var ed = document.getElementById('notes-editor');
+            if (!ed) return;
+            try {
+                localStorage.setItem(STORAGE_KEY, ed.value);
+                _notesSetStatus('✓ Sauvegardé', '#34d399');
+            } catch(e) {
+                _notesSetStatus('✗ Erreur localStorage', '#f87171');
+            }
+        };
+
+        window._notesCopy = function() {
+            var ed = document.getElementById('notes-editor');
+            if (!ed || !ed.value) return;
+            navigator.clipboard ? navigator.clipboard.writeText(ed.value)
+                                      .then(function(){ _notesSetStatus('✓ Copié', '#60a5fa'); })
+                                      .catch(function(){ _notesSetStatus('✗ Erreur copie', '#f87171'); })
+                                : (function(){
+                                    ed.select();
+                                    document.execCommand('copy');
+                                    _notesSetStatus('✓ Copié', '#60a5fa');
+                                  })();
+        };
+
+        window._notesClear = function() {
+            if (!confirm('Effacer toutes les notes ?')) return;
+            var ed = document.getElementById('notes-editor');
+            if (ed) ed.value = '';
+            try { localStorage.removeItem(STORAGE_KEY); } catch(e) {}
+            _notesUpdateCount();
+            _notesSetStatus('Notes effacées', '#94a3b8');
+        };
+
+        // Charger au démarrage
+        _notesLoad();
+
+        // Attacher les événements quand le DOM est prêt
+        document.addEventListener('DOMContentLoaded', function() {
+            var ed = document.getElementById('notes-editor');
+            if (!ed) return;
+            ed.addEventListener('input', function() {
+                _notesUpdateCount();
+                // Autosave après 2 s d'inactivité
+                clearTimeout(_autoSaveTimer);
+                _autoSaveTimer = setTimeout(function() {
+                    try {
+                        localStorage.setItem(STORAGE_KEY, ed.value);
+                        _notesSetStatus('✓ Auto-sauvegardé', '#475569');
+                    } catch(e) {}
+                }, 2000);
+            });
+        });
+
+        // Charger aussi lors du switch vers l'onglet notes
+        document.addEventListener('aprs-switchtab', function(e) {
+            if (e.detail === 'notes') _notesLoad();
+        });
+    })();
+
+    // ── Historique alertes propagation & blackout HF ──────────────────────────
+    window.loadPropAlertHistory = function() {
+        var st   = document.getElementById('propalert-hist-status');
+        var list = document.getElementById('propalert-hist-list');
+        if (st) st.textContent = 'chargement…';
+        fetch('/prop_alert_history')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                var alerts = d.alerts || [];
+                if (st) st.textContent = alerts.length ? alerts.length + ' alerte(s)' : '–';
+                if (!list) return;
+                if (!alerts.length) {
+                    list.innerHTML = '<p class="text-slate-600 text-[10px] italic text-center py-4">Aucune alerte depuis le démarrage du serveur.</p>';
+                    return;
+                }
+                list.innerHTML = alerts.map(function(a) {
+                    var ago = _fmtAgo(a.ago_s);
+                    var extras = [];
+                    if (a.kp  !== null && a.kp  !== undefined) extras.push('Kp ' + parseFloat(a.kp).toFixed(1));
+                    if (a.sfi !== null && a.sfi !== undefined) extras.push('SFI ' + Math.round(a.sfi));
+                    if (a.xray_class) extras.push(a.xray_class);
+                    var extraHtml = extras.length
+                        ? '<span class="text-[9px] font-mono text-slate-500 ml-2">' + extras.join('· ') + '</span>'
+                        : '';
+                    return '<div class="flex items-start gap-3 px-3 py-2 rounded-xl border" style="border-color:' + a.color_border + '33;background:' + a.color_border + '11">'
+                        + '<span class="text-base leading-none mt-0.5">' + a.icon + '</span>'
+                        + '<div class="flex-1 min-w-0">'
+                        +   '<div class="flex items-center gap-2 flex-wrap">'
+                        +     '<span class="text-[11px] font-bold" style="color:' + a.color_text + '">' + esc(a.title) + '</span>'
+                        +     extraHtml
+                        +   '</div>'
+                        +   '<div class="text-[10px] text-slate-400 mt-0.5">' + esc(a.detail) + '</div>'
+                        + '</div>'
+                        + '<span class="text-[9px] font-mono text-slate-600 shrink-0 mt-0.5">' + ago + '</span>'
+                        + '</div>';
+                }).join('');
+            })
+            .catch(function(err) {
+                if (st) st.textContent = 'erreur';
+                if (list) list.innerHTML = '<p class="text-red-500 text-[10px] italic text-center py-4">Erreur chargement historique : ' + esc(String(err)) + '</p>';
+            });
+    };
+
+    function _fmtAgo(s) {
+        if (s < 60)   return s + ' s';
+        if (s < 3600) return Math.floor(s/60) + ' min';
+        if (s < 86400) return Math.floor(s/3600) + ' h ' + Math.floor((s%3600)/60) + ' min';
+        return Math.floor(s/86400) + ' j';
+    }
 
 
     fetch('/rx_history')
         .then(function(r) { return r.json(); })
         .then(function(frames) {
             frames.forEach(function(data) {
-                if (data._fid) _seenFids.add(data._fid);
+                if (data._fid) {
+                _seenFids.add(data._fid);
+                if (_seenFids.size > 500) {
+                    var _it = _seenFids.values();
+                    for (var _i=0;_i<100;_i++) _seenFids.delete(_it.next().value);
+                }
+            }
                 if (data.type === 'tx_event') {
                     txCount++;
                     if (window._statsRecord) _statsRecord('TX', data);
@@ -3380,8 +5977,11 @@ def index():
                 } else if (data.type !== 'rx_level' && data.type !== 'connected') {
                     rxFrameCount++;
                     if (window._statsRecord) _statsRecord(data._source === 'IS' ? 'IS' : 'RX', data);
-                    addLog('RX', data);
-                    document.dispatchEvent(new CustomEvent('aprs-frame', {detail: data}));
+                    // Déduplication contenu : ne pas afficher deux fois la même trame
+                    if (!_isDupContent(data)) {
+                        addLog('RX', data);
+                        document.dispatchEvent(new CustomEvent('aprs-frame', {detail: data}));
+                    }
                 }
             });
             document.getElementById('rx-count').textContent = rxFrameCount;
@@ -3398,13 +5998,16 @@ def index():
 
     // ── SSE ────────────────────────────────────────────────────────────────
     var evtSource = new EventSource('/rx_stream');
+    evtSource.onmessage = _sseOnMessage;
+    evtSource.onerror   = _sseOnError;
 
-    evtSource.onmessage = function(e) {
+    function _handleSseFrame(data) {
         try {
-            var data = JSON.parse(e.data);
-            // Ignorer les trames déjà affichées via rx_history (dédoublonnage)
+            // Ignorer les trames déjà affichées via rx_history (dédoublonnage par _fid)
             if (data._fid && _seenFids.has(data._fid)) return;
             if (data._fid) _seenFids.add(data._fid);
+            // Ignorer les doublons de contenu (même trame via chemins multiples)
+            if (data.type !== 'rx_level' && data.type !== 'tx_event' && _isDupContent(data)) return;
             if (data.type === 'rx_level') {
                 var pct = Math.round(data.level * 100);
                 document.getElementById('rx-bar').style.width = pct + '%';
@@ -3463,6 +6066,10 @@ def index():
                 }
                 if (window._statsRecord) _statsRecord('TX', data);
                 addLog('TX', data);
+            } else if (data.type === 'weather_alert') {
+                _wxAlertShow(data);
+            } else if (data.type === 'prop_alert') {
+                _propAlertShow(data);
             } else if (data.type === 'iss_pass_alert') {
                 _issPassAlertShow(data);
             } else if (data.type === 'msg_ack') {
@@ -3503,20 +6110,45 @@ def index():
                 // Notification chat si message prive
                 if (data._chat) {
                     refreshContacts();
-                    if (activeContact && activeContact === data.src) loadHistory(activeContact);
+                    var _chatSrc = (data.src || '').trim().toUpperCase();
+                    if (activeContact && activeContact.trim().toUpperCase() === _chatSrc) {
+                        loadHistory(activeContact);
+                    }
                     document.getElementById('qso-badge').classList.remove('hidden');
                     var _mb=document.getElementById('mnav-qso-badge');if(_mb){_mb.textContent='●';_mb.style.display='block';}
-                    var _msgTxt = (data.extra && data.extra.msg_text) ? data.extra.msg_text : '';
                 }
             }
         } catch(err) {}
-    };
+    }  // end _handleSseFrame
 
-    evtSource.onerror = function() {
-        document.getElementById('rx-status-text').textContent = '❌ SSE deconnecte';
-        document.getElementById('rx-status-text').className = 'text-red-400';
-        document.getElementById('rx-led').style.background = '#ef4444';
-    };
+    var _sseReconnDelay = 3000;
+    var _sseReconnTimer = null;
+
+    function _sseOnMessage(e) {
+        try {
+            var data = JSON.parse(e.data);
+            _sseReconnDelay = 3000; // reset backoff on success
+            // rétablir indicateur si on était en erreur
+            var txt = document.getElementById('rx-status-text');
+            // traitement délégué à la fonction principale
+            _handleSseFrame(data);
+        } catch(err) {}
+    }
+
+    function _sseOnError() {
+        var txt = document.getElementById('rx-status-text');
+        var led = document.getElementById('rx-led');
+        if (txt) { txt.textContent = '🔄 Reconnexion SSE…'; txt.className = 'text-amber-400'; }
+        if (led) led.style.background = '#f59e0b';
+        try { evtSource.close(); } catch(e) {}
+        if (_sseReconnTimer) clearTimeout(_sseReconnTimer);
+        _sseReconnTimer = setTimeout(function() {
+            _sseReconnDelay = Math.min(_sseReconnDelay * 1.5, 30000);
+            evtSource = new EventSource('/rx_stream');
+            evtSource.onmessage = _sseOnMessage;
+            evtSource.onerror   = _sseOnError;
+        }, _sseReconnDelay);
+    }
 
     // ── Digi Path preset ───────────────────────────────────────────────────
     function aprsGeoToggle(mode) {
@@ -3531,6 +6163,19 @@ def index():
             coordsBlock.style.display = 'none';
         }
     }
+
+    function checkHfPathWarn() {
+        var hfOn  = document.getElementById('hf_mode') && document.getElementById('hf_mode').checked;
+        var pval  = (document.getElementById('pathCustom') || {}).value || '';
+        var warn  = document.getElementById('hf_wide_warn');
+        if (warn) warn.style.display = (hfOn && /WIDE/i.test(pval)) ? 'block' : 'none';
+    }
+    // Vérifier aussi quand on modifie manuellement le path
+    document.addEventListener('DOMContentLoaded', function() {
+        var pc = document.getElementById('pathCustom');
+        if (pc) pc.addEventListener('input', checkHfPathWarn);
+        checkHfPathWarn();
+    });
 
     function applyPathPreset(sel) {
         var input = document.getElementById('pathCustom');
@@ -3568,64 +6213,124 @@ def index():
     // ── Passages ISS ─────────────────────────────────────────────────────────
 
     // ── Countdown ticker ISS ─────────────────────────────────────────────────
-    var _issNextRisetime = 0;
+    var _issNextRisetime  = 0;
+    var _issPassDuration  = 0;   // durée du prochain passage (secondes)
+    var _issNextRiseAz    = null; // azimut AOS du prochain passage
     var _issCountdownTimer = null;
     function _issTickCountdown() {
         var el = document.getElementById('iss-next-countdown');
         if (!el || !_issNextRisetime) return;
         var now  = Date.now() / 1000;
         var diff = Math.round(_issNextRisetime - now);
+        var inPass = (diff <= 0 && _issPassDuration > 0
+                      && now < _issNextRisetime + _issPassDuration);
         if (diff <= 0) {
             el.textContent = '🛸 EN COURS';
             el.style.color = '#4ade80';
             el.style.borderColor = '#22c55e44';
             el.style.background  = 'rgba(74,222,128,.12)';
-            return;
+        } else {
+            var h = Math.floor(diff / 3600);
+            var m = Math.floor((diff % 3600) / 60);
+            var s = diff % 60;
+            var txt = h > 0
+                ? h + 'h' + String(m).padStart(2,'0') + 'm'
+                : m + 'min ' + String(s).padStart(2,'0') + 's';
+            el.textContent = '⏱ ' + txt;
+            el.style.display = 'inline-block';
         }
-        var h = Math.floor(diff / 3600);
-        var m = Math.floor((diff % 3600) / 60);
-        var s = diff % 60;
-        var txt = h > 0
-            ? h + 'h' + String(m).padStart(2,'0') + 'm'
-            : m + 'min ' + String(s).padStart(2,'0') + 's';
-        el.textContent = '⏱ ' + txt;
-        el.style.display = 'inline-block';
+        // Voyant ISS : orange/doré pendant le passage, violet sinon
+        _issUpdateDot(undefined, inPass);
     }
 
     function issPassRefresh() {
-        var list = document.getElementById('iss-pass-list');
-        var btn  = document.getElementById('iss-refresh-btn');
+        // issPassRefresh écrit dans iss-pass-list (onglet Réglages/alertes widget)
+        // ET dans iss-pass-list-cfg (miroir condensé dans Réglages ISS).
+        // L'onglet ISS principal utilise iss-24h-list, géré exclusivement par iss24hRefresh().
+        var list    = document.getElementById('iss-pass-list');
+        var cfgList = document.getElementById('iss-pass-list-cfg');
+        var btn     = document.getElementById('iss-refresh-btn');
+        if (!list && !cfgList && !btn) return;   // rien à mettre à jour
         if (list) list.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">⏳ Calcul SGP4...</span>';
+        if (cfgList) cfgList.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">⏳ Calcul SGP4...</span>';
         if (btn)  btn.textContent = '…';
         fetch('/iss_passes').then(function(r){ return r.json(); }).then(function(d){
             if (btn) btn.textContent = '↺ MAJ';
-            if (!list) return;
             if (d.error) {
-                list.innerHTML = '<span style="color:#ef4444;font-size:10px">' + d.error + '</span>';
+                if (list)    list.innerHTML    = '<span style="color:#ef4444;font-size:10px">' + d.error + '</span>';
+                if (cfgList) cfgList.innerHTML = '<span style="color:#ef4444;font-size:10px">❌ ' + d.error + '</span>';
                 return;
             }
             if (!d.passes || !d.passes.length) {
-                list.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">Aucun passage prévu</span>';
+                if (list)    list.innerHTML    = '<span style="color:#475569;font-style:italic;font-size:10px">Aucun passage prévu aujourd&rsquo;hui</span>';
+                if (cfgList) cfgList.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">Aucun passage prévu aujourd&rsquo;hui</span>';
                 return;
             }
 
-            // Mettre à jour le countdown sur le 1er passage
-            _issNextRisetime = d.passes[0].risetime || 0;
+            // Mettre à jour le countdown sur le 1er passage FUTUR
+            var _nowSec = Date.now() / 1000;
+            var _firstFuture = d.passes.find(function(p){ return p.risetime > _nowSec; });
+            _issNextRisetime = _firstFuture ? _firstFuture.risetime   : 0;
+            _issPassDuration = _firstFuture ? (_firstFuture.duration  || _firstFuture.duration_min * 60 || 0) : 0;
+            _issNextRiseAz   = _firstFuture ? (_firstFuture.rise_az   !== undefined && _firstFuture.rise_az !== null ? Math.round(_firstFuture.rise_az) : null) : null;
+            // Badge azimut AOS dans le dashboard principal
+            (function() {
+                var _AZ_C = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSO','SO','OSO','O','ONO','NO','NNO'];
+                var elAz = document.getElementById('iss-next-az-badge');
+                if (elAz) {
+                    if (_issNextRiseAz !== null) {
+                        var card = _AZ_C[Math.round(_issNextRiseAz / 22.5) % 16];
+                        elAz.textContent = '🧭 AOS ' + _issNextRiseAz + '° ' + card;
+                        elAz.style.display = 'inline';
+                    } else {
+                        elAz.style.display = 'none';
+                    }
+                }
+                // Footer live panel : AOS → LOS pour le passage le plus proche (futur ou en cours)
+                var elFoot = document.getElementById('iss-live-az-footer');
+                if (elFoot && d.passes && d.passes.length) {
+                    var _nowSec3 = Date.now() / 1000;
+                    var _cur = d.passes.find(function(p){ return p.risetime <= _nowSec3 && _nowSec3 < p.risetime + (p.duration || 0); })
+                            || d.passes.find(function(p){ return p.risetime > _nowSec3; });
+                    if (_cur && _cur.rise_az !== undefined && _cur.rise_az !== null) {
+                        var rAz = Math.round(_cur.rise_az);
+                        var rCd = _AZ_C[Math.round(rAz / 22.5) % 16];
+                        var txt = '🧭 AOS ' + rAz + '° ' + rCd;
+                        if (_cur.set_az !== undefined && _cur.set_az !== null) {
+                            var sAz = Math.round(_cur.set_az);
+                            var sCd = _AZ_C[Math.round(sAz / 22.5) % 16];
+                            txt += '  →  LOS ' + sAz + '° ' + sCd;
+                        }
+                        elFoot.textContent = txt;
+                        elFoot.style.display = 'block';
+                    } else {
+                        elFoot.style.display = 'none';
+                    }
+                }
+            })();
             _issTickCountdown();
             if (_issCountdownTimer) clearInterval(_issCountdownTimer);
             _issCountdownTimer = setInterval(_issTickCountdown, 1000);
 
-            list.innerHTML = d.passes.map(function(p, i) {
+            // Onglet Réglages : list peut être null, cfgList prend le relais
+            if (!list && !cfgList) return;
+
+            var _nowSec2 = Date.now() / 1000;
+            var _nextIdx = d.passes.findIndex(function(p){ return p.risetime > _nowSec2; });
+            if (_nextIdx < 0) _nextIdx = d.passes.length - 1; // tous passés : highlight dernier
+            if (list) { list.innerHTML = d.passes.map(function(p, i) {
                 var inMin   = Math.round(p.in_min);
                 var maxEl   = (p.max_el !== undefined && p.max_el !== null) ? Math.round(p.max_el) : null;
                 var dur     = p.duration_min;
-                var isNext  = (i === 0);
+                var isNext  = (i === _nextIdx);
 
-                // Couleur selon imminence
-                var urgColor = inMin < 15  ? '#f472b6'   // rose : très proche
-                             : inMin < 60  ? '#a78bfa'   // violet : < 1h
-                             : inMin < 240 ? '#67e8f9'   // cyan : < 4h
-                             :               '#475569';  // gris : lointain
+                // Couleur selon imminence (inMin négatif = déjà passé)
+                var urgColor = inMin < -5   ? '#334155'   // gris foncé : déjà passé
+                             : inMin <= 0   ? '#f472b6'   // rose : en cours
+                             : inMin < 15   ? '#f472b6'   // rose : très proche
+                             : inMin < 60   ? '#a78bfa'   // violet : < 1h
+                             : inMin < 240  ? '#67e8f9'   // cyan : < 4h
+                             :                '#475569'; // gris : lointain
 
                 // Qualité du passage selon élévation max
                 var elLabel = '', elColor = '#475569', elPct = 0;
@@ -3637,6 +6342,24 @@ def index():
                     else                  { elLabel = '↙ Rasant';     elColor = '#475569'; }
                 }
 
+                // Probabilité contact APRS VHF 145.825 MHz selon élévation max
+                var aprsProb = 0, aprsColor = '#475569', aprsQuality = '';
+                if (maxEl !== null) {
+                    if      (maxEl < 5)  { aprsProb = 5;  aprsColor = '#475569'; aprsQuality = 'Très faible'; }
+                    else if (maxEl < 10) { aprsProb = 12; aprsColor = '#ef4444'; aprsQuality = 'Faible'; }
+                    else if (maxEl < 20) { aprsProb = 30; aprsColor = '#f97316'; aprsQuality = 'Possible'; }
+                    else if (maxEl < 35) { aprsProb = 52; aprsColor = '#eab308'; aprsQuality = 'Probable'; }
+                    else if (maxEl < 55) { aprsProb = 72; aprsColor = '#22c55e'; aprsQuality = 'Bonne'; }
+                    else                 { aprsProb = 90; aprsColor = '#10b981'; aprsQuality = 'Excellente'; }
+                    // Interpolation linéaire par segment
+                    if (maxEl >= 5  && maxEl < 10) aprsProb = Math.round(5  + (maxEl-5)  / 5  * 15);
+                    if (maxEl >= 10 && maxEl < 20) aprsProb = Math.round(20 + (maxEl-10) / 10 * 20);
+                    if (maxEl >= 20 && maxEl < 35) aprsProb = Math.round(40 + (maxEl-20) / 15 * 25);
+                    if (maxEl >= 35 && maxEl < 55) aprsProb = Math.round(65 + (maxEl-35) / 20 * 15);
+                    if (maxEl >= 55 && maxEl < 80) aprsProb = Math.round(80 + (maxEl-55) / 25 * 15);
+                    if (maxEl >= 80)               aprsProb = 95;
+                }
+
                 // Fond de carte
                 var cardBg  = isNext
                     ? 'background:linear-gradient(135deg,rgba(124,58,237,.18),rgba(59,130,246,.10));border:1px solid #7c3aed55'
@@ -3644,13 +6367,19 @@ def index():
 
                 var html = '<div style="border-radius:10px;padding:8px 10px;' + cardBg + ';margin-bottom:4px">';
 
-                // Ligne 1 : heure + badge "dans Xmin"
-                html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">';
-                html +=   '<span style="font-family:monospace;font-size:' + (isNext ? '13' : '11') + 'px;font-weight:' + (isNext ? '800' : '600') + ';color:' + (isNext ? '#e2e8f0' : '#94a3b8') + '">';
-                html +=     (isNext ? '🛸 ' : '') + p.risetime_fmt;
-                html +=   '</span>';
+                // Ligne 1 : heure début + badge "dans Xmin"
+                var setFmt = p.set_fmt || '';
+                html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:3px">';
+                html +=   '<div>';
+                html +=     '<div style="font-family:monospace;font-size:' + (isNext ? '13' : '11') + 'px;font-weight:' + (isNext ? '800' : '600') + ';color:' + (isNext ? '#e2e8f0' : '#94a3b8') + '">';
+                html +=       (isNext ? '🛸 ' : '') + p.risetime_fmt;
+                html +=     '</div>';
+                if (setFmt) {
+                    html += '<div style="font-family:monospace;font-size:9px;color:#475569;margin-top:1px">⬇ fin&nbsp;&nbsp;' + setFmt + '</div>';
+                }
+                html +=   '</div>';
                 html +=   '<span style="font-size:10px;font-weight:700;color:' + urgColor + ';background:' + urgColor + '18;border-radius:6px;padding:2px 7px;white-space:nowrap">';
-                html +=     (inMin <= 0 ? 'EN COURS' : 'dans ' + inMin + ' min');
+                html +=     (inMin < -5 ? 'PASSÉ' : inMin <= 0 ? 'EN COURS' : 'dans ' + inMin + ' min');
                 html +=   '</span>';
                 html += '</div>';
 
@@ -3671,14 +6400,32 @@ def index():
                 // Barre d'élévation
                 if (maxEl !== null) {
                     var barColor = maxEl >= 60 ? '#4ade80' : maxEl >= 30 ? '#a78bfa' : '#67e8f9';
-                    html += '<div style="height:3px;background:#0f172a;border-radius:2px;overflow:hidden">';
+                    html += '<div style="height:3px;background:#0f172a;border-radius:2px;overflow:hidden;margin-bottom:6px">';
                     html +=   '<div style="width:' + elPct + '%;height:100%;background:' + barColor + ';border-radius:2px;transition:width .6s ease"></div>';
+                    html += '</div>';
+                }
+
+                // Probabilité contact APRS
+                if (maxEl !== null) {
+                    html += '<div style="display:flex;align-items:center;gap:10px;background:rgba(0,0,0,.25);border-radius:8px;padding:6px 8px;margin-top:2px">';
+                    // Colonne gauche : label + barre
+                    html +=   '<div style="flex:1;min-width:0">';
+                    html +=     '<div style="font-size:9px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px">📡 Contact APRS</div>';
+                    html +=     '<div style="height:5px;background:#0f172a;border-radius:3px;overflow:hidden">';
+                    html +=       '<div style="width:' + aprsProb + '%;height:100%;background:' + aprsColor + ';border-radius:3px;transition:width .8s ease;box-shadow:0 0 6px ' + aprsColor + '88"></div>';
+                    html +=     '</div>';
+                    html +=     '<div style="font-size:9px;color:' + aprsColor + ';opacity:.75;margin-top:3px">' + aprsQuality + '</div>';
+                    html +=   '</div>';
+                    // Colonne droite : pourcentage en grand
+                    html +=   '<div style="text-align:center;min-width:52px">';
+                    html +=     '<div style="font-family:monospace;font-size:22px;font-weight:900;line-height:1;color:' + aprsColor + ';text-shadow:0 0 12px ' + aprsColor + '66">' + aprsProb + '%</div>';
+                    html +=   '</div>';
                     html += '</div>';
                 }
 
                 html += '</div>';
                 return html;
-            }).join('');
+            }).join(''); } // fin if (list)
 
             // Statut position
             var st = document.getElementById('iss-pass-status');
@@ -3687,23 +6434,47 @@ def index():
             }
 
             // Miroir Réglages (version condensée)
-            var cfgList = document.getElementById('iss-pass-list-cfg');
             if (cfgList) {
                 cfgList.innerHTML = d.passes.map(function(p, i) {
-                    var inMin = Math.round(p.in_min);
-                    var maxEl = (p.max_el !== undefined && p.max_el !== null) ? Math.round(p.max_el) : null;
-                    var col   = inMin < 60 ? '#a78bfa' : '#475569';
-                    return '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #1e293b33">'
+                    var inMin  = Math.round(p.in_min);
+                    var maxEl  = (p.max_el !== undefined && p.max_el !== null) ? Math.round(p.max_el) : null;
+                    var riseAz = (p.rise_az !== undefined && p.rise_az !== null) ? Math.round(p.rise_az) : null;
+                    var col    = inMin < 60 ? '#a78bfa' : '#475569';
+                    var times  = p.risetime_fmt + (p.set_fmt ? ' → ' + p.set_fmt : '');
+                    var _AZ_C  = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSO','SO','OSO','O','ONO','NO','NNO'];
+                    var azTxt  = riseAz !== null ? ' · 🧭 ' + riseAz + '° ' + _AZ_C[Math.round(riseAz/22.5)%16] : '';
+                    // Probabilité APRS (calcul inline)
+                    var aprsProb = 0, aprsColor = '#475569';
+                    if (maxEl !== null) {
+                        if      (maxEl < 5)  { aprsProb = 5;  aprsColor = '#475569'; }
+                        else if (maxEl < 10) { aprsProb = 12; aprsColor = '#ef4444'; }
+                        else if (maxEl < 20) { aprsProb = 30; aprsColor = '#f97316'; }
+                        else if (maxEl < 35) { aprsProb = 52; aprsColor = '#eab308'; }
+                        else if (maxEl < 55) { aprsProb = 72; aprsColor = '#22c55e'; }
+                        else                 { aprsProb = 90; aprsColor = '#10b981'; }
+                        if (maxEl >= 5  && maxEl < 10) aprsProb = Math.round(5  + (maxEl-5)  / 5  * 15);
+                        if (maxEl >= 10 && maxEl < 20) aprsProb = Math.round(20 + (maxEl-10) / 10 * 20);
+                        if (maxEl >= 20 && maxEl < 35) aprsProb = Math.round(40 + (maxEl-20) / 15 * 25);
+                        if (maxEl >= 35 && maxEl < 55) aprsProb = Math.round(65 + (maxEl-35) / 20 * 15);
+                        if (maxEl >= 55 && maxEl < 80) aprsProb = Math.round(80 + (maxEl-55) / 25 * 15);
+                        if (maxEl >= 80)               aprsProb = 95;
+                    }
+                    return '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #1e293b33">'
                         + '<span style="font-family:monospace;font-size:10px;color:' + (i===0?'#e2e8f0':'#64748b') + '">'
-                        + (i===0?'🛸 ':'') + p.risetime_fmt + '</span>'
+                        + (i===0?'🛸 ':'') + times + '</span>'
+                        + '<span style="display:flex;align-items:center;gap:5px">'
                         + '<span style="font-size:9px;color:' + col + '">'
-                        + 'dans ' + inMin + 'min' + (maxEl!==null ? ' · ▲'+maxEl+'°' : '') + ' · ' + p.duration_min + 'min'
-                        + '</span></div>';
+                        + 'dans ' + inMin + 'min' + (maxEl!==null ? ' · ▲'+maxEl+'°' : '') + ' · ' + p.duration_min + 'min' + azTxt
+                        + '</span>'
+                        + (maxEl !== null ? '<span style="font-family:monospace;font-size:9px;font-weight:700;color:' + aprsColor + ';background:' + aprsColor + '1a;border-radius:4px;padding:1px 5px">📡 ' + aprsProb + '%</span>' : '')
+                        + '</span>'
+                        + '</div>';
                 }).join('');
             }
         }).catch(function(e){
             if (btn) btn.textContent = '↺ MAJ';
             if (list) list.innerHTML = '<span style="color:#ef4444;font-size:10px">❌ Calcul SGP4 indisponible</span>';
+            if (cfgList) cfgList.innerHTML = '<span style="color:#ef4444;font-size:10px">❌ Erreur SGP4</span>';
             console.warn('[ISS]', e);
         });
     }
@@ -3743,7 +6514,7 @@ def index():
             + data.risetime_fmt + ' · durée ' + data.duration_min + ' min'
             + ' · 145.825 MHz</span>';
         banner.onclick = function() {
-            document.getElementById('iss-pass-list') && issPassRefresh();
+            issPassRefresh();
             banner.parentNode && banner.parentNode.removeChild(banner);
         };
         document.body.appendChild(banner);
@@ -3765,11 +6536,452 @@ def index():
         setTimeout(function(){ if (banner.parentNode) banner.parentNode.removeChild(banner); }, 15000);
     }
 
-    function _issUpdateDot(enabled) {
+    // ── Alertes météo — popup ────────────────────────────────────────────────
+    function _wxAlertShow(data) {
+        // Eviter les doublons visuels sur la même clé
+        var existId = 'wx-banner-' + (data.key || 'gen');
+        if (document.getElementById(existId)) return;
+
+        // ── Mettre à jour le badge header ────────────────────────────────────
+        _wxBadgeSet(data.icon || '⚠️', data.title || 'Alerte météo', data);
+
+        var banner = document.createElement('div');
+        banner.id  = existId;
+        banner.style.cssText = [
+            'position:fixed',
+            'top:60px',
+            'left:50%',
+            'transform:translateX(-50%)',
+            'z-index:9998',
+            'background:' + (data.color_bg    || '#1c0a00'),
+            'border:2px solid ' + (data.color_border || '#f59e0b'),
+            'border-radius:14px',
+            'padding:12px 26px',
+            'font-size:13px',
+            'font-weight:700',
+            'color:' + (data.color_text  || '#fcd34d'),
+            'box-shadow:0 8px 32px ' + (data.color_border || '#f59e0b') + '40',
+            'max-width:92vw',
+            'text-align:center',
+            'cursor:pointer',
+            'transition:opacity .3s'
+        ].join(';');
+
+        var icon   = data.icon   || '⚠️';
+        var title  = data.title  || 'Alerte météo';
+        var detail = data.detail || '';
+        var extra  = '';
+        if (data.temp_c   !== null && data.temp_c   !== undefined) extra += ' · ' + data.temp_c.toFixed(1) + ' °C';
+        if (data.wind_kmh !== null && data.wind_kmh !== undefined) extra += ' · vent ' + data.wind_kmh.toFixed(0) + ' km/h';
+        if (data.description) extra += ' · ' + data.description;
+
+        banner.innerHTML = icon + ' <b>' + title + '</b>'
+            + (detail ? '<br><span style="font-size:11px;font-weight:400;opacity:.85">' + detail + extra + '</span>' : '');
+
+        banner.onclick = function() {
+            banner.style.opacity = '0';
+            setTimeout(function(){
+                banner.parentNode && banner.parentNode.removeChild(banner);
+                if (!document.querySelector('[id^="wx-banner-"]')) _wxBadgeClear();
+            }, 300);
+        };
+        document.body.appendChild(banner);
+
+        // Bip double (440 Hz + 550 Hz) — distinct du triple ISS
+        try {
+            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            [440, 550].forEach(function(freq, i) {
+                var osc = ctx.createOscillator();
+                var g   = ctx.createGain();
+                osc.frequency.value = freq;
+                osc.type = 'triangle';
+                g.gain.value = 0.2;
+                osc.connect(g); g.connect(ctx.destination);
+                osc.start(ctx.currentTime + i * 0.22);
+                osc.stop (ctx.currentTime + i * 0.22 + 0.18);
+            });
+            setTimeout(function(){ try { ctx.close(); } catch(_){} }, 1200);
+        } catch(_) {}
+
+        // Auto-fermeture après 20 s
+        setTimeout(function() {
+            if (banner.parentNode) {
+                banner.style.opacity = '0';
+                setTimeout(function(){
+                    banner.parentNode && banner.parentNode.removeChild(banner);
+                    if (!document.querySelector('[id^="wx-banner-"]')) _wxBadgeClear();
+                }, 300);
+            }
+        }, 20000);
+    }
+
+    function _wxBadgeSet(icon, txt, data) {
+        var b  = document.getElementById('wx-alert-badge');
+        var bi = document.getElementById('wx-alert-badge-icon');
+        var bt = document.getElementById('wx-alert-badge-txt');
+        if (!b) return;
+        if (bi) bi.textContent = icon;
+        if (bt) bt.textContent = txt.length > 22 ? txt.slice(0, 20) + '\u2026' : txt;
+        var border = (data && data.color_border) ? data.color_border : '#f59e0b';
+        var bg     = (data && data.color_bg)     ? data.color_bg     : 'rgba(120,53,15,0.55)';
+        b.style.borderColor = border + '88';
+        b.style.background  = bg;
+        b.title = txt + (data && data.detail ? ' \u2014 ' + data.detail : '');
+        b.style.display   = 'flex';
+        b.style.animation = 'wxBadgePulse 2s ease-in-out infinite';
+    }
+
+    function _wxBadgeClear() {
+        var b = document.getElementById('wx-alert-badge');
+        if (b) b.style.display = 'none';
+    }
+
+    window._wxAlertBadgeClick = function() {
+        document.querySelectorAll('[id^="wx-banner-"]').forEach(function(el) {
+            el.style.opacity = '0';
+            setTimeout(function(){ el.parentNode && el.parentNode.removeChild(el); }, 300);
+        });
+        setTimeout(_wxBadgeClear, 350);
+    };
+
+    // ── Alertes propagation / blackout ────────────────────────────────────────
+
+    function _propBadgeSet(icon, txt, data) {
+        var b  = document.getElementById('prop-alert-badge');
+        var bi = document.getElementById('prop-alert-badge-icon');
+        var bt = document.getElementById('prop-alert-badge-txt');
+        if (!b) return;
+        if (bi) bi.textContent = icon;
+        // Texte court : supprimer le prefixe bavard, garder l'essentiel
+        var short = txt;
+        // Kp : "Tempete geomagnetique - Kp 6.7" → "TEMPETE Kp 6.7"
+        short = short.replace(/[Tt]emp.te\s+g.omagn.tique\s*[—-]\s*/i, 'TEMPETE ');
+        // SFI : "Conditions HF degradees - SFI 65" → "HF DEG SFI 65"
+        short = short.replace(/[Cc]onditions\s+HF\s+d.grad.es\s*[—-]\s*/i, 'HF DEG ');
+        // Xray : "Eruption solaire M2.5" → "FLARE M2.5"
+        short = short.replace(/[Ee]ruption\s+solaire\s*/i, 'FLARE ');
+        if (bt) bt.textContent = short.length > 20 ? short.slice(0, 18) + '…' : short;
+        var border = (data && data.color_border) ? data.color_border : '#ef4444';
+        var bg     = (data && data.color_bg)     ? data.color_bg     : 'rgba(120,20,20,0.6)';
+        var txtCol = (data && data.color_text)   ? data.color_text   : '#fca5a5';
+        b.style.borderColor  = border + '88';
+        b.style.background   = bg;
+        if (bt) bt.style.color = txtCol;
+        b.title = txt + (data && data.detail ? ' — ' + data.detail : '');
+        b.style.display   = 'flex';
+        b.style.animation = 'propBadgePulse 2s ease-in-out infinite';
+    }
+
+    function _propBadgeClear() {
+        var b = document.getElementById('prop-alert-badge');
+        if (b) { b.style.display = 'none'; b.style.animation = ''; }
+    }
+
+    window._propAlertBadgeClick = function() {
+        // Fermer toutes les bannières prop ouvertes
+        document.querySelectorAll('[id^="prop-banner-"]').forEach(function(el) {
+            el.style.opacity = '0';
+            setTimeout(function(){ el.parentNode && el.parentNode.removeChild(el); }, 300);
+        });
+        setTimeout(_propBadgeClear, 350);
+    };
+
+    // ── Pill propagation discrète — mise à jour indices courants ────────────
+    function _propPillUpdate() {
+        fetch('/prop_status')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                var pill  = document.getElementById('prop-status-pill');
+                var elKp  = document.getElementById('prop-pill-kp');
+                var elSfi = document.getElementById('prop-pill-sfi');
+                var elXr  = document.getElementById('prop-pill-xray');
+                if (!pill) return;
+
+                // ── Kp ────────────────────────────────────────────────────
+                if (elKp) {
+                    var kpTxt = d.kp !== null && d.kp !== undefined
+                        ? '🧲 Kp ' + d.kp.toFixed(1) : '🧲 –';
+                    elKp.textContent = kpTxt;
+                    elKp.style.color = d.kp_alert ? '#fcd34d' : '#475569';
+                    elKp.title = d.kp_alert ? ('⚠ Kp ≥ ' + d.kp_max) : '';
+                }
+
+                // ── SFI ───────────────────────────────────────────────────
+                if (elSfi) {
+                    var sfiTxt = d.sfi !== null && d.sfi !== undefined
+                        ? '📻 ' + Math.round(d.sfi) : '📻 –';
+                    elSfi.textContent = sfiTxt;
+                    elSfi.style.color = d.sfi_alert ? '#fca5a5' : '#475569';
+                    elSfi.title = d.sfi_alert ? ('⚠ SFI < ' + d.sfi_min) : '';
+                }
+
+                // ── X-ray ─────────────────────────────────────────────────
+                if (elXr) {
+                    var xrTxt = d.xray_class ? '☀️ ' + d.xray_class : '☀️ –';
+                    elXr.textContent = xrTxt;
+                    elXr.style.color = d.xray_alert ? '#fdba74' : '#475569';
+                    elXr.title = d.xray_alert ? ('⚠ Éruption ≥ ' + d.xray_thr) : '';
+                }
+
+                // ── Bordure globale ───────────────────────────────────────
+                var anyAlert = d.kp_alert || d.sfi_alert || d.xray_alert;
+                if (anyAlert) {
+                    pill.style.borderColor  = '#ef4444aa';
+                    pill.style.background   = 'rgba(69,10,10,0.55)';
+                    pill.style.animation    = 'propPillPulse 2.5s ease-in-out infinite';
+                } else {
+                    pill.style.borderColor  = '#1e293b';
+                    pill.style.background   = 'rgba(15,23,42,0.7)';
+                    pill.style.animation    = '';
+                }
+            })
+            .catch(function() { /* silencieux si hors-ligne */ });
+    }
+
+    // Charger au démarrage puis toutes les 10 minutes
+    _propPillUpdate();
+    setInterval(_propPillUpdate, 600000);
+
+    function _propAlertShow(data) {
+        var existId = 'prop-banner-' + (data.key || 'gen');
+        if (document.getElementById(existId)) return;
+
+        // Mettre a jour le badge header (visible sur tous les onglets)
+        _propBadgeSet(data.icon || '📶', data.title || 'Alerte propagation', data);
+
+        var banner = document.createElement('div');
+        banner.id  = existId;
+        banner.style.cssText = [
+            'position:fixed',
+            'top:60px',
+            'left:50%',
+            'transform:translateX(-50%)',
+            'z-index:9999',
+            'background:' + (data.color_bg    || '#1c0a00'),
+            'border:2px solid ' + (data.color_border || '#f97316'),
+            'border-radius:14px',
+            'padding:12px 26px',
+            'font-size:13px',
+            'font-weight:700',
+            'color:' + (data.color_text  || '#fdba74'),
+            'box-shadow:0 8px 32px ' + (data.color_border || '#f97316') + '40',
+            'max-width:92vw',
+            'text-align:center',
+            'cursor:pointer',
+            'transition:opacity .3s'
+        ].join(';');
+
+        var icon   = data.icon   || '📶';
+        var title  = data.title  || 'Alerte propagation';
+        var detail = data.detail || '';
+        var extra  = '';
+        if (data.sfi !== null && data.sfi !== undefined) extra += ' · SFI ' + Math.round(data.sfi);
+        if (data.kp  !== null && data.kp  !== undefined) extra += ' · Kp '  + data.kp.toFixed(1);
+        if (data.xray_class) extra += ' · ' + data.xray_class;
+
+        banner.innerHTML = icon + ' <b>' + title + '</b>'
+            + (detail ? '<br><span style="font-size:11px;font-weight:400;opacity:.85">' + detail + extra + '</span>' : '');
+
+        banner.onclick = function() {
+            banner.style.opacity = '0';
+            setTimeout(function(){
+                banner.parentNode && banner.parentNode.removeChild(banner);
+                if (!document.querySelector('[id^="prop-banner-"]')) _propBadgeClear();
+            }, 300);
+        };
+        document.body.appendChild(banner);
+
+        // Bip triple montant (distinct météo et ISS)
+        try {
+            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            [520, 660, 820].forEach(function(freq, i) {
+                var osc = ctx.createOscillator();
+                var g   = ctx.createGain();
+                osc.frequency.value = freq;
+                osc.type = 'sine';
+                g.gain.value = 0.18;
+                osc.connect(g); g.connect(ctx.destination);
+                osc.start(ctx.currentTime + i * 0.18);
+                osc.stop (ctx.currentTime + i * 0.18 + 0.15);
+            });
+            setTimeout(function(){ try { ctx.close(); } catch(_){} }, 1200);
+        } catch(_) {}
+
+        // Auto-fermeture après 25 s
+        setTimeout(function() {
+            if (banner.parentNode) {
+                banner.style.opacity = '0';
+                setTimeout(function(){
+                    banner.parentNode && banner.parentNode.removeChild(banner);
+                    if (!document.querySelector('[id^="prop-banner-"]')) _propBadgeClear();
+                }, 300);
+            }
+        }, 25000);
+    }
+
+    function propAlertToggle() {
+        var tog = document.getElementById('prop-alert-toggle');
+        if (!tog) return;
+        fetch('/prop_alert_config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ enabled: tog.checked })
+        }).catch(function(){});
+    }
+
+    function propAlertSave() {
+        var kp   = document.getElementById('prop-kp-max');
+        var sfi  = document.getElementById('prop-sfi-min');
+        var xray = document.getElementById('prop-xray-class');
+        var itvl = document.getElementById('prop-interval-min');
+        fetch('/prop_alert_config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                kp_max:       kp   ? parseFloat(kp.value)   : 5.0,
+                sfi_min:      sfi  ? parseFloat(sfi.value)  : 70.0,
+                xray_class:   xray ? xray.value              : 'M1',
+                interval_min: itvl ? parseInt(itvl.value)   : 15,
+            })
+        }).catch(function(){});
+    }
+
+    function propAlertTest(btn) {
+        if (btn) btn.textContent = '⏳ Test en cours…';
+        fetch('/prop_alert_test', { method: 'POST' })
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+                if (btn) btn.textContent = d.status === 'ok'
+                    ? '✅ Test lancé — vérifiez les seuils'
+                    : '❌ Erreur : ' + (d.error || '?');
+                setTimeout(function(){ if (btn) btn.textContent = '🔬 Tester les alertes propagation'; }, 4000);
+            })
+            .catch(function(){ if (btn) { btn.textContent = '❌ Erreur réseau'; setTimeout(function(){ btn.textContent = '🔬 Tester les alertes propagation'; }, 4000); } });
+    }
+
+    // Charger config propagation au démarrage
+    (function propAlertInit(){
+        fetch('/prop_alert_config').then(function(r){ return r.json(); }).then(function(d){
+            var tog  = document.getElementById('prop-alert-toggle');
+            var kp   = document.getElementById('prop-kp-max');
+            var sfi  = document.getElementById('prop-sfi-min');
+            var xray = document.getElementById('prop-xray-class');
+            var itvl = document.getElementById('prop-interval-min');
+            if (tog)  tog.checked  = !!d.enabled;
+            if (kp   && d.kp_max       !== undefined) kp.value   = d.kp_max;
+            if (sfi  && d.sfi_min      !== undefined) sfi.value  = d.sfi_min;
+            if (xray && d.xray_class   !== undefined) xray.value = d.xray_class;
+            if (itvl && d.interval_min !== undefined) itvl.value = d.interval_min;
+        }).catch(function(){});
+    })();
+
+    // ── Alertes Météo — WX_ALERT_UI_PATCH_v1 ─────────────────────────────────
+    function wxAlertToggle() {
+        var tog = document.getElementById('wx-alert-toggle');
+        if (!tog) return;
+        fetch('/weather_alert_config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ enabled: tog.checked })
+        }).then(function(r){ return r.json(); }).then(function(){
+            var st = document.getElementById('wx-alert-status');
+            if (st) { st.textContent = tog.checked ? '✅ Alertes activées' : '⏹ Alertes désactivées'; setTimeout(function(){ st.textContent=''; }, 3000); }
+        }).catch(function(){});
+    }
+
+    function wxAlertSave() {
+        var v = function(id) { var e = document.getElementById(id); return e ? e.value : null; };
+        var b = function(id) { var e = document.getElementById(id); return e ? e.checked : false; };
+        var payload = {
+            enabled:      b('wx-alert-toggle'),
+            temp_max:     parseFloat(v('wx-temp-max'))  || 38,
+            temp_min:     parseFloat(v('wx-temp-min'))  || -5,
+            wind_max:     parseFloat(v('wx-wind-max'))  || 60,
+            gust_max:     parseFloat(v('wx-gust-max'))  || 80,
+            rain_mm:      parseFloat(v('wx-rain-mm'))   || 10,
+            wmo_severe:   b('wx-wmo-severe'),
+            interval_min:   parseInt(v('wx-interval-min')) || 30,
+            bulletin_aprs:  b('wx-bulletin-aprs')
+        };
+        fetch('/weather_alert_config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        }).then(function(r){ return r.json(); }).then(function(){
+            var st = document.getElementById('wx-alert-status');
+            if (st) { st.textContent = '✅ Sauvegardé'; setTimeout(function(){ st.textContent=''; }, 2500); }
+        }).catch(function(){});
+    }
+
+    function wxAlertTest(btn) {
+        if (btn) btn.disabled = true;
+        var st = document.getElementById('wx-alert-status');
+        if (st) st.textContent = '⏳ Interrogation Open-Meteo…';
+        fetch('/weather_alert_test', { method: 'POST' })
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+                if (btn) btn.disabled = false;
+                if (st) { st.textContent = d.status === 'ok' ? '✅ Test déclenché — vérifiez les notifications' : '⚠️ ' + (d.error || 'Erreur'); setTimeout(function(){ st.textContent=''; }, 4000); }
+            })
+            .catch(function(){ if (btn) btn.disabled = false; if (st) { st.textContent = '❌ Erreur réseau'; setTimeout(function(){ st.textContent=''; }, 4000); } });
+    }
+
+    (function wxAlertInit(){
+        fetch('/weather_alert_config').then(function(r){ return r.json(); }).then(function(d){
+            var tog  = document.getElementById('wx-alert-toggle');
+            var tmax = document.getElementById('wx-temp-max');
+            var tmin = document.getElementById('wx-temp-min');
+            var wmax = document.getElementById('wx-wind-max');
+            var gmax = document.getElementById('wx-gust-max');
+            var rmm  = document.getElementById('wx-rain-mm');
+            var wmo  = document.getElementById('wx-wmo-severe');
+            var itvl = document.getElementById('wx-interval-min');
+            if (tog)  tog.checked  = !!d.enabled;
+            if (tmax && d.temp_max     !== undefined) tmax.value = d.temp_max;
+            if (tmin && d.temp_min     !== undefined) tmin.value = d.temp_min;
+            if (wmax && d.wind_max     !== undefined) wmax.value = d.wind_max;
+            if (gmax && d.gust_max     !== undefined) gmax.value = d.gust_max;
+            if (rmm  && d.rain_mm      !== undefined) rmm.value  = d.rain_mm;
+            if (wmo)  wmo.checked = (d.wmo_severe !== false);
+            if (itvl && d.interval_min !== undefined) itvl.value = d.interval_min;
+            var blnaprs = document.getElementById('wx-bulletin-aprs');
+            if (blnaprs) blnaprs.checked = (d.bulletin_aprs !== false);
+        }).catch(function(){});
+    })();
+    // ── FIN WX_ALERT_UI_PATCH_v1 ─────────────────────────────────────────────
+
+    function _issUpdateDot(enabled, inPass) {
         var dot = document.getElementById('iss-active-dot');
         if (!dot) return;
-        dot.style.display = enabled ? 'inline-flex' : 'none';
+        // Si enabled explicitement fourni, mémoriser l'état alerte
+        if (enabled !== undefined) _issAlertEnabled = !!enabled;
+        if (!_issAlertEnabled) {
+            dot.style.display = 'none';
+            return;
+        }
+        dot.style.display = 'inline-flex';
+        var inner = dot.querySelector('span');
+        if (inPass) {
+            // 🟠 Passage en cours : orange/doré vif
+            dot.style.color     = '#fbbf24';
+            dot.style.animation = 'issDotPulse .8s ease-in-out infinite';
+            if (inner) {
+                inner.style.background = '#f59e0b';
+                inner.style.boxShadow  = '0 0 8px #f59e0b, 0 0 16px #f59e0b88';
+            }
+            dot.title = 'ISS EN PASSAGE';
+        } else {
+            // 🟣 Alerte active, pas de passage : violet standard
+            dot.style.color     = '#a78bfa';
+            dot.style.animation = 'issDotPulse 2.5s ease-in-out infinite';
+            if (inner) {
+                inner.style.background = '#7c3aed';
+                inner.style.boxShadow  = '0 0 6px #7c3aed';
+            }
+            dot.title = 'Alerte passage ISS activée';
+        }
     }
+    var _issAlertEnabled = false;
 
     // Charger config + passages au démarrage
     (function issInit(){
@@ -3785,6 +6997,243 @@ def index():
 
     // Rafraîchissement auto toutes les 15 min (rafraîchissement automatique toutes les 15 min)
     setInterval(issPassRefresh, 15 * 60 * 1000);
+
+    // ── Passages ISS 24h glissantes ────────────────────────────────────────
+    function iss24hRefresh() {
+        var list = document.getElementById('iss-24h-list');
+        var btn  = document.getElementById('iss-24h-btn');
+        var st   = document.getElementById('iss-24h-status');
+        if (list) list.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">⏳ Calcul SGP4…</span>';
+        if (btn)  btn.textContent = '…';
+        fetch('/iss_passes?range=24h').then(function(r){ return r.json(); }).then(function(d){
+            if (btn) btn.textContent = '↺ MAJ';
+            if (d.error) {
+                if (list) list.innerHTML = '<span style="color:#ef4444;font-size:10px">' + d.error + '</span>';
+                return;
+            }
+            if (!d.passes || !d.passes.length) {
+                if (list) list.innerHTML = '<span style="color:#475569;font-style:italic;font-size:10px">Aucun passage dans les 24 prochaines heures</span>';
+                if (st)   st.textContent = 'Aucun passage';
+                return;
+            }
+            var nowSec = Date.now() / 1000;
+            var passes = d.passes.slice().sort(function(a,b){ return a.risetime - b.risetime; });
+            var nextIdx = passes.findIndex(function(p){ return p.risetime > nowSec; });
+            if (nextIdx < 0) nextIdx = passes.length - 1;
+
+            if (st) st.textContent = passes.length + ' passage(s) · '
+                + (d.lat !== undefined ? d.lat.toFixed(2) + '° / ' + d.lon.toFixed(2) + '°' : '');
+
+            list.innerHTML = passes.map(function(p, i) {
+                var inMin  = Math.round((p.risetime - nowSec) / 60);
+                var maxEl  = (p.max_el !== undefined && p.max_el !== null) ? Math.round(p.max_el) : null;
+                var dur    = p.duration_min;
+                var riseAz = (p.rise_az !== undefined && p.rise_az !== null) ? Math.round(p.rise_az) : null;
+                var setAz  = (p.set_az  !== undefined && p.set_az  !== null) ? Math.round(p.set_az)  : null;
+                var isNext = (i === nextIdx);
+                var isPast = inMin < -Math.round(dur || 5);
+
+                // ── Couleurs selon statut temporel ──────────────────────────
+                var badgeCol = isPast     ? '#334155'
+                             : inMin <= 0 ? '#f472b6'
+                             : inMin < 15 ? '#f472b6'
+                             : inMin < 60 ? '#a78bfa'
+                             : inMin < 240? '#67e8f9'
+                             :              '#475569';
+
+                // ── Qualité élévation ───────────────────────────────────────
+                var elLabel = '—', elColor = '#475569', elBg = 'rgba(71,85,105,.12)';
+                if (maxEl !== null) {
+                    if      (maxEl >= 60) { elLabel = 'Excellent'; elColor = '#4ade80'; elBg = 'rgba(74,222,128,.10)'; }
+                    else if (maxEl >= 30) { elLabel = 'Bon';       elColor = '#a78bfa'; elBg = 'rgba(167,139,250,.10)'; }
+                    else if (maxEl >= 10) { elLabel = 'Passable';  elColor = '#67e8f9'; elBg = 'rgba(103,232,249,.10)'; }
+                    else                  { elLabel = 'Rasant';    elColor = '#475569'; elBg = 'rgba(71,85,105,.12)'; }
+                }
+
+                // ── Probabilité contact APRS ────────────────────────────────
+                var aprsProb = 0, aprsColor = '#475569', aprsLabel = 'Très faible';
+                if (maxEl !== null) {
+                    if      (maxEl < 5)  { aprsProb = 5;  aprsColor = '#475569'; aprsLabel = 'Très faible'; }
+                    else if (maxEl < 10) { aprsProb = 12; aprsColor = '#ef4444'; aprsLabel = 'Faible'; }
+                    else if (maxEl < 20) { aprsProb = 30; aprsColor = '#f97316'; aprsLabel = 'Possible'; }
+                    else if (maxEl < 35) { aprsProb = 52; aprsColor = '#eab308'; aprsLabel = 'Probable'; }
+                    else if (maxEl < 55) { aprsProb = 72; aprsColor = '#22c55e'; aprsLabel = 'Bonne'; }
+                    else                 { aprsProb = 90; aprsColor = '#10b981'; aprsLabel = 'Excellente'; }
+                    if (maxEl >= 5  && maxEl < 10) aprsProb = Math.round(5  + (maxEl-5)  / 5  * 15);
+                    if (maxEl >= 10 && maxEl < 20) aprsProb = Math.round(20 + (maxEl-10) / 10 * 20);
+                    if (maxEl >= 20 && maxEl < 35) aprsProb = Math.round(40 + (maxEl-20) / 15 * 25);
+                    if (maxEl >= 35 && maxEl < 55) aprsProb = Math.round(65 + (maxEl-35) / 20 * 15);
+                    if (maxEl >= 55 && maxEl < 80) aprsProb = Math.round(80 + (maxEl-55) / 25 * 15);
+                    if (maxEl >= 80)               aprsProb = 95;
+                }
+
+                // ── Libellé jour ─────────────────────────────────────────────
+                var rdt  = new Date(p.risetime * 1000);
+                var tod  = new Date(); tod.setHours(0,0,0,0);
+                var rdtd = new Date(rdt); rdtd.setHours(0,0,0,0);
+                var isToday    = (rdtd.getTime() === tod.getTime());
+                var tomorrow   = new Date(tod); tomorrow.setDate(tod.getDate()+1);
+                var isTomorrow = (rdtd.getTime() === tomorrow.getTime());
+                var dayTag = isToday ? ''
+                    : isTomorrow
+                        ? '<span style="display:inline-block;background:rgba(245,158,11,.15);color:#f59e0b;font-size:9px;font-weight:700;border-radius:4px;padding:0 5px;margin-right:5px;text-transform:uppercase;letter-spacing:.05em">demain</span>'
+                        : '<span style="display:inline-block;background:rgba(245,158,11,.12);color:#f59e0b;font-size:9px;font-weight:700;border-radius:4px;padding:0 5px;margin-right:5px">' + rdt.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit"}) + '</span>';
+
+                // ── Libellé statut / countdown ────────────────────────────────
+                var statusTxt = isPast     ? 'PASSÉ'
+                    : inMin <= 0           ? 'EN COURS'
+                    : inMin < 60           ? 'dans ' + inMin + ' min'
+                    : Math.round(inMin/60) + 'h' + (inMin%60 ? String(inMin%60).padStart(2,'0') : '');
+
+                // ── Fond de carte ─────────────────────────────────────────────
+                var cardStyle = isNext
+                    ? 'background:rgba(124,58,237,.12);border:1px solid rgba(124,58,237,.35)'
+                    : isPast
+                        ? 'background:rgba(10,15,25,.35);border:1px solid rgba(30,41,59,.3);opacity:.5'
+                        : 'background:rgba(15,23,42,.55);border:1px solid rgba(30,41,59,.7)';
+
+                var h = '<div style="border-radius:12px;padding:10px 12px;' + cardStyle + ';margin-bottom:2px">';
+
+                // ══ LIGNE 1 : heure + badge statut ═══════════════════════════
+                h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px">';
+
+                // Heure AOS → LOS
+                h += '<div style="display:flex;align-items:baseline;gap:6px">';
+                if (isNext) h += '<span style="font-size:14px;line-height:1">🛸</span>';
+                h += dayTag;
+                h += '<span style="font-family:monospace;font-size:' + (isNext?'14':'12') + 'px;font-weight:' + (isNext?'800':'600') + ';color:' + (isPast?'#475569':isNext?'#e2e8f0':'#94a3b8') + ';letter-spacing:.02em">';
+                h +=   p.risetime_fmt;
+                h += '</span>';
+                if (p.set_fmt && !isPast) {
+                    h += '<span style="font-family:monospace;font-size:10px;color:#475569;font-weight:400">→ ' + p.set_fmt + '</span>';
+                }
+                h += '</div>';
+
+                // Badge statut
+                h += '<span style="font-size:9px;font-weight:700;color:' + badgeCol + ';background:' + badgeCol + '1a;border:1px solid ' + badgeCol + '30;border-radius:6px;padding:2px 8px;white-space:nowrap;letter-spacing:.04em;text-transform:uppercase">';
+                h +=   statusTxt;
+                h += '</span>';
+                h += '</div>';
+
+                if (!isPast) {
+                    // ══ LIGNE 2 : métriques orbitales ════════════════════════
+                    h += '<div style="display:flex;align-items:center;gap:10px;padding:6px 8px;background:rgba(0,0,0,.2);border-radius:8px;margin-bottom:6px">';
+
+                    // Durée
+                    h += '<div style="display:flex;flex-direction:column;align-items:center;min-width:36px">';
+                    h +=   '<span style="font-family:monospace;font-size:13px;font-weight:700;color:#94a3b8;line-height:1">' + dur + '</span>';
+                    h +=   '<span style="font-size:8px;color:#475569;text-transform:uppercase;letter-spacing:.06em;margin-top:2px">min</span>';
+                    h += '</div>';
+
+                    h += '<div style="width:1px;height:28px;background:rgba(71,85,105,.3)"></div>';
+
+                    // Élévation max
+                    if (maxEl !== null) {
+                        h += '<div style="display:flex;flex-direction:column;align-items:center;min-width:38px">';
+                        h +=   '<span style="font-family:monospace;font-size:13px;font-weight:700;color:' + elColor + ';line-height:1">' + maxEl + '°</span>';
+                        h +=   '<span style="font-size:8px;color:#475569;text-transform:uppercase;letter-spacing:.06em;margin-top:2px">élév. max</span>';
+                        h += '</div>';
+
+                        h += '<div style="width:1px;height:28px;background:rgba(71,85,105,.3)"></div>';
+
+                        // Badge qualité passage
+                        h += '<div style="flex:1;display:flex;align-items:center">';
+                        h +=   '<span style="font-size:10px;font-weight:700;color:' + elColor + ';background:' + elBg + ';border-radius:6px;padding:3px 8px">';
+                        h +=     (maxEl >= 60 ? '⭐ ' : maxEl >= 30 ? '✦ ' : maxEl >= 10 ? '· ' : '↙ ') + elLabel;
+                        h +=   '</span>';
+                        h += '</div>';
+
+                        // Azimut AOS → LOS (boussole compacte)
+                        if (riseAz !== null) {
+                            var _AZ_CARDS2 = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSO','SO','OSO','O','ONO','NO','NNO'];
+                            var rCard = _AZ_CARDS2[Math.round(riseAz / 22.5) % 16];
+                            var sCard = setAz !== null ? _AZ_CARDS2[Math.round(setAz / 22.5) % 16] : null;
+                            // Aiguille sur cercle SVG (r=9, centre 11,11)
+                            var r9 = 8;
+                            var rxN = (11 + r9 * Math.cos((riseAz - 90) * Math.PI / 180)).toFixed(1);
+                            var ryN = (11 + r9 * Math.sin((riseAz - 90) * Math.PI / 180)).toFixed(1);
+                            h += '<div style="width:1px;height:28px;background:rgba(71,85,105,.3)"></div>';
+                            h += '<div style="display:flex;align-items:center;gap:5px">';
+                            // Mini boussole SVG
+                            h += '<svg width="22" height="22" viewBox="0 0 22 22" style="flex-shrink:0">';
+                            h +=   '<circle cx="11" cy="11" r="10" fill="rgba(15,23,42,.6)" stroke="rgba(71,85,105,.5)" stroke-width="1"/>';
+                            h +=   '<text x="11" y="5"  text-anchor="middle" font-size="4" fill="#475569" font-family="monospace">N</text>';
+                            h +=   '<text x="11" y="20" text-anchor="middle" font-size="4" fill="#475569" font-family="monospace">S</text>';
+                            h +=   '<text x="3"  y="13" text-anchor="middle" font-size="4" fill="#475569" font-family="monospace">O</text>';
+                            h +=   '<text x="19" y="13" text-anchor="middle" font-size="4" fill="#475569" font-family="monospace">E</text>';
+                            // Aiguille AOS (cyan)
+                            h +=   '<line x1="11" y1="11" x2="' + rxN + '" y2="' + ryN + '" stroke="#67e8f9" stroke-width="2" stroke-linecap="round"/>';
+                            h +=   '<circle cx="11" cy="11" r="1.5" fill="#67e8f9"/>';
+                            // Aiguille LOS (si dispo, violet atténué)
+                            if (setAz !== null) {
+                                var sxN = (11 + r9 * Math.cos((setAz - 90) * Math.PI / 180)).toFixed(1);
+                                var syN = (11 + r9 * Math.sin((setAz - 90) * Math.PI / 180)).toFixed(1);
+                                h +=   '<line x1="11" y1="11" x2="' + sxN + '" y2="' + syN + '" stroke="#a78bfa" stroke-width="1.5" stroke-linecap="round" opacity=".5" stroke-dasharray="2,2"/>';
+                            }
+                            h += '</svg>';
+                            // Texte AOS → LOS
+                            h += '<div style="display:flex;flex-direction:column;gap:1px">';
+                            h +=   '<span style="font-family:monospace;font-size:9px;font-weight:700;color:#67e8f9;letter-spacing:.03em">' + riseAz + '° ' + rCard + '</span>';
+                            if (sCard) {
+                                h += '<span style="font-family:monospace;font-size:8px;color:#a78bfa;opacity:.7">' + setAz + '° ' + sCard + '</span>';
+                            }
+                            h +=   '<span style="font-size:7px;color:#334155;text-transform:uppercase;letter-spacing:.06em">AOS→LOS</span>';
+                            h += '</div>';
+                            h += '</div>';
+                        }
+                    }
+
+                    // Fréquences (compact, à droite)
+                    h += '<div style="margin-left:auto;text-align:right">';
+                    h +=   '<div style="font-family:monospace;font-size:8px;color:#334155;line-height:1.5">145.825</div>';
+                    h +=   '<div style="font-family:monospace;font-size:8px;color:#2d3748;line-height:1.5">437.550</div>';
+                    h += '</div>';
+                    h += '</div>';
+
+                    // ══ LIGNE 3 : probabilité contact APRS ═══════════════════
+                    if (maxEl !== null) {
+                        var elPct = Math.min(100, Math.round(maxEl / 90 * 100));
+                        var barCol = maxEl >= 60 ? '#4ade80' : maxEl >= 30 ? '#a78bfa' : maxEl >= 10 ? '#67e8f9' : '#475569';
+                        h += '<div style="display:flex;align-items:center;gap:10px;padding:7px 8px;background:rgba(0,0,0,.25);border-radius:8px">';
+
+                        // Colonne gauche : label + double barre (élév + APRS)
+                        h +=   '<div style="flex:1;min-width:0">';
+                        h +=     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">';
+                        h +=       '<span style="font-size:8px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.07em">Élév.</span>';
+                        h +=       '<span style="font-size:8px;color:' + elColor + ';font-weight:600">' + maxEl + '°</span>';
+                        h +=     '</div>';
+                        h +=     '<div style="height:3px;background:#0f172a;border-radius:2px;overflow:hidden;margin-bottom:6px">';
+                        h +=       '<div style="width:' + elPct + '%;height:100%;background:' + barCol + ';border-radius:2px"></div>';
+                        h +=     '</div>';
+                        h +=     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">';
+                        h +=       '<span style="font-size:8px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.07em">📡 Contact APRS</span>';
+                        h +=       '<span style="font-size:8px;color:' + aprsColor + ';font-weight:600">' + aprsLabel + '</span>';
+                        h +=     '</div>';
+                        h +=     '<div style="height:4px;background:#0f172a;border-radius:3px;overflow:hidden">';
+                        h +=       '<div style="width:' + aprsProb + '%;height:100%;background:' + aprsColor + ';border-radius:3px;box-shadow:0 0 5px ' + aprsColor + '77"></div>';
+                        h +=     '</div>';
+                        h +=   '</div>';
+
+                        // Colonne droite : % en grand
+                        h +=   '<div style="text-align:center;min-width:46px;border-left:1px solid rgba(71,85,105,.25);padding-left:10px">';
+                        h +=     '<div style="font-family:monospace;font-size:20px;font-weight:900;line-height:1;color:' + aprsColor + '">' + aprsProb + '%</div>';
+                        h +=     '<div style="font-size:8px;color:#475569;margin-top:2px;text-transform:uppercase;letter-spacing:.05em">liaison</div>';
+                        h +=   '</div>';
+                        h += '</div>';
+                    }
+                }
+
+                h += '</div>';
+                return h;
+            }).join('');
+        }).catch(function(err){
+            if (btn)  btn.textContent = '↺ MAJ';
+            if (list) list.innerHTML = '<span style="color:#ef4444;font-size:10px">Erreur chargement</span>';
+        });
+    }
+    // Lancer au chargement de l'onglet ISS
+    iss24hRefresh();
+    setInterval(iss24hRefresh, 15 * 60 * 1000);
 
     // ── Rafraichissement liste peripheriques audio ──────────────────────────
     async function refreshDevices() {
@@ -3851,11 +7300,31 @@ def index():
     }
 
     async function sendISS() {
-        fetch('/send_raw', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ message: "Contact via ARISS / ISS", is_iss: true })
-        });
+        // Vérifier que l'ISS est bien en vue avant d'émettre
+        var btn = document.getElementById("btn-iss-send");
+        try {
+            var r = await fetch("/iss_now");
+            var d = await r.json();
+            if (!d.visible) {
+                if (btn) { var old = btn.textContent; btn.textContent = "❌ ISS hors de portée"; setTimeout(function(){ btn.textContent = old; }, 3000); }
+                return;
+            }
+        } catch(e) { /* on tente quand même si /iss_now échoue */ }
+
+        if (btn) { btn.textContent = "⏳ Émission…"; btn.disabled = true; }
+        try {
+            await fetch('/send_raw', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ message: "Contact via ARISS / ISS", is_iss: true })
+            });
+            if (btn) { btn.textContent = "✅ Envoyé !"; }
+        } catch(e) {
+            if (btn) { btn.textContent = "❌ Erreur"; }
+        }
+        setTimeout(function(){
+            if (btn) { btn.textContent = "📡 BEACON"; btn.disabled = false; }
+        }, 3000);
     }
 
     async function sendBeacon() { await fetch('/send_beacon', { method: 'POST' }); }
@@ -3909,6 +7378,30 @@ def index():
         await fetch('/send_status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}) });
     }
 
+    async function sendText1(btn) {
+        var orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ Envoi...';
+        try {
+            var r = await fetch('/send_text1', { method: 'POST' });
+            var d = await r.json();
+            btn.textContent = d.error ? ('❌ ' + d.error) : '✅ Envoyé';
+        } catch(e) { btn.textContent = '❌ Erreur réseau'; }
+        setTimeout(function(){ btn.textContent = orig; btn.disabled = false; }, 3000);
+    }
+
+    async function sendText2(btn) {
+        var orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ Envoi...';
+        try {
+            var r = await fetch('/send_text2', { method: 'POST' });
+            var d = await r.json();
+            btn.textContent = d.error ? ('❌ ' + d.error) : '✅ Envoyé';
+        } catch(e) { btn.textContent = '❌ Erreur réseau'; }
+        setTimeout(function(){ btn.textContent = orig; btn.disabled = false; }, 3000);
+    }
+
     function clearConsole() { document.getElementById('console').innerHTML = ''; }
 
     // ── Handler délégué : bouton "trame brute" ───────────────────────────────
@@ -3956,7 +7449,7 @@ def index():
             // d.schedules = {station:{interval,next_in}, meteo:{...}, ...}
             var schedules = d.schedules || {};
 
-            var TYPES = ['station', 'iss', 'meteo', 'propagation'];
+            var TYPES = ['station', 'iss', 'meteo', 'propagation', 'text1', 'text2'];
             var anyActive = false;
 
             TYPES.forEach(function(btype) {
@@ -4043,7 +7536,7 @@ def index():
             ? parseFloat(data.lon_manual) : '';
         // Construire beacon_schedules depuis les selects sched_*
         var schedules = {};
-        ['station','iss','meteo','propagation'].forEach(function(t) {
+        ['station','iss','meteo','propagation','text1','text2'].forEach(function(t) {
             var v = parseInt(data['sched_' + t]) || 0;
             if (v > 0) schedules[t] = v;
             delete data['sched_' + t];
@@ -4054,6 +7547,14 @@ def index():
         data.igate_enabled  = document.getElementById('igate_enabled') ? document.getElementById('igate_enabled').checked : false;
         data.igate_rx_only  = data.igate_rx_only === 'true';
         data.igate_port     = parseInt(data.igate_port) || 14580;
+        // Digipeater
+        data.digi_enabled   = document.getElementById('digi_enabled') ? document.getElementById('digi_enabled').checked : false;
+        data.digi_aliases   = (data.digi_aliases || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+        data.digi_limit     = parseInt(data.digi_limit) || 2;
+        // Mode HF 300 bauds
+        data.hf_mode        = document.getElementById('hf_mode') ? document.getElementById('hf_mode').checked : false;
+        data.hf_mark_hz     = parseInt(data.hf_mark_hz)  || 1600;
+        data.hf_space_hz    = parseInt(data.hf_space_hz) || 1800;
         try {
             await fetch('/update_config', {
                 method: 'POST',
@@ -4091,8 +7592,14 @@ def index():
     // ── QSO Chat ───────────────────────────────────────────────────────────
     var activeContact = null;
 
+    // ── Constante destination ISS ─────────────────────────────────────────────
+    var _ISS_DEST    = 'RS0ISS-4';   // Digipeater ISS principal (ARISS)
+    var _ISS_PATH    = 'ARISS';      // Path requis pour passer via l'ISS
+    var _issMode     = false;        // true quand le contact actif est ISS
+
     function openCQGeneral() {
         activeContact = 'APRS';
+        _issMode = false;
         document.getElementById('chat-title').innerHTML =
             '<span style="color:#f59e0b;font-weight:900;letter-spacing:.04em">📢 Appel général</span>'
             + ' <span style="font-size:9px;color:#78716c;font-family:monospace">→ APRS</span>';
@@ -4103,10 +7610,38 @@ def index():
         document.getElementById('chat-avatar').style.border = '1px solid #f59e0b';
         document.getElementById('chat-input').disabled    = false;
         document.getElementById('chat-send-btn').disabled = false;
+        document.getElementById('chat-delete-btn').disabled = false;
         document.getElementById('chat-input').placeholder = 'CQ CQ DE F1RIQ — 67 car. max...';
         document.getElementById('chat-input').focus();
+        _renderMacroBar();
         _macroSetEnabled(true);
         loadHistory('APRS');
+        switchTab('qso');
+    }
+
+    function openISS() {
+        activeContact = _ISS_DEST;
+        _issMode = true;
+        document.getElementById('chat-title').innerHTML =
+            '<span style="color:#818cf8;font-weight:900;letter-spacing:.04em">🛸 ISS / ARISS</span>'
+            + ' <span style="font-size:9px;color:#6366f1;font-family:monospace">→ ' + _ISS_DEST + '</span>';
+        document.getElementById('chat-subtitle').innerHTML =
+            '<span style="color:#6366f1">PATH : <b>' + _ISS_PATH + '</b></span>'
+            + ' &nbsp;·&nbsp; QRG 145.825 MHz FM';
+        document.getElementById('chat-avatar').innerHTML =
+            '<span style="font-size:16px">🛸</span>';
+        document.getElementById('chat-avatar').style.background =
+            'linear-gradient(135deg,#1e1b4b,#3730a3)';
+        document.getElementById('chat-avatar').style.border = '1px solid #818cf8';
+        document.getElementById('chat-input').disabled    = false;
+        document.getElementById('chat-send-btn').disabled = false;
+        document.getElementById('chat-delete-btn').disabled = false;
+        document.getElementById('chat-input').placeholder =
+            'Message ISS via ARISS — 67 car. max...';
+        document.getElementById('chat-input').focus();
+        _renderMacroBar();
+        _macroSetEnabled(true);
+        loadHistory(_ISS_DEST);
         switchTab('qso');
     }
 
@@ -4114,19 +7649,48 @@ def index():
         cs = cs.trim().toUpperCase();
         if (!cs) return;
         activeContact = cs;
+        _issMode = false;
         document.getElementById('new-contact-input').value = '';
         document.getElementById('chat-title').innerHTML = cs + ' ' + qrzLink(cs, {cls:'text-[10px] text-slate-500 hover:text-blue-400 font-mono transition-colors align-middle'});
         document.getElementById('chat-subtitle').textContent = 'APRS - 144.800 MHz';
         document.getElementById('chat-avatar').textContent = cs.substring(0, 2);
         document.getElementById('chat-input').disabled    = false;
         document.getElementById('chat-send-btn').disabled = false;
+        document.getElementById('chat-delete-btn').disabled = false;
         document.getElementById('chat-input').placeholder = 'Message APRS 67 car. max...';
         document.getElementById('chat-avatar').style.background = '';
         document.getElementById('chat-avatar').style.border = '';
         document.getElementById('chat-input').focus();
+        _renderMacroBar();
         _macroSetEnabled(true);
         loadHistory(cs);
         switchTab('qso');
+    }
+
+    async function deleteQso() {
+        if (!activeContact) return;
+        if (!confirm('Supprimer toute la conversation avec ' + activeContact + ' ?')) return;
+        var r = await fetch('/chat/delete/' + encodeURIComponent(activeContact), { method: 'DELETE' });
+        var d = await r.json();
+        if (d.ok) {
+            // Réinitialiser le panneau chat
+            activeContact = null;
+            _issMode = false;
+            document.getElementById('chat-title').textContent = 'Selectionner un contact';
+            document.getElementById('chat-subtitle').textContent = 'APRS Point-a-Point';
+            document.getElementById('chat-avatar').textContent = '?';
+            document.getElementById('chat-avatar').style.background = '';
+            document.getElementById('chat-avatar').style.border = '';
+            document.getElementById('chat-input').disabled    = true;
+            document.getElementById('chat-send-btn').disabled = true;
+            document.getElementById('chat-delete-btn').disabled = true;
+            document.getElementById('chat-messages').innerHTML =
+                '<div class="text-center text-slate-600 text-xs italic mt-20">👆 Choisissez un contact pour demarrer</div>';
+            _macroSetEnabled(false);
+            refreshContacts();
+        } else {
+            alert('Erreur : ' + (d.error || 'impossible de supprimer'));
+        }
     }
 
     async function loadHistory(cs) {
@@ -4235,7 +7799,7 @@ def index():
     }
 
     // ── Macros QSO ─────────────────────────────────────────────────────────
-    var _CALLSIGN_CFG = '""" + (config_manager.data.get('callsign','N0CALL')) + """';
+    var _CALLSIGN_CFG = __CALLSIGN_JSON__;
     // Groupe 1 : macros QSO standard
     var _macrosQso = [
         { label:'CQ',      text:'CQ CQ DE {MY} APRS QRZ?' },
@@ -4257,6 +7821,15 @@ def index():
         { label:'?APRSV', text:'?APRSV', title:'Demande la version logiciel APRS' },
         { label:'?WX',    text:'?WX',    title:'Demande météo locale' },
         { label:'?PING?', text:'?PING?', title:'Ping — vérifie que la station est active' },
+    ];
+
+    // Groupe 3 : macros ISS / ARISS — envoi avec path forcé ARISS
+    var _macrosISS = [
+        { label:'CQ ARISS', text:'CQ CQ ARISS DE {MY} LOC {LOC} QRZ?' },
+        { label:'QTH',      text:'DE {MY} QTH LOC {LOC} APRS VIA ISS' },
+        { label:'73 ISS',   text:'73 DE {MY} TNX ARISS QSO GL' },
+        { label:'PSE QSL',  text:'PSE QSL DE {MY} VIA ISS ARISS' },
+        { label:'Test',     text:'TEST DE {MY} PSE QSL VIA ARISS' },
     ];
 
     function _macroExpand(tpl) {
@@ -4287,6 +7860,7 @@ def index():
 
     function _makeMacroBtn(m, idx, group) {
         var isAprs  = (group === 'aprs');
+        var isISS   = (group === 'iss');
         var btn = document.createElement('button');
         btn.type = 'button';
         btn.disabled = true;
@@ -4307,6 +7881,22 @@ def index():
                 if (this.disabled) return;
                 var txt = _macrosAprs[parseInt(this.getAttribute('data-idx'))].text;
                 _chatSendDirect(txt);
+            };
+        } else if (isISS) {
+            // Bouton ISS : remplit le champ (envoi manuel pour relecture)
+            btn.textContent = m.label;
+            btn.title = _macroExpand(m.text);
+            btn.className = baseClass
+                + 'bg-indigo-950/60 border border-indigo-600/60 text-indigo-300 '
+                + 'hover:bg-indigo-600 hover:border-indigo-400 hover:text-white';
+            btn.onclick = function() {
+                var inp2 = document.getElementById('chat-input');
+                if (!inp2 || inp2.disabled) return;
+                var txt = _macroExpand(_macrosISS[parseInt(this.getAttribute('data-idx'))].text).substring(0, 67);
+                inp2.value = txt;
+                inp2.focus();
+                var cc = document.getElementById('chat-charcount');
+                if (cc) cc.textContent = txt.length + '/67';
             };
         } else {
             btn.textContent = m.label;
@@ -4332,35 +7922,58 @@ def index():
         if (!bar) return;
         bar.innerHTML = '';
 
-        // ── Groupe QSO ────────────────────────────────────────────────────
-        var lblQso = document.createElement('span');
-        lblQso.textContent = 'QSO';
-        lblQso.style.cssText = 'font-size:8px;font-weight:900;color:#475569;'
-                             + 'text-transform:uppercase;letter-spacing:.08em;'
-                             + 'align-self:center;white-space:nowrap;margin-right:2px';
-        bar.appendChild(lblQso);
+        if (_issMode) {
+            // ── Mode ISS : groupe ISS uniquement ──────────────────────────
+            var lblIss = document.createElement('span');
+            lblIss.innerHTML = '🛸 ARISS';
+            lblIss.style.cssText = 'font-size:8px;font-weight:900;color:#6366f1;'
+                                 + 'text-transform:uppercase;letter-spacing:.08em;'
+                                 + 'align-self:center;white-space:nowrap;margin-right:4px';
+            bar.appendChild(lblIss);
 
-        _macrosQso.forEach(function(m, idx) {
-            bar.appendChild(_makeMacroBtn(m, idx, 'qso'));
-        });
+            _macrosISS.forEach(function(m, idx) {
+                bar.appendChild(_makeMacroBtn(m, idx, 'iss'));
+            });
 
-        // ── Séparateur ────────────────────────────────────────────────────
-        var sep = document.createElement('span');
-        sep.style.cssText = 'width:1px;height:18px;background:#334155;'
-                          + 'align-self:center;flex-shrink:0;margin:0 4px';
-        bar.appendChild(sep);
+            // Badge path ARISS
+            var badge = document.createElement('span');
+            badge.textContent = 'path: ARISS';
+            badge.style.cssText = 'font-size:9px;font-weight:700;color:#818cf8;'
+                                + 'background:#1e1b4b;border:1px solid #4338ca;'
+                                + 'border-radius:6px;padding:1px 6px;'
+                                + 'align-self:center;margin-left:auto;white-space:nowrap';
+            bar.appendChild(badge);
+        } else {
+            // ── Mode normal : QSO + APRS ──────────────────────────────────
+            var lblQso = document.createElement('span');
+            lblQso.textContent = 'QSO';
+            lblQso.style.cssText = 'font-size:8px;font-weight:900;color:#475569;'
+                                 + 'text-transform:uppercase;letter-spacing:.08em;'
+                                 + 'align-self:center;white-space:nowrap;margin-right:2px';
+            bar.appendChild(lblQso);
 
-        // ── Groupe APRS (envoi direct) ────────────────────────────────────
-        var lblAprs = document.createElement('span');
-        lblAprs.textContent = 'APRS';
-        lblAprs.style.cssText = 'font-size:8px;font-weight:900;color:#6d28d9;'
-                              + 'text-transform:uppercase;letter-spacing:.08em;'
-                              + 'align-self:center;white-space:nowrap;margin-right:2px';
-        bar.appendChild(lblAprs);
+            _macrosQso.forEach(function(m, idx) {
+                bar.appendChild(_makeMacroBtn(m, idx, 'qso'));
+            });
 
-        _macrosAprs.forEach(function(m, idx) {
-            bar.appendChild(_makeMacroBtn(m, idx, 'aprs'));
-        });
+            // ── Séparateur ────────────────────────────────────────────────
+            var sep = document.createElement('span');
+            sep.style.cssText = 'width:1px;height:18px;background:#334155;'
+                              + 'align-self:center;flex-shrink:0;margin:0 4px';
+            bar.appendChild(sep);
+
+            // ── Groupe APRS (envoi direct) ────────────────────────────────
+            var lblAprs = document.createElement('span');
+            lblAprs.textContent = 'APRS';
+            lblAprs.style.cssText = 'font-size:8px;font-weight:900;color:#6d28d9;'
+                                  + 'text-transform:uppercase;letter-spacing:.08em;'
+                                  + 'align-self:center;white-space:nowrap;margin-right:2px';
+            bar.appendChild(lblAprs);
+
+            _macrosAprs.forEach(function(m, idx) {
+                bar.appendChild(_makeMacroBtn(m, idx, 'aprs'));
+            });
+        }
     }
 
     function _macroSetEnabled(enabled) {
@@ -4375,10 +7988,12 @@ def index():
         if (!text || !activeContact) return;
         input.value = '';
         document.getElementById('chat-charcount').textContent = '0/67';
+        var payload = { dest: activeContact, text: text };
+        if (_issMode) payload.custom_path = _ISS_PATH;
         await fetch('/chat/send', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ dest: activeContact, text: text })
+            body: JSON.stringify(payload)
         });
         loadHistory(activeContact);
     }
@@ -4461,9 +8076,10 @@ def index():
         if (!el) return;
         _map = L.map('aprs-map', { zoomControl: true, attributionControl: false })
                 .setView([46.5, 2.5], 6);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            maxZoom: 18, attribution: '© OSM'
-        }).addTo(_map);
+        var _tileUrl = (typeof _isDayMode === 'function' && _isDayMode())
+            ? 'https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png'
+            : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+        L.tileLayer(_tileUrl, { maxZoom: 20, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributeurs' }).addTo(_map);
         // Rejouer les stations déjà en mémoire
         Object.keys(_mapMarkers).forEach(function(cs) {
             var m = _mapMarkers[cs];
@@ -4631,10 +8247,26 @@ def index():
         }
 
         popup += '<div style="font-size:9px;color:#475569;margin-top:5px">'
-               + new Date().toLocaleTimeString('fr-FR') + '</div></div>';
+               + new Date().toLocaleTimeString('fr-FR') + '</div>'
+               + '<div id="mapcity-' + cs.replace(/[^a-z0-9]/gi,'_') + '" style="font-size:10px;color:#7dd3fc;margin-top:3px;font-style:italic">🏙️ …</div>'
+               + '</div>';
+
+        // Injection asynchrone de la ville dans le popup Leaflet
+        (function(_cs, _lat, _lon) {
+            fetch('/nearest_city?lat=' + _lat + '&lon=' + _lon)
+                .then(function(r){ return r.ok ? r.json() : null; })
+                .then(function(d) {
+                    var el = document.getElementById('mapcity-' + _cs.replace(/[^a-z0-9]/gi,'_'));
+                    if (el && d && d.display) {
+                        el.innerHTML = '🏙️ <b style="color:#bae6fd">' + esc(d.display) + '</b>';
+                        el.style.fontStyle = 'normal';
+                    } else if (el) { el.style.display = 'none'; }
+                })
+                .catch(function(){ var el=document.getElementById('mapcity-' + _cs.replace(/[^a-z0-9]/gi,'_')); if(el) el.style.display='none'; });
+        })(cs, lat, lon);
 
         if (!_mapMarkers[cs]) {
-            _mapMarkers[cs] = { lat: lat, lon: lon, emoji: emoji, popup: popup, distKm: _distKm, trail: [] };
+            _mapMarkers[cs] = { lat: lat, lon: lon, emoji: emoji, popup: popup, distKm: _distKm, trail: [], city: null };
             _mapCount++;
             document.getElementById('map-station-count').textContent = _mapCount;
             var badge = document.getElementById('map-badge');
@@ -4642,12 +8274,19 @@ def index():
             badge.classList.remove('hidden');
             var _mmb = document.getElementById('mnav-map-badge');
             if (_mmb) { _mmb.textContent = _mapCount; _mmb.style.display = 'block'; }
+            // Première apparition : fetcher la ville
+            _fetchCityForStation(cs, lat, lon);
         } else {
+            var _prevLat = _mapMarkers[cs].lat, _prevLon = _mapMarkers[cs].lon;
             _mapMarkers[cs].lat    = lat;
             _mapMarkers[cs].lon    = lon;
             _mapMarkers[cs].emoji  = emoji;
             _mapMarkers[cs].popup  = popup;
             _mapMarkers[cs].distKm = _distKm;
+            // Re-fetcher la ville si la position a significativement changé (~10 km)
+            if (!_mapMarkers[cs].city || Math.abs(_prevLat - lat) > 0.1 || Math.abs(_prevLon - lon) > 0.1) {
+                _fetchCityForStation(cs, lat, lon);
+            }
         }
 
         // ── Accumulation de traînée pour stations mobiles ─────────────────
@@ -4667,7 +8306,31 @@ def index():
             var _addPt = true;
             if (_tr.length) {
                 var _lp = _tr[_tr.length-1];
-                if (Math.abs(_lp[0]-lat) < 1e-5 && Math.abs(_lp[1]-lon) < 1e-5) _addPt = false;
+                // Filtre doublon exact (< ~1 m)
+                if (Math.abs(_lp[0]-lat) < 1e-5 && Math.abs(_lp[1]-lon) < 1e-5) {
+                    _addPt = false;
+                } else {
+                    // Filtre tracés parasites : distance entre deux points consécutifs
+                    var _dLat = (lat - _lp[0]) * Math.PI / 180;
+                    var _dLon = (lon - _lp[1]) * Math.PI / 180;
+                    var _a = Math.sin(_dLat/2)*Math.sin(_dLat/2)
+                           + Math.cos(_lp[0]*Math.PI/180)*Math.cos(lat*Math.PI/180)
+                           * Math.sin(_dLon/2)*Math.sin(_dLon/2);
+                    var _distKmSeg = 6371 * 2 * Math.atan2(Math.sqrt(_a), Math.sqrt(1-_a));
+                    // Rejeter si > 300 km entre deux positions (saut géographique impossible)
+                    if (_distKmSeg > 300) {
+                        _addPt = false;
+                        // Rompre la traînée pour ne pas relier l'ancienne position
+                        _mapMarkers[cs].trail = [];
+                        _tr = _mapMarkers[cs].trail;
+                    } else if (_lp[2]) {
+                        // Filtre vitesse implicite : > 500 km/h → parasite
+                        var _dtSeg = _now_s - _lp[2];
+                        if (_dtSeg > 0 && (_distKmSeg / (_dtSeg / 3600)) > 500) {
+                            _addPt = false;
+                        }
+                    }
+                }
             }
             if (_addPt) {
                 var _spd = (e.speed_kmh !== undefined) ? e.speed_kmh : -1;
@@ -4694,15 +8357,45 @@ def index():
             if (m.distKm !== null && m.distKm !== undefined) {
                 var dStr = m.distKm < 10 ? m.distKm.toFixed(1) : Math.round(m.distKm);
                 var dCol = m.distKm < 50 ? '#34d399' : m.distKm < 150 ? '#fbbf24' : '#fb923c';
-                distHtml = '<span style="font-size:9px;font-family:monospace;color:' + dCol + ';margin-left:auto;white-space:nowrap">📏 ' + dStr + ' km</span>';
+                distHtml = '<span style="font-size:9px;font-family:monospace;color:' + dCol + ';white-space:nowrap">📏 ' + dStr + ' km</span>';
             }
-            return '<div class="px-4 py-3 flex items-center gap-3 cursor-pointer hover:bg-slate-800/40 transition-colors"'
+            var cityId   = 'stlist-city-' + cs.replace(/[^a-z0-9]/gi,'_');
+            var cityHtml = m.city
+                ? '<span style="font-size:9px;color:#7dd3fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px" title="' + esc(m.city) + '">🏙️ ' + esc(m.city) + '</span>'
+                : '<span id="' + cityId + '" style="font-size:9px;color:#475569;font-style:italic">🏙️…</span>';
+            return '<div class="px-4 py-2.5 flex flex-col gap-0.5 cursor-pointer hover:bg-slate-800/40 transition-colors"'
                  + ' data-cs="' + cs + '" onclick="(function(el){var c=el.dataset.cs;if(_map&&_mapMarkers[c]&&_mapMarkers[c].marker){_map.setView(_mapMarkers[c].marker.getLatLng(),13);_mapMarkers[c].marker.openPopup();switchTab(&quot;map&quot;)}})(this)">'
-                 + '<span style="font-size:18px;line-height:1">' + (m.emoji||'📍') + '</span>'
+                 + '<div style="display:flex;align-items:center;gap:6px">'
+                 + '<span style="font-size:18px;line-height:1;flex-shrink:0">' + (m.emoji||'📍') + '</span>'
                  + qrzLink(cs, {cls:'font-mono font-bold text-white text-xs hover:text-blue-300 transition-colors'})
-                 + distHtml
+                 + '<span style="margin-left:auto;display:flex;gap:4px;align-items:center">' + distHtml + '</span>'
+                 + '</div>'
+                 + '<div style="padding-left:26px">' + cityHtml + '</div>'
                  + '</div>';
         }).join('');
+    }
+
+    // Fetch city for a station and store it in _mapMarkers, then refresh list
+    function _fetchCityForStation(cs, lat, lon) {
+        if (!cs || !lat || !lon) return;
+        fetch('/nearest_city?lat=' + lat + '&lon=' + lon)
+            .then(function(r){ return r.ok ? r.json() : null; })
+            .then(function(d) {
+                if (!d || !d.display) return;
+                if (_mapMarkers[cs]) {
+                    _mapMarkers[cs].city = d.display;
+                    // Mise à jour directe du span si la liste est déjà rendue
+                    var el = document.getElementById('stlist-city-' + cs.replace(/[^a-z0-9]/gi,'_'));
+                    if (el) {
+                        el.removeAttribute('id');
+                        el.style.color = '#7dd3fc';
+                        el.style.fontStyle = 'normal';
+                        el.title = d.display;
+                        el.innerHTML = '🏙️ ' + esc(d.display);
+                    }
+                }
+            })
+            .catch(function(){});
     }
 
     function mapClearAll() {
@@ -4717,10 +8410,110 @@ def index():
         _updateStationList();
     }
 
+    function mapClearTrails() {
+        // Efface les traînées côté frontend (polylines + tableau trail)
+        if (_map) {
+            Object.values(_mapMarkers).forEach(function(m) {
+                if (m.trailLayers) {
+                    m.trailLayers.forEach(function(l){ _map.removeLayer(l); });
+                    m.trailLayers = [];
+                }
+                if (m.polyline) { _map.removeLayer(m.polyline); m.polyline = null; }
+                m.trail = [];
+            });
+        }
+        // Efface les traînées côté serveur (stations_positions)
+        fetch('/map_clear_trails', { method: 'DELETE' })
+            .then(function(r){ return r.json(); })
+            .then(function(d){ console.log('[MAP] Traînées effacées :', d.cleared, 'station(s)'); })
+            .catch(function(e){ console.error('[MAP] Erreur effacement traînées :', e); });
+    }
+
     function mapFitAll() {
         if (!_map) return;
         var pts = Object.values(_mapMarkers).filter(function(m){return m.lat;}).map(function(m){return [m.lat,m.lon];});
         if (pts.length) _map.fitBounds(pts, {padding:[40,40]});
+    }
+
+    // ── Recherche périmétrique ─────────────────────────────────────────────
+    var _nearbyCircle = null;
+
+    function openNearbyModal() {
+        var m = document.getElementById('nearby-modal');
+        m.style.display = 'flex';
+        setTimeout(runNearbySearch, 80);
+    }
+    function closeNearbyModal() {
+        document.getElementById('nearby-modal').style.display = 'none';
+        if (_nearbyCircle && _map) { _map.removeLayer(_nearbyCircle); _nearbyCircle = null; }
+    }
+    function runNearbySearch() {
+        var radius  = parseInt(document.getElementById('nearby-radius').value, 10);
+        var age     = parseInt(document.getElementById('nearby-age').value, 10);
+        var mobOnly = document.getElementById('nearby-mobile-only').checked ? 1 : 0;
+        var resDiv  = document.getElementById('nearby-results');
+        resDiv.innerHTML = '<span style="color:#94a3b8;font-size:12px;">Recherche en cours…</span>';
+
+        // Construire URL : si la station locale a des coordonnées, pas besoin de lat/lon
+        var url = '/nearby_stations?radius_km=' + radius + '&max_age_s=' + age + '&mobile_only=' + mobOnly;
+        if (typeof _stationLat !== 'undefined' && _stationLat !== null) {
+            url += '&lat=' + _stationLat + '&lon=' + _stationLon;
+        }
+
+        fetch(url)
+            .then(function(r){ return r.json(); })
+            .then(function(data) {
+                if (data.error) {
+                    resDiv.innerHTML = '<span style="color:#f87171;font-size:12px;">⚠ ' + data.error + '</span>';
+                    return;
+                }
+                // Cercle sur la carte
+                if (_nearbyCircle && _map) _map.removeLayer(_nearbyCircle);
+                if (_map && data.center) {
+                    _nearbyCircle = L.circle([data.center.lat, data.center.lon], {
+                        radius: data.radius_km * 1000,
+                        color: '#38bdf8', weight: 1.5,
+                        fillColor: '#38bdf8', fillOpacity: 0.04,
+                        dashArray: '6,4'
+                    }).addTo(_map);
+                }
+                // Tableau résultats
+                if (!data.stations || data.stations.length === 0) {
+                    resDiv.innerHTML = '<span style="color:#64748b;font-size:12px;">Aucune station dans ce périmètre.</span>';
+                    return;
+                }
+                var html = '<table style="width:100%;border-collapse:collapse;font-size:11px;">'
+                    + '<thead><tr style="color:#64748b;border-bottom:1px solid #1e293b;">'
+                    + '<th style="text-align:left;padding:4px 6px;">Indicatif</th>'
+                    + '<th style="text-align:right;padding:4px 6px;">Dist.</th>'
+                    + '<th style="text-align:right;padding:4px 6px;">Âge</th>'
+                    + '<th style="text-align:center;padding:4px 6px;">Type</th>'
+                    + '</tr></thead><tbody>';
+                data.stations.forEach(function(s) {
+                    var ageStr = s.age_s < 60 ? s.age_s + ' s'
+                               : s.age_s < 3600 ? Math.round(s.age_s/60) + ' min'
+                               : Math.round(s.age_s/3600) + ' h';
+                    var typBadge = s.mobile
+                        ? '<span style="color:#fb923c;">🚗 mobile</span>'
+                        : '<span style="color:#94a3b8;">📍 fixe</span>';
+                    var rowColor = s.distance_km < 10 ? '#dcfce7' : s.distance_km < 50 ? '#e2e8f0' : '#94a3b8';
+                    html += '<tr style="border-bottom:1px solid #1e293b;cursor:pointer;" '
+                          + 'onclick="closeNearbyModal();if(_map)_map.setView([' + s.lat + ',' + s.lon + '],12);"'
+                          + 'title="Cliquer pour centrer la carte">'
+                          + '<td style="padding:4px 6px;color:' + rowColor + ';font-weight:700;font-family:monospace;">' + s.callsign + '</td>'
+                          + '<td style="text-align:right;padding:4px 6px;color:#38bdf8;">' + s.distance_km.toFixed(1) + ' km</td>'
+                          + '<td style="text-align:right;padding:4px 6px;color:#64748b;">' + ageStr + '</td>'
+                          + '<td style="text-align:center;padding:4px 6px;">' + typBadge + '</td>'
+                          + '</tr>';
+                });
+                html += '</tbody></table>';
+                html += '<div style="margin-top:8px;font-size:10px;color:#475569;">'
+                      + data.count + ' station(s) dans un rayon de ' + data.radius_km + ' km</div>';
+                resDiv.innerHTML = html;
+            })
+            .catch(function(e) {
+                resDiv.innerHTML = '<span style="color:#f87171;font-size:12px;">Erreur réseau : ' + e + '</span>';
+            });
     }
 
     // Écouter les frames APRS reçues via SSE
@@ -5100,8 +8893,206 @@ def index():
     setInterval(_updateIgateStatus, 5000);
     _updateIgateStatus();
 
+    function _updateDigiStatus() {
+        fetch('/digi/status').then(function(r){ return r.json(); }).then(function(d) {
+            var dot  = document.getElementById('digi-dot');
+            var txt  = document.getElementById('digi-count-txt');
+            var big  = document.getElementById('digi-count-big');
+            if (!dot) return;
+            if (d.enabled) {
+                dot.style.background = '#10b981';
+                dot.style.boxShadow  = '0 0 6px #10b98188';
+            } else {
+                dot.style.background = '#334155';
+                dot.style.boxShadow  = 'none';
+            }
+            var n = d.digipeated || 0;
+            if (txt) txt.textContent = n + ' retransmission' + (n !== 1 ? 's' : '');
+            if (big) big.textContent = n;
+        }).catch(function(){});
+    }
+    setInterval(_updateDigiStatus, 5000);
+    _updateDigiStatus();
+
     // ── Répéteur toggle warning ────────────────────────────────────────────
     var _repToggle  = document.getElementById('repeater_toggle');
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  MÉTÉO  —  Open-Meteo (gratuit, sans clé API)  WEATHER_PATCH_APPLIED
+    // ══════════════════════════════════════════════════════════════════════
+    (function() {
+        // ── Correspondance code WMO → emoji + description FR ──────────────
+        var WMO = {
+            0:  ['☀️',  'Ciel dégagé'],
+            1:  ['🌤️',  'Peu nuageux'],
+            2:  ['⛅',   'Partiellement nuageux'],
+            3:  ['☁️',  'Couvert'],
+            45: ['🌫️',  'Brouillard'],
+            48: ['🌫️',  'Brouillard givrant'],
+            51: ['🌦️',  'Bruine légère'],
+            53: ['🌦️',  'Bruine modérée'],
+            55: ['🌧️',  'Bruine forte'],
+            61: ['🌧️',  'Pluie légère'],
+            63: ['🌧️',  'Pluie modérée'],
+            65: ['🌧️',  'Pluie forte'],
+            71: ['🌨️',  'Neige légère'],
+            73: ['🌨️',  'Neige modérée'],
+            75: ['❄️',   'Neige forte'],
+            77: ['🌨️',  'Grains de neige'],
+            80: ['🌦️',  'Averses légères'],
+            81: ['🌧️',  'Averses modérées'],
+            82: ['⛈️',   'Averses violentes'],
+            85: ['🌨️',  'Averses de neige'],
+            86: ['❄️',   'Averses de neige fortes'],
+            95: ['⛈️',   'Orage'],
+            96: ['⛈️',   'Orage avec grêle'],
+            99: ['⛈️',   'Orage avec forte grêle'],
+        };
+
+        var _wxLat = null, _wxLon = null, _wxTimer = null;
+        var _WX_CACHE_KEY = 'aprs_wx_cache';
+        var _WX_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
+        function _wxIcon(code)  { return (WMO[code] || ['🌡️', 'Inconnu'])[0]; }
+        function _wxDesc(code)  { return (WMO[code] || ['🌡️', 'Inconnu'])[1]; }
+
+        function _wxDirArrow(deg) {
+            var dirs = ['↑N','↗NE','→E','↘SE','↓S','↙SO','←O','↖NO'];
+            return dirs[Math.round(deg / 45) % 8] || '';
+        }
+
+        function _wxRender(d) {
+            var c = d.current;
+            var code = c.weather_code;
+            document.getElementById('wx-icon').textContent  = _wxIcon(code);
+            document.getElementById('wx-temp').textContent  = Math.round(c.temperature_2m) + '°C';
+            document.getElementById('wx-feels').textContent = '(res. ' + Math.round(c.apparent_temperature) + '°C)';
+            document.getElementById('wx-desc').textContent  = _wxDesc(code);
+            var wSpd = Math.round(c.wind_speed_10m);
+            var wDir = _wxDirArrow(c.wind_direction_10m);
+            document.getElementById('wx-wind').textContent  = '💨 ' + wSpd + ' km/h ' + wDir;
+            document.getElementById('wx-hum').textContent   = '💧 ' + Math.round(c.relative_humidity_2m) + '%';
+            var precip = c.precipitation !== undefined ? c.precipitation : 0;
+            var rainEl = document.getElementById('wx-rain');
+            if (precip > 0) {
+                rainEl.textContent = '🌧 ' + precip.toFixed(1) + ' mm';
+                rainEl.style.display = '';
+                document.getElementById('wx-sep4').style.display = '';
+            } else {
+                rainEl.style.display = 'none';
+                document.getElementById('wx-sep4').style.display = 'none';
+            }
+            // Visibilité des séparateurs
+            ['wx-sep1','wx-sep2','wx-sep3'].forEach(function(id){ document.getElementById(id).style.display = ''; });
+        }
+
+        function _wxFetch(lat, lon) {
+            // Proxy local pour eviter le CORS (fetch direct bloque par le navigateur)
+            var url = '/wx_proxy'
+                    + '?lat=' + lat.toFixed(4)
+                    + '&lon=' + lon.toFixed(4);
+
+            fetch(url)
+                .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+                .then(function(data) {
+                    _wxRender(data);
+                    // Stocker en cache localStorage avec timestamp
+                    try {
+                        localStorage.setItem(_WX_CACHE_KEY, JSON.stringify({
+                            t: Date.now(), lat: lat, lon: lon, data: data
+                        }));
+                    } catch(e) {}
+                })
+                .catch(function(err) {
+                    console.warn('[WX] Open-Meteo erreur :', err);
+                    document.getElementById('wx-icon').textContent = '⚠️';
+                    document.getElementById('wx-temp').textContent = 'Météo indisponible';
+                });
+        }
+
+        function _wxStart(lat, lon, locName) {
+            _wxLat = lat; _wxLon = lon;
+            document.getElementById('wx-loc-name').textContent = locName || (lat.toFixed(2) + ',' + lon.toFixed(2));
+            _wxFetch(lat, lon);
+            // Rafraîchissement auto toutes les 15 min
+            if (_wxTimer) clearInterval(_wxTimer);
+            _wxTimer = setInterval(function(){ _wxFetch(_wxLat, _wxLon); }, _WX_CACHE_TTL);
+        }
+
+        window._wxRefresh = function() {
+            if (_wxLat !== null) _wxFetch(_wxLat, _wxLon);
+        };
+
+        // ── Initialisation : attendre que la config station soit chargée ──
+        function _wxInit() {
+            // 1) Essayer le cache localStorage en premier
+            try {
+                var cached = JSON.parse(localStorage.getItem(_WX_CACHE_KEY) || 'null');
+                if (cached && (Date.now() - cached.t) < _WX_CACHE_TTL) {
+                    _wxRender(cached.data);
+                    _wxLat = cached.lat; _wxLon = cached.lon;
+                    document.getElementById('wx-loc-name').textContent =
+                        cached.lat.toFixed(2) + ',' + cached.lon.toFixed(2);
+                }
+            } catch(e) {}
+
+            // 2) Attendre que _stationLat/_stationLon soient définis (config station)
+            var _tries = 0;
+            var _poll = setInterval(function() {
+                _tries++;
+                if (typeof _stationLat !== 'undefined' && _stationLat !== null
+                    && typeof _stationLon !== 'undefined' && _stationLon !== null) {
+                    clearInterval(_poll);
+                    _wxStart(_stationLat, _stationLon, 'Station');
+                } else if (_tries > 30) {
+                    clearInterval(_poll);
+                    // Fallback : géolocalisation navigateur
+                    if (navigator.geolocation) {
+                        navigator.geolocation.getCurrentPosition(function(pos) {
+                            _wxStart(pos.coords.latitude, pos.coords.longitude, 'Vous');
+                        }, function() {
+                            document.getElementById('wx-icon').textContent = '📡';
+                            document.getElementById('wx-temp').textContent = '';
+                            document.getElementById('wx-desc').textContent = 'Position inconnue';
+                        });
+                    }
+                }
+            }, 200);
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            // Lancer après un court délai pour laisser la config se charger
+            setTimeout(_wxInit, 600);
+        });
+
+        // ── Mode jour : adapter les couleurs du widget ────────────────────
+        document.addEventListener('DOMContentLoaded', function() {
+            var bar = document.getElementById('weather-bar');
+            if (!bar) return;
+            function _wxTheme() {
+                if (document.body.classList.contains('day-mode')) {
+                    bar.style.background    = 'rgba(236,239,245,0.72)';
+                    bar.style.borderColor   = 'rgba(196,202,218,0.5)';
+                    bar.style.color         = '#3a4460';
+                    ['wx-sep1','wx-sep2','wx-sep3','wx-sep4'].forEach(function(id){
+                        var el = document.getElementById(id);
+                        if (el) el.style.color = '#c8cedc';
+                    });
+                } else {
+                    bar.style.background    = 'rgba(15,23,42,0.45)';
+                    bar.style.borderColor   = 'rgba(148,163,184,0.08)';
+                    bar.style.color         = '#94a3b8';
+                    ['wx-sep1','wx-sep2','wx-sep3','wx-sep4'].forEach(function(id){
+                        var el = document.getElementById(id);
+                        if (el) el.style.color = '#334155';
+                    });
+                }
+            }
+            _wxTheme();
+            // Observer les changements de thème
+            new MutationObserver(_wxTheme).observe(document.body, {attributeFilter: ['class']});
+        });
+    })();
 
 </script>
 
@@ -5146,14 +9137,17 @@ def index():
                 <h3 class="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">📻 Onglet TRAFIC</h3>
                 <div class="space-y-2 text-slate-400">
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📨 Envoyer message</span><span>Saisir indicatif destinataire + texte → <span class="text-white">ENVOYER</span>. Confirmation ACK attendue automatiquement. Les messages sont sauvegardés dans <span class="text-white font-mono">chat.json</span> et restaurés au redémarrage.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Beacon ISS</span><span>Émet une balise positionnée via ARISS (QRG 145.825 MHz).</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Beacon ISS</span><span>Émet une balise positionnée via ARISS (QRG 145.825 MHz). Le bouton est <span class="text-amber-400 font-bold">désactivé automatiquement</span> hors passage ISS et s'active (fond indigo animé) uniquement quand l'ISS est en vue au-dessus de l'horizon.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📡 Beacon Station</span><span>Émet la balise de position standard avec commentaire et locator.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🌦️ Beacon Météo</span><span>Récupère les données Open-Meteo (lat/lon depuis locator) et émet un beacon APRS météo format <span class="text-emerald-400">@…_</span>.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📶 Beacon Propagation</span><span>Interroge NOAA SWPC (SFI, Kp, A-index) et émet un beacon statut <span class="text-emerald-400">&gt;SFI:NNN K:N.N HF:xxx VHF:yyy {NOAA}</span>.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛰️ Envoyer statut</span><span>Émet le statut texte libre configuré dans les réglages (trame <span class="text-emerald-400">&gt;</span>).</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Console</span><span>Affiche les trames TX/RX. Clic sur un indicatif → fiche QRZ.com. Clic sur les coordonnées → onglet MAP.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Passages ISS</span><span>Widget compact affichant les 5 prochains passages de l'ISS avec durée et <span class="text-white font-mono">élév. max</span>. Calculés localement par SGP4 — fonctionne hors-ligne. Mis à jour toutes les 15 min. Le bouton <span class="text-white font-bold">↺ MAJ</span> force un recalcul.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Console</span><span>Affiche les trames TX/RX. Clic sur un indicatif → fiche QRZ.com. Clic sur les coordonnées → onglet MAP. Le flux SSE se reconnecte automatiquement avec backoff exponentiel (3 s → 30 s) en cas de coupure réseau ou redémarrage du serveur.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Passages ISS (jour)</span><span>Widget affichant <b>tous les passages de l'ISS du jour courant</b> (minuit → minuit heure locale) avec durée et <span class="text-white font-mono">élév. max</span>. Calculés localement par SGP4 — fonctionne hors-ligne. Passages passés grisés, prochain surligné. Mis à jour toutes les 15 min.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Passages ISS 24 h</span><span>Bloc dans l'onglet <span class="text-white font-bold">🛸 ISS</span> affichant tous les passages sur <b>24 heures glissantes</b> (depuis maintenant). Badge <span class="text-white font-mono">J+0 / J+1</span>, barre d'élévation, étiquette "demain" si le passage est le lendemain. Mis à jour toutes les 15 min ou sur demande.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Beacons auto</span><span>Chaque type de balise possède son propre intervalle configurable dans <span class="text-white font-bold">⚙️ RÉGLAGES</span>. Le temps restant avant la prochaine émission est affiché en temps réel.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📋 Log système</span><span>Journal rotatif <span class="text-white font-mono">aprs.log</span> : rotation quotidienne à minuit avec compression gzip automatique. Archives nommées <span class="text-white font-mono">aprs.log.YYYY-MM-DD.gz</span>, rétention 2 jours. Consultable via <span class="text-white font-mono">GET /log?n=200&amp;level=ERROR</span>. Liste des archives via <span class="text-white font-mono">GET /log/archives</span>.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🔒 Arrêt propre</span><span>À l'arrêt (SIGTERM / Ctrl-C / <span class="text-white font-mono">systemctl stop</span>), le serveur sauvegarde automatiquement <span class="text-white font-mono">chat.json</span> et <span class="text-white font-mono">config.json</span>, ferme les sockets KISS TX et iGate, et attend la fin du thread RX avant de quitter.</span></div>
                 </div>
             </section>
 
@@ -5170,6 +9164,7 @@ def index():
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Commentaire</span><span>Texte libre joint à la balise station (max 43 caractères).</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Alertes ISS</span><span>Active la bannière + bip avant chaque passage de l'ISS. Nécessite un locator ou des coordonnées valides.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🌩️ Alertes Météo</span><span>Définir les seuils (température, vent, rafales, pluie, pression, codes WMO) et l'intervalle de vérification.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📶 Alertes Propagation</span><span>Surveille en continu SFI (NOAA SWPC) et les mesures X-ray GOES. Bannière + bip triple sur tempête géomagnétique (Kp ≥ seuil), dégradation HF (SFI bas) ou éruption solaire (classe C1–X5). Cooldown 1 h par type. Bouton <span class="text-white font-bold">🔬 Tester</span> pour forcer une vérification immédiate.</span></div>
                 </div>
             </section>
 
@@ -5193,10 +9188,10 @@ def index():
             <section>
                 <h3 class="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">💬 QSO · 🗺️ MAP · 🛰️ ISS · 📊 STATS</h3>
                 <div class="space-y-2 text-slate-400">
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">💬 QSO</span><span>Messagerie APRS par indicatif. Historique persistant dans <span class="text-white font-mono">chat.json</span>. Badge rouge = messages non lus. ACK automatique.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🗺️ MAP</span><span>Carte temps réel des stations APRS. Clic marqueur → infos PHG, vitesse, altitude. Widget <span class="text-violet-400">📶 Propagation VHF</span> NOAA en direct.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">💬 QSO</span><span>Messagerie APRS par indicatif. Historique persistant dans <span class="text-white font-mono">chat.json</span>. Badge rouge = messages non lus. ACK automatique. Bouton 🗑️ dans le header chat pour supprimer une conversation.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🗺️ MAP</span><span>Carte temps réel des stations APRS en français (OSM France). Clic marqueur → infos PHG, vitesse, altitude. Widget <span class="text-violet-400">📶 Propagation VHF</span> NOAA en direct.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛰️ ISS</span><span>Suivi temps réel via OrbTrack. APRS : <span class="text-emerald-400">145.825 MHz</span> · Voice FM : <span class="text-emerald-400">437.800 MHz</span>.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📊 STATS</span><span>Histogramme 24 h (TX / RX / IS) et top 10 des stations les plus actives. Persisté dans <span class="text-white font-mono">stats.json</span>.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-24 shrink-0">📊 STATS</span><span>Histogramme 24 h (TX / RX / IS) et top 10 des stations les plus actives. Persisté dans <span class="text-white font-mono">stats.json</span>.</span></div>
                 </div>
             </section>
 
@@ -5219,8 +9214,10 @@ def index():
                 <h3 class="text-[10px] font-black text-violet-400 uppercase tracking-widest mb-3 flex items-center gap-2">🛸 Alerte Passage ISS</h3>
                 <div class="space-y-2 text-slate-400">
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Activation</span><span>Dans <span class="text-white font-bold">⚙️ RÉGLAGES</span>, section «&nbsp;Alertes Passage ISS&nbsp;». Activer le toggle et définir l'avance souhaitée.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Moteur SGP4</span><span>Calcul orbital embarqué (stdlib pure, sans dépendance externe). Précision ±30 s / ±5 km — suffisant pour planifier l'écoute APRS 145.825 MHz.</span></div>
-                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">TLE ISS</span><span>Rechargé toutes les 6 h depuis CelesTrak (3 sources en cascade). En cas de coupure réseau, le cache disque <span class="text-white font-mono">.iss_tle_cache</span> prend le relais jusqu'à 7 jours.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Moteur SGP4</span><span>Calcul orbital embarqué (stdlib pure, sans dépendance externe). Précision ±30 s / ±5 km — suffisant pour planifier l'écoute APRS 145.825 MHz. Fonctionne entièrement hors-ligne.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">TLE ISS</span><span>Rechargé toutes les 6 h depuis CelesTrak (3 sources en cascade). En cas de coupure réseau, le cache disque <span class="text-white font-mono">.iss_tle_cache</span> prend le relais jusqu'à <span class="text-white font-bold">7 jours</span> sans Internet.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Élévation maximale</span><span>Chaque passage affiche l'élévation max (en degrés) calculée par SGP4. Au-dessus de <span class="text-white">10°</span> la réception APRS est généralement possible. Au-dessus de <span class="text-emerald-400">40°</span> la liaison est excellente.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Panel EN VUE</span><span>Affiché <b>en haut de la sidebar Trafic</b> dès que l'ISS passe au-dessus de l'horizon local. Montre élévation courante, azimut AOS/LOS, compas SVG et compte à rebours LOS. Se masque automatiquement hors passage.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Bannière &amp; bip</span><span>Bannière violette + triple bip 440/660/880 Hz X minutes avant le passage. Cliquer pour fermer.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Voyant header</span><span>Point <span class="text-violet-400 font-bold">● ISS</span> animé sous «&nbsp;Station Active&nbsp;» quand l'alerte est activée.</span></div>
                 </div>
@@ -5238,7 +9235,18 @@ def index():
                 </div>
             </section>
 
-            <div class="text-center pt-2 pb-1 text-slate-700 text-[9px]">Py-APRS v2.4 · Direwolf + SGP4 · 73 de F1RIQ</div>
+            <hr class="border-slate-700/60"/>
+
+            <section>
+                <h3 class="text-[10px] font-black text-yellow-400 uppercase tracking-widest mb-3 flex items-center gap-2">🔑 Sécurité</h3>
+                <div class="space-y-2 text-slate-400">
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Mot de passe</span><span>Modifiable depuis <span class="text-white font-bold">⚙️ RÉGLAGES</span>, section <span class="text-white font-bold">🔑 Changer le mot de passe</span> en bas de page. Saisir l'ancien mot de passe, le nouveau (min 6 caractères) et confirmer.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Stockage</span><span>Les mots de passe sont stockés sous forme de hash <span class="text-white font-mono">werkzeug</span> (PBKDF2-SHA256) dans <span class="text-white font-mono">users.json</span>. Jamais en clair.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Session</span><span>Session Flask signée côté serveur. Déconnexion via <span class="text-white font-mono">/logout</span>.</span></div>
+                </div>
+            </section>
+
+            <div class="text-center pt-2 pb-1 text-slate-700 text-[9px]">Py-APRS v2.6.8 · Direwolf + SGP4 · 73 de F1RIQ</div>
         </div><!-- /aide-panel-guide -->
 
         <!-- ── CHANGELOG ── -->
@@ -5264,6 +9272,12 @@ def index():
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">iGate : compteur bloqué</span><span>Vérifier que l'iGate est activé, le passcode correct (bouton <span class="text-white font-bold">🔑 Calculer</span>) et que Direwolf reçoit bien des trames.</span></div>
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Beacon TX échoue</span><span>Socket KISS Direwolf non disponible. Vérifier que Direwolf écoute sur le port KISS TCP (défaut 8001). Redémarrer le serveur Python si nécessaire.</span></div>
                     <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Lien QRZ absent</span><span>L'indicatif <span class="text-white font-mono">BEACON</span>, <span class="text-white font-mono">APRS</span> ou <span class="text-white font-mono">?</span> n'ont pas de lien QRZ (adresses non callsign). Seuls les vrais indicatifs sont cliquables.</span></div>
+                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">config.json perdu à l'arrêt</span><span>Utiliser <span class="text-white font-mono">systemctl stop</span> ou <span class="text-white">Ctrl-C</span> plutôt que <span class="text-white font-mono">kill -9</span>. Le graceful shutdown sauvegarde automatiquement la config. Un <span class="text-white font-mono">kill -9</span> contourne cette protection.</span></div>
+                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">TLE ISS périmés</span><span>Si le cache <span class="text-white font-mono">.iss_tle_cache</span> a plus de 7 jours et qu'Internet est indisponible, les prédictions sont désactivées. Supprimer le fichier cache puis rétablir la connexion pour forcer un rechargement.</span></div>
+                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Élévation ISS = 0°</span><span>Peut indiquer des TLE trop anciens ou une position de station invalide. Vérifier le locator dans les réglages et forcer la mise à jour TLE via le bouton <span class="text-white font-bold">↺ MAJ</span>.</span></div>
+                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Moniteur bloqué / figé</span><span>Le flux SSE se reconnecte seul après coupure. Si le moniteur reste figé, recharger la page (F5). Si le problème persiste, vérifier que le serveur Python tourne (<span class="text-white font-mono">systemctl status aprs</span>) et que le port n'est pas saturé.</span></div>
+                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Log aprs.log trop volumineux</span><span>La rotation est automatique (quotidienne, gzip, 30 jours). Vérifier l'espace disque avec <span class="text-white font-mono">ls -lh aprs.log*</span>. Les archives <span class="text-white font-mono">.gz</span> peuvent être supprimées manuellement sans impact sur le fonctionnement.</span></div>
+                    <div class="flex gap-3"><span class="text-red-400/70 w-48 shrink-0">Mot de passe oublié</span><span>Éditer manuellement <span class="text-white font-mono">users.json</span> et remplacer le hash par un nouveau généré avec <span class="text-white font-mono">python3 -c "from werkzeug.security import generate_password_hash as g; print(g('nouveaumdp'))"</span>.</span></div>
                 </div>
             </section>
         </div><!-- /aide-panel-debug -->
@@ -5280,7 +9294,7 @@ def index():
                         <div class="text-white font-black text-sm tracking-tight">F1RIQ</div>
                         <div class="text-slate-400 text-[10px] mt-0.5">Radioamateur · Développeur · France · JN07II</div>
                         <div class="text-slate-600 text-[9px] mt-0.5"><a href="mailto:tonyf1riq@gmail.com" class="hover:text-blue-400 transition-colors">tonyf1riq@gmail.com</a></div>
-                        <div class="text-slate-600 text-[9px] mt-1">Py-APRS · version 2.4 · Backend Dire Wolf + SGP4</div>
+                        <div class="text-slate-600 text-[9px] mt-1">Py-APRS · version 2.6.7 · Backend Dire Wolf + SGP4</div>
                     </div>
                     <div class="ml-auto text-right shrink-0">
                         <div class="text-emerald-400 text-[10px] font-bold">✅ Logiciel libre</div>
@@ -5376,8 +9390,47 @@ function _aideLoadChangelog() {
 
 // Fermer avec Escape
 document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape') document.getElementById('modal-aide').classList.add('hidden');
+    if (e.key === 'Escape') {
+        document.getElementById('modal-aide').classList.add('hidden');
+    }
 });
+</script>
+
+<script>
+async function submitPasswd() {
+    var cur  = document.getElementById('passwd-current').value;
+    var nw   = document.getElementById('passwd-new').value;
+    var conf = document.getElementById('passwd-confirm').value;
+    var msg  = document.getElementById('passwd-msg');
+    function showMsg(text, ok) {
+        msg.textContent = text;
+        msg.className = 'text-xs rounded-xl px-4 py-2.5 font-bold '
+            + (ok ? 'bg-emerald-900/50 text-emerald-400 border border-emerald-700/50'
+                  : 'bg-red-900/50 text-red-400 border border-red-700/50');
+        msg.classList.remove('hidden');
+    }
+    if (!cur || !nw || !conf) return showMsg('Tous les champs sont requis.', false);
+    if (nw.length < 6)        return showMsg('Minimum 6 caractères.', false);
+    if (nw !== conf)          return showMsg('Les mots de passe ne correspondent pas.', false);
+    try {
+        var r = await fetch('/auth/change_password', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({current_password: cur, new_password: nw})
+        });
+        var d = await r.json();
+        if (r.ok && d.ok) {
+            showMsg('✅ Mot de passe modifié avec succès !', true);
+            document.getElementById('passwd-current').value = '';
+            document.getElementById('passwd-new').value     = '';
+            document.getElementById('passwd-confirm').value = '';
+        } else {
+            showMsg('❌ ' + (d.error || 'Mot de passe actuel incorrect.'), false);
+        }
+    } catch(e) {
+        showMsg('❌ Erreur réseau.', false);
+    }
+}
 </script>
 
 <script>
@@ -5465,15 +9518,234 @@ if ('serviceWorker' in navigator && typeof Notification !== 'undefined' && Notif
     _registerSW().catch(function(){});
 }
 
-<script>
-// ══════════════════════════════════════════════════════════════════════════════
 </script>
+
+<script>
+/* ── SSTV RX UI — stub (récepteur intégré supprimé) ── */
+(function(){
+    window.sstvStart  = function() {};
+    window.sstvStop   = function() {};
+    window.sstvMonUpdate = function() {};
+    window.sstvRefreshGallery = function() {};
+    window.sstvMonClear = function() {};
+    window._sstvSelectMonitor = function() {};
+    window._sstvRefreshDevices = function() {};
+})();
+/* ── fin SSTV RX UI ── */
+</script>
+
+<style>
+@keyframes issLivePulse {
+    0%,100% { border-color:rgba(124,58,237,.35); box-shadow:0 10px 40px rgba(124,58,237,.18); }
+    50%      { border-color:rgba(167,139,250,.70); box-shadow:0 10px 40px rgba(167,139,250,.35); }
+}
+</style>
+
+<script>
+/* ── ISS LIVE TRACKING (onglet Trafic) ────────────────────────────────────── */
+(function(){
+    var _issLiveTimer = null;
+    var _issPassEnd   = 0;
+    var _issCountdown = null;
+
+    var _AZ_CARDS = [
+        "N","NNE","NE","ENE","E","ESE","SE","SSE",
+        "S","SSO","SO","OSO","O","ONO","NO","NNO"
+    ];
+
+    function _azCard(az) {
+        return _AZ_CARDS[Math.round(az / 22.5) % 16];
+    }
+
+    function _elToRadius(el) {
+        return Math.max(0, 34 * (1 - el / 90));
+    }
+
+    function _updateCompass(az, el) {
+        var ptr = document.getElementById("iss-compass-ptr");
+        if (ptr) ptr.setAttribute("transform", "rotate(" + az + ",45,45)");
+        var r  = _elToRadius(Math.max(0, Math.min(90, el)));
+        var cx = 45 + r * Math.cos((az - 90) * Math.PI / 180);
+        var cy = 45 + r * Math.sin((az - 90) * Math.PI / 180);
+        var dot = document.getElementById("iss-compass-dot");
+        var ico = document.getElementById("iss-compass-icon");
+        if (dot) { dot.setAttribute("cx", cx.toFixed(1)); dot.setAttribute("cy", cy.toFixed(1)); }
+        if (ico) { ico.setAttribute("x",  cx.toFixed(1)); ico.setAttribute("y", (cy+3).toFixed(1)); }
+    }
+
+    function _setText(id, val) {
+        var el = document.getElementById(id);
+        if (el) el.textContent = val;
+    }
+
+    function _startCountdown(endTs) {
+        _issPassEnd = endTs;
+        if (_issCountdown) clearInterval(_issCountdown);
+        _issCountdown = setInterval(function() {
+            var rem = Math.round(_issPassEnd - Date.now() / 1000);
+            if (rem <= 0) {
+                clearInterval(_issCountdown);
+                _setText("iss-live-timer", "00:00");
+            } else {
+                var m = Math.floor(rem / 60);
+                var s = rem % 60;
+                _setText("iss-live-timer",
+                    (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s);
+            }
+        }, 1000);
+    }
+
+    function _poll() {
+        fetch("/iss_now").then(function(r){ return r.json(); }).then(function(d) {
+            var panel = document.getElementById("iss-live-panel");
+            if (!panel) return;
+
+            var issBtn = document.getElementById("btn-iss-send");
+            if (d.error || !d.visible) {
+                panel.style.display = "none";
+                if (_issCountdown) { clearInterval(_issCountdown); _issCountdown = null; }
+                if (issBtn) {
+                    issBtn.disabled = false;
+                    issBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-slate-800/50 border border-slate-700 text-slate-400 hover:bg-indigo-700/40 hover:border-indigo-500 hover:text-indigo-200";
+                    issBtn.title = "ISS hors de portée — le beacon sera refusé";
+                }
+                return;
+            }
+
+            panel.style.display = "";
+            if (issBtn) {
+                issBtn.disabled = false;
+                issBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-indigo-700/60 hover:bg-indigo-600/80 border border-indigo-500 text-white animate-pulse cursor-pointer";
+                issBtn.title = "ISS EN VUE — Envoyer un beacon ARISS maintenant !";
+            }
+
+            // Élévation
+            var elColor = d.elevation > 45 ? "#a78bfa" : d.elevation > 20 ? "#c4b5fd" : "#7c3aed";
+            var elEl = document.getElementById("iss-live-el");
+            if (elEl) { elEl.textContent = d.elevation.toFixed(1) + "°"; elEl.style.color = elColor; }
+
+            // Azimut
+            _setText("iss-live-az",      d.azimuth.toFixed(1) + "°");
+            _setText("iss-live-az-card", _azCard(d.azimuth));
+
+            // Boussole
+            _updateCompass(d.azimuth, d.elevation);
+
+            // Télémétrie
+            _setText("iss-live-dist", d.slant_km.toFixed(0) + " km");
+            _setText("iss-live-alt",  d.alt_km.toFixed(0)   + " km");
+
+            // Doppler
+            var dop   = d.doppler_hz;
+            var dopEl = document.getElementById("iss-live-doppler");
+            if (dopEl) {
+                dopEl.textContent = (dop > 0 ? "+" : "") + dop + " Hz";
+                dopEl.style.color = dop < -200 ? "#34d399" : dop > 200 ? "#f87171" : "#fbbf24";
+            }
+            _setText("iss-live-freq", d.freq_rx_khz.toFixed(3) + " kHz");
+
+            // Compte à rebours fin de passage
+            if (!_issCountdown || _issPassEnd <= Date.now() / 1000) {
+                fetch("/iss_passes?range=24h")
+                    .then(function(r2){ return r2.json(); })
+                    .then(function(d2) {
+                        var now = Date.now() / 1000;
+                        var cur = (d2.passes || []).find(function(p) {
+                            return p.risetime <= now && (p.risetime + p.duration) >= now;
+                        });
+                        if (cur) _startCountdown(cur.risetime + cur.duration);
+                    }).catch(function(){});
+            }
+        }).catch(function(){});
+    }
+
+    function _startPoll() {
+        if (_issLiveTimer) return;
+        _poll();
+        _issLiveTimer = setInterval(_poll, 2000);
+    }
+    function _stopPoll() {
+        if (_issLiveTimer) { clearInterval(_issLiveTimer); _issLiveTimer = null; }
+    }
+
+    // Terminal est l'onglet par défaut
+    _startPoll();
+
+    document.addEventListener("aprs-switchtab", function(e) {
+        if (e.detail === "terminal") {
+            _startPoll();
+            // Sur mobile : remonter la console pour afficher les dernieres trames
+            if (window.innerWidth < 768) {
+                var con = document.getElementById("console");
+                if (con) setTimeout(function(){ con.scrollTop = 0; }, 80);
+            }
+        } else {
+            _stopPoll();
+        }
+    });
+})();
+/* ── fin ISS Live Tracking ── */
+</script>
+
+
+<!-- Modale recherche perimetrique -->
+<div id="nearby-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.7);align-items:center;justify-content:center;">
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:16px;padding:24px;width:min(520px,96vw);max-height:80vh;display:flex;flex-direction:column;gap:12px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-size:15px;font-weight:700;color:#e2e8f0;">📡 Stations a proximite</span>
+      <button onclick="closeNearbyModal()" style="color:#64748b;font-size:18px;line-height:1;background:none;border:none;cursor:pointer;">✕</button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+      <label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:6px;">
+        Rayon
+        <input type="range" id="nearby-radius" min="5" max="500" step="5" value="50"
+               oninput="document.getElementById('nearby-radius-val').textContent=this.value"
+               style="width:120px;">
+        <span id="nearby-radius-val" style="color:#60a5fa;font-weight:700;min-width:32px;">50</span> km
+      </label>
+      <label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:6px;">
+        Age max
+        <select id="nearby-age" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:2px 6px;font-size:11px;">
+          <option value="900">15 min</option>
+          <option value="3600" selected>1 h</option>
+          <option value="10800">3 h</option>
+          <option value="86400">24 h</option>
+        </select>
+      </label>
+      <label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:6px;">
+        <input type="checkbox" id="nearby-mobile-only"> Mobiles uniquement
+      </label>
+      <button onclick="runNearbySearch()"
+              style="background:#1d4ed8;color:#fff;border:none;border-radius:8px;padding:5px 14px;font-size:11px;font-weight:700;cursor:pointer;">
+        🔍 Chercher
+      </button>
+    </div>
+    <div id="nearby-results" style="overflow-y:auto;flex:1;min-height:80px;">
+      <span style="color:#475569;font-size:12px;">Definissez un rayon puis cliquez sur Chercher.</span>
+    </div>
+  </div>
+</div>
 
 </body>
 </html>
-"""
+""").replace("__CFG_JSON__", _cfg_json).replace("__CALLSIGN_JSON__", _callsign_json)
 
 # ── Routes Flask ─────────────────────────────────────────────────────────────
+
+@app.route('/sw.js')
+def sw_js():
+    """Service Worker minimal pour les notifications push."""
+    js = (
+        "self.addEventListener('push',function(e){"
+        "var d=e.data?e.data.json():{};e.waitUntil("
+        "self.registration.showNotification(d.title||'Py-APRS',"
+        "{body:d.body||'',tag:d.tag||'aprs',renotify:true}));});"
+        "self.addEventListener('notificationclick',function(e){"
+        "e.notification.close();});"
+    )
+    from flask import Response as _R
+    return _R(js, mimetype='application/javascript',
+              headers={'Service-Worker-Allowed': '/'})
 
 @app.route('/send_beacon', methods=['POST'])
 @_login_required
@@ -5511,6 +9783,26 @@ def send_status():
         return jsonify({"status": "queued"})
     except Exception:
         return jsonify({"status": "busy"}), 429
+
+@app.route('/send_text1', methods=['POST'])
+@_login_required
+def send_text1():
+    """Émet immédiatement le texte libre 1 comme beacon APRS."""
+    text = (config_manager.data.get("beacon_text1") or "").strip()
+    if not text:
+        return jsonify({"error": "Texte libre 1 non configuré"}), 400
+    _do_send_text1()
+    return jsonify({"status": "queued"})
+
+@app.route('/send_text2', methods=['POST'])
+@_login_required
+def send_text2():
+    """Émet immédiatement le texte libre 2 comme beacon APRS."""
+    text = (config_manager.data.get("beacon_text2") or "").strip()
+    if not text:
+        return jsonify({"error": "Texte libre 2 non configuré"}), 400
+    _do_send_text2()
+    return jsonify({"status": "queued"})
 
 @app.route('/send_raw', methods=['POST'])
 @_login_required
@@ -5680,8 +9972,8 @@ def tx_diag():
         # Encode AX.25 minimal
         def _ec(call, last=False):
             p = call.upper().split("-")
-            b = p[0].ljust(6)
-            ssid = int(p[1]) if len(p)>1 else 0
+            b = p[0].strip('*').ljust(6)
+            ssid = int(p[1].strip('*')) if len(p)>1 else 0
             r = [(ord(c)<<1) for c in b]
             r.append((ssid<<1)|(0x61 if last else 0x60))
             return r
@@ -5769,24 +10061,89 @@ def igate_status():
         "frames_is_rx": igate_client.frames_is_rx,
     })
 
+@app.route('/digi/status')
+@_login_required
+def digi_status():
+    return jsonify({
+        "enabled":    config_manager.data.get("digi_enabled", False),
+        "aliases":    config_manager.data.get("digi_aliases", []),
+        "digi_limit": config_manager.data.get("digi_limit", 2),
+        "digipeated": digipeater.frames_digipeated,
+    })
+
+@app.route('/log')
+@_login_required
+def view_log():
+    """Retourne les N dernières lignes du log courant (JSON)."""
+    lines_req = min(int(request.args.get("n", 200)), 2000)
+    level_filter = request.args.get("level", "").upper()   # DEBUG INFO WARNING ERROR
+    try:
+        with open(_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        # Filtrer par niveau si demandé
+        if level_filter:
+            all_lines = [l for l in all_lines if ("  " + level_filter + " ") in l
+                         or ("  " + level_filter + "  ") in l]
+        tail = all_lines[-lines_req:]
+        return jsonify({"lines": [l.rstrip() for l in tail], "total": len(all_lines)})
+    except FileNotFoundError:
+        return jsonify({"lines": [], "total": 0})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/log/archives')
+@_login_required
+def list_log_archives():
+    """Liste les archives de log disponibles."""
+    import glob
+    pattern = _LOG_FILE + ".*.gz"
+    files = sorted(glob.glob(pattern), reverse=True)
+    result = []
+    for f in files:
+        try:
+            size = os.path.getsize(f)
+            result.append({"name": os.path.basename(f), "size": size,
+                           "size_human": f"{size/1024:.1f} Ko"})
+        except OSError:
+            pass
+    return jsonify({"archives": result, "log_file": _LOG_FILE,
+                    "backup_count": _LOG_BACKUP_COUNT})
+
+
 @app.route('/rx_stream')
 @_login_required
 def rx_stream():
     def generate():
-        local_q = queue.Queue()
-        listeners.append(local_q)
+        local_q = queue.Queue(maxsize=200)
+        with _listeners_lock:
+            listeners.append(local_q)
         try:
             yield "data: {\"type\":\"connected\"}\n\n"
+            consecutive_errors = 0
             while True:
                 try:
-                    frame = local_q.get(timeout=20)
+                    frame = local_q.get(timeout=8)  # PATCH_MONITOR_FREEZE_267
                     yield "data: %s\n\n" % json.dumps(frame, ensure_ascii=False)
+                    consecutive_errors = 0
                 except queue.Empty:
+                    # Keepalive — si le client est mort, GeneratorExit sera levé
                     yield ": keepalive\n\n"
+                except GeneratorExit:
+                    break
+                except Exception:
+                    consecutive_errors += 1
+                    if consecutive_errors > 3:
+                        break
         finally:
-            listeners.remove(local_q)
+            with _listeners_lock:
+                try:
+                    listeners.remove(local_q)
+                except ValueError:
+                    pass
     return Response(generate(), mimetype='text/event-stream',
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 # ── Routes Chat ───────────────────────────────────────────────────────────────
 
@@ -5812,18 +10169,34 @@ def chat_send():
     msgno   = chat_manager._next_msgno()
     payload = ":" + dest.ljust(9) + ":" + text + "{" + msgno + "}"
     chat_manager.add_outgoing(dest, text, msgno)
+    # custom_path : permet de forcer ARISS pour les messages ISS
+    custom_path = (data.get('custom_path') or '').strip() or None
     try:
         tx_queue.put_nowait({
-            "dest": "APRS", "payload": payload, "path": None,
+            "dest": "APRS", "payload": payload, "path": custom_path,
             "aprs_type": "Message", "extra": {"comment": text, "msg_dest": dest}
         })
         return jsonify({"status": "queued", "msgno": msgno})
     except queue.Full:
         return jsonify({"status": "busy"}), 429
 
+@app.route('/chat/delete/<callsign>', methods=['DELETE'])
+@_login_required
+def chat_delete(callsign):
+    """Supprime toute la conversation avec un indicatif."""
+    cs = callsign.upper().strip()
+    if not cs:
+        return jsonify({"error": "indicatif requis"}), 400
+    deleted = chat_manager.delete_conversation(cs)
+    if deleted:
+        logger.info("[QSO] Conversation supprimée : %s", cs)
+        return jsonify({"ok": True, "callsign": cs})
+    return jsonify({"ok": False, "error": "conversation introuvable"}), 404
+
 # ── Broadcaster SSE ───────────────────────────────────────────────────────────
 
 listeners = []
+_listeners_lock = threading.Lock()
 
 stations_positions      = {}
 stations_positions_lock = threading.Lock()
@@ -6073,6 +10446,151 @@ igate_client = APRSISClient()
 import socket   # utilisé par APRSISClient
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── DIGIPEATER APRS ───────────────────────────────────────────────────────────
+# Retransmet les trames RF reçues en décrémentant WIDEn-N et en gérant les
+# alias RELAY / WIDE1. Conforme au standard APRS 1.0.1.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class APRSDigipeater:
+    """Moteur digipeater APRS logiciel.
+
+    Règles appliquées :
+      1. Trame ignorée si émise par notre propre station.
+      2. Trame ignorée si déjà retransmise (marqueur *) par nous.
+      3. Alias simples (RELAY, WIDE1, WIDE1-1) : retransmettre + marquer *.
+      4. WIDEn-N (n>0, N>0) :
+           - Si N==1 → transmettre + marquer chemin* (nœud terminal).
+           - Si N>1  → transmettre + décrémenter vers WIDEn-(N-1) + marquer *.
+      5. Filtre anti-dupli : hash SHA1 (src+dest+payload) dans fenêtre 30 s.
+      6. Limite max_hops configurable (digi_limit).
+    """
+
+    _WIDE_RE = re.compile(r'^WIDE(\d)-(\d)$', re.IGNORECASE)
+    DEDUP_WINDOW = 30   # secondes
+
+    def __init__(self):
+        self.frames_digipeated = 0
+        self._dedup: dict = {}           # hash → timestamp
+        self._lock  = threading.Lock()
+
+    # ── Vérification/déduplication ────────────────────────────────────────
+    def _is_duplicate(self, frame) -> bool:
+        # Clé = src + dest + payload (tronqué à 80 car pour ignorer les timestamps variables)
+        raw  = "%s>%s:%s" % (frame.get("src",""), frame.get("dest",""), frame.get("payload","")[:80])
+        h    = hashlib.sha1(raw.encode()).hexdigest()[:16]
+        now  = time.time()
+        with self._lock:
+            expired = [k for k, t in self._dedup.items() if now - t > self.DEDUP_WINDOW]
+            for k in expired:
+                del self._dedup[k]
+            if h in self._dedup:
+                return True
+            self._dedup[h] = now
+            return False
+
+    # ── Traitement d'une trame ────────────────────────────────────────────
+    def process(self, frame: dict) -> bool:
+        """Analyse la trame et la retransmet si nécessaire.
+        Retourne True si une retransmission a été effectuée."""
+        cfg      = config_manager.data
+        if not cfg.get("digi_enabled", False):
+            return False
+
+        my_call  = cfg.get("callsign", "N0CALL").upper().strip()
+        aliases  = [a.upper().strip() for a in cfg.get("digi_aliases", [])]
+        max_hops = int(cfg.get("digi_limit", 2))
+        src      = frame.get("src", "").upper().strip()
+        payload  = frame.get("payload", "")
+        path_str = frame.get("path", "")
+
+        # 1. Ne pas digi ses propres trames
+        if src.split('-')[0] == my_call.split('-')[0]:
+            return False
+
+        # 2. Ignorer les trames venant d'IS
+        if frame.get("_source") == "IS":
+            return False
+
+        # 3. Anti-dupli
+        if self._is_duplicate(frame):
+            logger.debug("[DIGI] Duplicat ignoré : %s", src)
+            return False
+
+        # Analyser le path
+        path_parts = [p.strip() for p in path_str.split(',') if p.strip()] if path_str else []
+        new_path   = list(path_parts)
+        retransmit = False
+
+        for i, hop in enumerate(path_parts):
+            hop_clean = hop.rstrip('*').upper()
+
+            # Déjà traité par nous (notre call dans le path avec *) — comparer la base sans SSID
+            if hop_clean.split('-')[0] == my_call.split('-')[0] and hop.endswith('*'):
+                return False
+
+            # --- Alias simple (RELAY, WIDE1, WIDE1-1, etc.) ---
+            if hop_clean in aliases and not hop.endswith('*'):
+                new_path[i] = my_call + '*'
+                retransmit = True
+                break
+
+            # --- WIDEn-N standard ---
+            m = self._WIDE_RE.match(hop_clean)
+            if m and not hop.endswith('*'):
+                n = int(m.group(1))
+                N = int(m.group(2))
+                if N == 0:
+                    continue   # épuisé
+                if n > max_hops:
+                    logger.debug("[DIGI] WIDEn-N ignoré (n=%d > limit=%d) : %s", n, max_hops, src)
+                    continue
+                if N == 1:
+                    # Dernier saut : marquer comme consommé (N → 0)
+                    # Le bit H (has-been-repeated) est porté par notre call inséré, pas le hop WIDE
+                    new_path[i] = "WIDE%d-0" % n
+                else:
+                    # Décrémenter N sans marquer * (le hop suivant n'est pas encore traité)
+                    new_path[i] = "WIDE%d-%d" % (n, N - 1)
+                # Insérer notre call juste avant pour traçabilité (chemin parcouru)
+                new_path.insert(i, my_call + '*')
+                retransmit = True
+                break
+
+        if not retransmit:
+            return False
+
+        # Reconstruire le path : supprimer les WIDEn-0* épuisés (inutiles dans la trame AX.25)
+        clean_path   = [h for h in new_path if not re.match(r'^WIDE\d-0\*?$', h, re.IGNORECASE)]
+        new_path_str = ','.join(clean_path)
+        dest         = frame.get("dest", "APRS")
+        tnc2_payload = payload
+
+        logger.info("[DIGI] Retransmission : %s>%s,%s (%d car.)",
+                    src, dest, new_path_str, len(tnc2_payload))
+
+        try:
+            tx_queue.put_nowait({
+                "dest":      dest,
+                "src":       src,          # préserver l'indicatif original
+                "payload":   tnc2_payload,
+                "path":      new_path_str,
+                "aprs_type": "Digi",
+                "extra":     {"comment": "[DIGI] %s" % src}
+            })
+            with self._lock:
+                self.frames_digipeated += 1
+            return True
+        except queue.Full:
+            logger.warning("[DIGI] TX queue pleine, trame abandonnée")
+            return False
+
+
+digipeater = APRSDigipeater()  # PATCH_DIGI_APPLIED_v1
+
+
+
+
 # Historique circulaire des trames reçues (hors rx_level), survivant au F5
 RX_HISTORY_MAX  = 500
 rx_history      = collections.deque(maxlen=RX_HISTORY_MAX)
@@ -6241,12 +10759,20 @@ def _rx_broadcaster():
                     frame.get("src")):
                 igate_client.gate_rf_to_is(frame)
 
+            # ── Digipeater : retransmission RF ────────────────────────────
+            if (frame.get("type") not in ("tx_event", "rx_level") and
+                    frame.get("_source") != "IS" and
+                    frame.get("src")):
+                digipeater.process(frame)
+
             # Assigner _fid AVANT de broadcaster (SSE + historique ont le même id)
             if frame.get("type") != "rx_level" and "_fid" not in frame:
                 frame["_fid"] = next(_fid_counter)
 
             # Historique (hors rx_level)
             if frame.get("type") != "rx_level":
+                if "_ts" not in frame:
+                    frame["_ts"] = time.time()
                 with rx_history_lock:
                     rx_history.append(frame)
                 # Marquer l'activité pour la jauge
@@ -6284,15 +10810,33 @@ def _rx_broadcaster():
                     }
 
             # ── Carnet de trafic : enregistrement automatique ─────────────
-# Diffuser à tous les clients SSE
+# Diffuser à tous les clients SSE — retrait automatique des listeners morts
+# PATCH_MONITOR_FREEZE_267
+            _MAX_LISTENER_ERRORS = 5
+            _dead = []
             for q in list(listeners):
                 try:
                     q.put_nowait(frame)
+                    # Réinitialiser le compteur d'erreurs si l'envoi réussit
+                    if hasattr(q, '_err_count'):
+                        q._err_count = 0
                 except queue.Full:
-                    pass
+                    q._err_count = getattr(q, '_err_count', 0) + 1
+                    if q._err_count >= _MAX_LISTENER_ERRORS:
+                        _dead.append(q)
+                        logger.warning("[SSE] Listener mort retiré (queue pleine x%d)", _MAX_LISTENER_ERRORS)
+            if _dead:
+                with _listeners_lock:
+                    for _dq in _dead:
+                        try:
+                            listeners.remove(_dq)
+                        except ValueError:
+                            pass
 
         except queue.Empty:
             pass
+        except Exception as _bcast_exc:
+            logger.error("[BROADCASTER] Exception inattendue (trame ignorée) : %s", _bcast_exc, exc_info=True)
 
         # Jauge rx_level périodique (toutes les 500 ms) basée sur activité KISS
         now = time.time()
@@ -6346,7 +10890,9 @@ def _tx_worker():
             _broadcast_tx(job)
             if modem is None:
                 raise RuntimeError("Modem non initialise")
-            modem.send_packet(job["dest"], job["payload"], job.get("path"))
+            # Pour les retransmissions digi, préserver le src original
+            _job_src = job.get("src") if job.get("aprs_type") == "Digi" else None
+            modem.send_packet(job["dest"], job["payload"], job.get("path"), custom_src=_job_src)
         except Exception as e:
             APRSModem.tx_last_error = str(e)
             logger.error("[TX WORKER] ERREUR : %s", e)
@@ -6383,6 +10929,8 @@ def _make_beacon_worker(btype):
             "iss":         _do_send_iss_beacon,
             "meteo":       _do_send_weather,
             "propagation": _do_send_propagation,
+            "text1":       _do_send_text1,
+            "text2":       _do_send_text2,
         }
         logger.info("[BCN] Thread démarré pour type=%s", btype)
         while True:
@@ -6426,7 +10974,7 @@ def _make_beacon_worker(btype):
 
 def _beacon_scheduler():
     """Superviseur : lance/relance les threads de balise selon la config."""
-    _ALL_TYPES = ["station", "iss", "meteo", "propagation"]
+    _ALL_TYPES = ["station", "iss", "meteo", "propagation", "text1", "text2"]
     while True:
         with _beacon_workers_lock:
             for btype in _ALL_TYPES:
@@ -6863,6 +11411,36 @@ def _do_send_weather():
     except queue.Full:
         return {"error": "File TX pleine"}
 
+def _do_send_text1():
+    """Émet un beacon texte libre APRS depuis beacon_text1."""
+    text = (config_manager.data.get("beacon_text1") or "").strip()
+    if not text:
+        logger.warning("[TX] Texte libre 1 vide — beacon annulé")
+        return
+    payload = ">" + text
+    try:
+        tx_queue.put_nowait({"dest": "APRS", "payload": payload, "path": None,
+                             "aprs_type": "Texte1", "extra": {"comment": text}})
+        logger.debug("[TX] Texte1 queued : %s", payload[:60])
+    except Exception as e:
+        logger.error("[TX] Texte1 queue erreur : %s", e)
+
+
+def _do_send_text2():
+    """Émet un beacon texte libre APRS depuis beacon_text2."""
+    text = (config_manager.data.get("beacon_text2") or "").strip()
+    if not text:
+        logger.warning("[TX] Texte libre 2 vide — beacon annulé")
+        return
+    payload = ">" + text
+    try:
+        tx_queue.put_nowait({"dest": "APRS", "payload": payload, "path": None,
+                             "aprs_type": "Texte2", "extra": {"comment": text}})
+        logger.debug("[TX] Texte2 queued : %s", payload[:60])
+    except Exception as e:
+        logger.error("[TX] Texte2 queue erreur : %s", e)
+
+
 threading.Thread(target=_beacon_scheduler, daemon=True, name="beacon-supervisor").start()
 
 
@@ -6884,6 +11462,24 @@ def known_callsigns():
         cs_list = sorted(stations_positions.keys())
     return jsonify(cs_list)
 
+@app.route('/map_clear_trails', methods=['DELETE', 'POST'])
+@_login_required
+def map_clear_trails():
+    """Supprime les traînées (breadcrumbs) de toutes les stations mobiles.
+    Les marqueurs et positions de base sont conservés ; seul l'historique
+    de trajets (champ 'trail') est effacé.
+    """
+    count = 0
+    with stations_positions_lock:
+        for pos in stations_positions.values():
+            if pos.get('trail'):
+                pos['trail'] = []
+                count += 1
+    logger.info("[MAP] Traînées mobiles effacées (%d station(s))", count)
+    import json as _j
+    return _j.dumps({"status": "ok", "cleared": count}), 200, {'Content-Type': 'application/json'}
+
+
 @app.route('/map_trails')
 @_login_required
 def map_trails():
@@ -6904,11 +11500,106 @@ def map_trails():
     import json as _j
     return _j.dumps(data), 200, {'Content-Type': 'application/json'}
 
+@app.route('/nearby_stations')
+@_login_required
+def nearby_stations():
+    """Recherche périmétrique des stations APRS connues.
+    Paramètres GET :
+      lat        float  — latitude centre (défaut : station locale)
+      lon        float  — longitude centre (défaut : station locale)
+      radius_km  float  — rayon en km (défaut : 50, max : 1000)
+      max_age_s  float  — âge max des données en secondes (défaut : 3600)
+      mobile_only int   — 1 = mobiles uniquement (défaut : 0)
+    Réponse JSON :
+      { "center": {lat, lon}, "radius_km": float, "stations": [
+          { "callsign", "lat", "lon", "distance_km", "mobile", "age_s", "ts" }, …
+        ] }
+    """
+    import math as _m
+    import json as _j
+    import time as _t
+
+    # ── Coordonnées centre ──────────────────────────────────────────────────
+    def _safe_float(v):
+        try: return float(v)
+        except: return None
+
+    lat = _safe_float(request.args.get("lat"))
+    lon = _safe_float(request.args.get("lon"))
+    if lat is None or lon is None:
+        # Fallback 1 : coordonnées manuelles
+        lat = _safe_float(config_manager.data.get("lat_manual"))
+        lon = _safe_float(config_manager.data.get("lon_manual"))
+    if lat is None or lon is None:
+        # Fallback 2 : dériver depuis le locator Maidenhead
+        mh = (config_manager.data.get("maidenhead") or "").strip().upper()
+        if len(mh) >= 4:
+            try:
+                _lo = (ord(mh[0]) - 65) * 20 - 180
+                _la = (ord(mh[1]) - 65) * 10 - 90
+                _lo += int(mh[2]) * 2
+                _la += int(mh[3]) * 1
+                if len(mh) >= 6:
+                    _lo += (ord(mh[4]) - 65) * (2/24) + (1/24)
+                    _la += (ord(mh[5]) - 65) * (1/24) + (0.5/24)
+                else:
+                    _lo += 1.0; _la += 0.5
+                lat, lon = _la, _lo
+            except Exception:
+                pass
+    if lat is None or lon is None:
+        return _j.dumps({"error": "lat/lon non disponibles — configurez les coordonnées ou le locator Maidenhead dans les réglages"}),\
+               400, {'Content-Type': 'application/json'}
+
+    radius_km   = min(float(request.args.get("radius_km",  50)),  1000.0)
+    max_age_s   = float(request.args.get("max_age_s",  3600))
+    mobile_only = request.args.get("mobile_only", "0") == "1"
+
+    # ── Haversine (Python) ──────────────────────────────────────────────────
+    def _hav_km(la1, lo1, la2, lo2):
+        R = 6371.0
+        dlat = _m.radians(la2 - la1)
+        dlon = _m.radians(lo2 - lo1)
+        a = _m.sin(dlat/2)**2 + _m.cos(_m.radians(la1))*_m.cos(_m.radians(la2))*_m.sin(dlon/2)**2
+        return R * 2 * _m.asin(_m.sqrt(a))
+
+    now = _t.time()
+    result = []
+
+    with stations_positions_lock:
+        snapshot = dict(stations_positions)
+
+    for cs, pos in snapshot.items():
+        if pos.get("lat") is None: continue
+        age = now - pos.get("ts", 0)
+        if age > max_age_s: continue
+        if mobile_only and not pos.get("mobile"): continue
+        dist = _hav_km(lat, lon, pos["lat"], pos["lon"])
+        if dist > radius_km: continue
+        result.append({
+            "callsign":    cs,
+            "lat":         round(pos["lat"], 6),
+            "lon":         round(pos["lon"], 6),
+            "distance_km": round(dist, 2),
+            "mobile":      bool(pos.get("mobile")),
+            "age_s":       round(age),
+            "ts":          pos.get("ts", 0),
+        })
+
+    result.sort(key=lambda x: x["distance_km"])
+    return _j.dumps({
+        "center":     {"lat": round(lat, 6), "lon": round(lon, 6)},
+        "radius_km":  radius_km,
+        "count":      len(result),
+        "stations":   result,
+    }), 200, {'Content-Type': 'application/json'}
+
+
 @app.route('/beacon_status')
 @_login_required
 def beacon_status():
     """Retourne l'état de chaque type de balise : interval + next_in."""
-    _ALL_TYPES = ["station", "iss", "meteo", "propagation"]
+    _ALL_TYPES = ["station", "iss", "meteo", "propagation", "text1", "text2"]
     schedules = config_manager.data.get('beacon_schedules', {})
     result = {}
     with _beacon_workers_lock:
@@ -6932,6 +11623,84 @@ def vhf_propagation():
     data = _fetch_solar_indices()
     data["source"] = "NOAA SWPC via serveur"
     return _j.dumps(data), 200, {'Content-Type': 'application/json'}
+
+
+# ── Ville la plus proche (reverse geocoding Nominatim) ────────────────────────
+# Cache LRU serveur : clé = (lat arrondi à 2 déc., lon arrondi à 2 déc.)
+#   → ~1 km de précision, évite les requêtes répétées pour la même zone
+_nearest_city_cache = {}
+_nearest_city_lock  = threading.Lock()
+_NOMINATIM_UA       = "APRS-Station/1.0 (local)"  # User-Agent requis par Nominatim
+
+def _fetch_nearest_city(lat: float, lon: float) -> dict:
+    """Interroge Nominatim et retourne un dict {city, state, country, display}."""
+    import urllib.request as _ur
+    import urllib.parse   as _up
+    url = ("https://nominatim.openstreetmap.org/reverse"
+           "?format=jsonv2&lat={lat}&lon={lon}&zoom=10&accept-language=fr"
+           ).format(lat=round(lat, 5), lon=round(lon, 5))
+    req = _ur.Request(url, headers={"User-Agent": _NOMINATIM_UA})
+    try:
+        with _ur.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        addr = data.get("address", {})
+        city = (addr.get("city")
+                or addr.get("town")
+                or addr.get("village")
+                or addr.get("municipality")
+                or addr.get("county")
+                or "")
+        state   = addr.get("state", "")
+        country = addr.get("country_code", "").upper()
+        display = city
+        if state and city and state.lower() != city.lower():
+            display = city + ", " + state
+        if country and country != "FR":
+            display = display + " (" + country + ")" if display else country
+        return {"city": city, "state": state, "country": country,
+                "display": display or data.get("display_name", "")[:60]}
+    except Exception as exc:
+        logger.debug("[CITY] Nominatim erreur : %s", exc)
+        return {"city": "", "state": "", "country": "", "display": ""}
+
+@app.route('/nearest_city')
+@_login_required
+def nearest_city():
+    """Retourne la ville la plus proche d'une position GPS.
+    Paramètres GET : lat, lon
+    Réponse JSON   : {city, state, country, display, cached}
+    Utilise un cache interne pour limiter les appels à Nominatim (1 rq/s max).
+    """
+    try:
+        lat = float(request.args.get("lat", ""))
+        lon = float(request.args.get("lon", ""))
+    except (TypeError, ValueError):
+        return json.dumps({"error": "lat/lon invalides"}), 400, \
+               {'Content-Type': 'application/json'}
+
+    # Clé de cache : grille ~1 km (2 décimales ≈ 1.1 km)
+    cache_key = (round(lat, 2), round(lon, 2))
+    with _nearest_city_lock:
+        if cache_key in _nearest_city_cache:
+            result = dict(_nearest_city_cache[cache_key])
+            result["cached"] = True
+            return json.dumps(result), 200, {'Content-Type': 'application/json'}
+
+    result = _fetch_nearest_city(lat, lon)
+    result["cached"] = False
+
+    with _nearest_city_lock:
+        # Limiter la taille du cache à 2000 entrées (~ 2 Mo max)
+        if len(_nearest_city_cache) >= 2000:
+            try:
+                del _nearest_city_cache[next(iter(_nearest_city_cache))]
+            except StopIteration:
+                pass
+        _nearest_city_cache[cache_key] = {k: v for k, v in result.items()
+                                          if k != "cached"}
+
+    logger.debug("[CITY] %s → %s", cache_key, result.get("display"))
+    return json.dumps(result), 200, {'Content-Type': 'application/json'}
 
 
 # ── Alerte propagation VHF ────────────────────────────────────────────────────
@@ -7033,6 +11802,11 @@ def vhf_alert_check():
 
 STATS_FILE = 'stats.json'
 
+# ── Cache mémoire météo (évite les appels HTTP bloquants répétés) ─────────────
+_WX_PROXY_CACHE    = {}   # clé "lat,lon" → {body, ts}
+_WX_HISTORY_CACHE  = {}   # clé "lat,lon" → {payload, ts}
+_WX_CACHE_TTL_S    = 600  # 10 minutes
+
 @app.route('/stats/load')
 @_login_required
 def stats_load():
@@ -7045,6 +11819,93 @@ def stats_load():
         except Exception:
             pass
     return _j.dumps({}), 200, {'Content-Type': 'application/json'}
+
+
+@app.route('/stats/reset_mesh', methods=['POST'])
+@_login_required
+def stats_reset_mesh():
+    """Efface uniquement les cases de maillage dans stats.json."""
+    import json as _j
+    try:
+        data = {}
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, 'r') as f:
+                data = _j.load(f)
+        data.pop('gridCells', None)
+        with open(STATS_FILE, 'w') as f:
+            _j.dump(data, f)
+        return _j.dumps({'ok': True}), 200, {'Content-Type': 'application/json'}
+    except Exception as e:
+        return _j.dumps({'ok': False, 'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+
+@app.route('/stats/reset_dx', methods=['POST'])
+@_login_required
+def stats_reset_dx():
+    """Efface le meilleur DX et la distance maximale dans stats.json."""
+    import json as _j
+    try:
+        data = {}
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, 'r') as f:
+                data = _j.load(f)
+        data.pop('bestDx',    None)
+        data.pop('maxDistKm', None)
+        with open(STATS_FILE, 'w') as f:
+            _j.dump(data, f)
+        return _j.dumps({'ok': True}), 200, {'Content-Type': 'application/json'}
+    except Exception as e:
+        return _j.dumps({'ok': False, 'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+
+@app.route('/wx_proxy')
+@_login_required
+def wx_proxy():
+    """Proxy météo avec cache 10 min pour eviter les appels bloquants repetes."""
+    import json as _j
+    import urllib.request as _ur
+    import ssl as _ssl
+    lat = request.args.get("lat", "")
+    lon = request.args.get("lon", "")
+    if not lat or not lon:
+        return _j.dumps({"error": "lat/lon manquants"}), 400, {"Content-Type": "application/json"}
+    _ck = lat + "," + lon
+    _cached = _WX_PROXY_CACHE.get(_ck)
+    if _cached and (time.time() - _cached["ts"]) < _WX_CACHE_TTL_S:
+        return _cached["body"], 200, {"Content-Type": "application/json"}
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude="  + lat +
+        "&longitude=" + lon +
+        "&current=temperature_2m,apparent_temperature,relative_humidity_2m"
+        ",wind_speed_10m,wind_direction_10m,weather_code,precipitation"
+        "&wind_speed_unit=kmh&timezone=auto"
+    )
+    # Essai 1 : SSL systeme
+    try:
+        ctx = _ssl.create_default_context()
+        req = _ur.Request(url, headers={"User-Agent": "RASPI-RADIO/1.0"})
+        with _ur.urlopen(req, timeout=5, context=ctx) as resp:
+            body = resp.read().decode("utf-8")
+        _WX_PROXY_CACHE[_ck] = {"body": body, "ts": time.time()}
+        return body, 200, {"Content-Type": "application/json"}
+    except Exception as e1:
+        logger.warning("[WX-PROXY] SSL systeme echoue : %s - tentative sans verif SSL", e1)
+    # Essai 2 : SSL non verifie (fallback RPi)
+    try:
+        ctx2 = _ssl.create_default_context()
+        ctx2.check_hostname = False
+        ctx2.verify_mode    = _ssl.CERT_NONE
+        req2 = _ur.Request(url, headers={"User-Agent": "RASPI-RADIO/1.0"})
+        with _ur.urlopen(req2, timeout=5, context=ctx2) as resp2:
+            body2 = resp2.read().decode("utf-8")
+        _WX_PROXY_CACHE[_ck] = {"body": body2, "ts": time.time()}
+        return body2, 200, {"Content-Type": "application/json"}
+    except Exception as e2:
+        logger.error("[WX-PROXY] Echec total : %s", e2)
+        if _cached:
+            return _cached["body"], 200, {"Content-Type": "application/json"}
+        return _j.dumps({"error": str(e2)}), 502, {"Content-Type": "application/json"}
 
 
 @app.route('/stats/save', methods=['POST'])
@@ -7254,6 +12115,18 @@ def _sgp4_elevation(sat_lat, sat_lon, sat_alt, obs_lat, obs_lon):
     return _math.degrees(_math.asin(max(-1.0, min(1.0, dot))))
 
 
+def _sgp4_azimuth(sat_lat, sat_lon, obs_lat, obs_lon):
+    """Retourne l'azimut (0-360°) depuis l'observateur vers le satellite."""
+    import math as _m2
+    slat = _m2.radians(sat_lat); slon = _m2.radians(sat_lon)
+    olat = _m2.radians(obs_lat); olon = _m2.radians(obs_lon)
+    dlon = slon - olon
+    y_az = _m2.sin(dlon) * _m2.cos(slat)
+    x_az = (_m2.cos(olat) * _m2.sin(slat)
+            - _m2.sin(olat) * _m2.cos(slat) * _m2.cos(dlon))
+    return (_m2.degrees(_m2.atan2(y_az, x_az)) + 360) % 360
+
+
 def _sgp4_compute_passes(tle, obs_lat, obs_lon,
                          n=5, horizon=0.0, hours_ahead=48):
     """
@@ -7309,15 +12182,59 @@ def _sgp4_compute_passes(tle, obs_lat, obs_lon,
                 rise_ref = (lo + hi) / 2.0
                 duration = set_t - rise_ref
 
-                dt_obj = _dt_sgp4.datetime.fromtimestamp(rise_ref)
+                # Azimuts au lever et au coucher
+                try:
+                    rl, rn, ra = _sgp4_propagate(tle, rise_ref)
+                    rise_az = round(_sgp4_azimuth(rl, rn, obs_lat, obs_lon), 1)
+                except Exception:
+                    rise_az = None
+                try:
+                    sl2, sn2, sa2 = _sgp4_propagate(tle, rise_ref + duration)
+                    set_az = round(_sgp4_azimuth(sl2, sn2, obs_lat, obs_lon), 1)
+                except Exception:
+                    set_az = None
+
+                dt_obj  = _dt_sgp4.datetime.fromtimestamp(rise_ref)
+                set_ts  = rise_ref + duration
+                set_obj = _dt_sgp4.datetime.fromtimestamp(set_ts)
                 passes.append({
                     "risetime":     int(rise_ref),
                     "duration":     int(duration),
                     "risetime_fmt": dt_obj.strftime("%d/%m %H:%M"),
+                    "set_fmt":      set_obj.strftime("%H:%M"),
                     "duration_min": round(duration / 60.0, 1),
                     "max_el":       round(max_el, 1),
+                    "rise_az":      rise_az,
+                    "set_az":       set_az,
                 })
+                max_el = 0.0   # ← reset pour le passage suivant
         t += step
+
+    # Flush d'un passage qui serait encore ouvert en fin de fenêtre temporelle
+    if in_pass and len(passes) < n:
+        set_t    = t_end
+        rise_ref = rise_t
+        duration = set_t - rise_ref
+        try:
+            dt_obj  = _dt_sgp4.datetime.fromtimestamp(rise_ref)
+            set_obj = _dt_sgp4.datetime.fromtimestamp(set_t)
+            try:
+                rl, rn, ra = _sgp4_propagate(tle, rise_ref)
+                rise_az_f = round(_sgp4_azimuth(rl, rn, obs_lat, obs_lon), 1)
+            except Exception:
+                rise_az_f = None
+            passes.append({
+                "risetime":     int(rise_ref),
+                "duration":     int(duration),
+                "risetime_fmt": dt_obj.strftime("%d/%m %H:%M"),
+                "set_fmt":      set_obj.strftime("%H:%M"),
+                "duration_min": round(duration / 60.0, 1),
+                "max_el":       round(max_el, 1),
+                "rise_az":      rise_az_f,
+                "set_az":       None,
+            })
+        except Exception:
+            pass
 
     return passes
 
@@ -7467,6 +12384,35 @@ def _iss_get_latlon():
     return lat, lon
 
 
+# Cache journalier des passages ISS — calculé en arrière-plan à minuit et au démarrage
+_iss_today_cache: dict = {}   # {"date": "YYYY-MM-DD", "data": [pass, ...]}
+
+
+def _iss_rebuild_today_cache():
+    """Calcule le cache de tous les passages ISS du jour courant (appel non-bloquant)."""
+    import datetime as _dt_c, time as _t_c
+    lat, lon = _iss_get_latlon()
+    if lat is None:
+        return
+    today      = _dt_c.datetime.now().date()
+    now_ts     = _t_c.time()
+    midnight_end = _dt_c.datetime.combine(
+        today + _dt_c.timedelta(days=1), _dt_c.time.min).timestamp()
+    hours_remaining = max(1.0, (midnight_end - now_ts) / 3600.0 + 0.5)
+    try:
+        line1, line2 = _sgp4_fetch_tle()
+        tle          = _sgp4_parse_tle(line1, line2)
+        passes       = _sgp4_compute_passes(tle, lat, lon, n=10,
+                                            hours_ahead=hours_remaining)
+        # Mise à jour atomique (remplace le dict d'un coup pour éviter la race condition)
+        _iss_today_cache.clear()
+        _iss_today_cache.update({"data": passes, "date": str(today)})
+        logger.info("[ISS] Cache journalier mis a jour : %d passage(s) le %s",
+                    len(passes), today)
+    except Exception as _e_cache:
+        logger.error("[ISS] Erreur cache journalier : %s", _e_cache)
+
+
 def _iss_pass_worker():
     """Thread daemon : vérifie toutes les minutes si un passage ISS approche."""
     import time as _t
@@ -7505,21 +12451,137 @@ def _iss_pass_worker():
             logger.error("[ISS] Erreur worker : %s", _e)
 
 threading.Thread(target=_iss_pass_worker, daemon=True).start()
+# Pré-calculer le cache journalier ISS au démarrage (thread pour ne pas bloquer Flask)
+threading.Thread(target=_iss_rebuild_today_cache, daemon=True).start()
 
 
 @app.route('/iss_passes')
 @_login_required
 def iss_passes():
-    """Retourne les prochains passages ISS pour la position de la station."""
-    import json as _j, time as _t
+    """Retourne les passages ISS du jour (?range=today, défaut) ou sur 24h glissantes (?range=24h)."""
+    import json as _j, time as _t, datetime as _dt
     lat, lon = _iss_get_latlon()
     if lat is None:
-        return _j.dumps({"error": "Position non configurée", "passes": []}), 200,                {'Content-Type': 'application/json'}
-    passes = _fetch_iss_passes(lat, lon, n=5)
-    now = _t.time()
-    for p in passes:
-        p["in_min"] = round((p["risetime"] - now) / 60.0, 0)
-    return _j.dumps({"passes": passes, "lat": lat, "lon": lon}), 200,            {'Content-Type': 'application/json'}
+        return _j.dumps({"error": "Position non configurée", "passes": []}), 200, \
+               {'Content-Type': 'application/json'}
+
+    range_mode = request.args.get("range", "today")   # "today" | "24h"
+    now_ts = _t.time()
+    today  = _dt.datetime.now().date()
+    midnight_start = _dt.datetime.combine(today,                         _dt.time.min).timestamp()
+    midnight_end   = _dt.datetime.combine(today + _dt.timedelta(days=1), _dt.time.min).timestamp()
+
+    if range_mode == "24h":
+        # ── Mode 24h glissantes : calcul direct, cache séparé ────────────────
+        cached24     = _iss_today_cache.get("data24")
+        cached24_ts  = _iss_today_cache.get("ts24", 0)
+        # Invalider toutes les 15 min
+        if cached24 is None or (now_ts - cached24_ts) > 900:
+            try:
+                line1, line2 = _sgp4_fetch_tle()
+                tle          = _sgp4_parse_tle(line1, line2)
+                cached24     = _sgp4_compute_passes(tle, lat, lon, n=20, hours_ahead=24.0)
+                _iss_today_cache.update({"data24": cached24, "ts24": now_ts})
+            except Exception as _e24:
+                logger.error("[ISS] Erreur SGP4 24h : %s", _e24)
+                cached24 = []
+        passes_list = cached24
+
+    else:
+        # ── Mode jour courant (défaut) ────────────────────────────────────────
+        cached      = _iss_today_cache.get("data")
+        cached_date = _iss_today_cache.get("date")
+        if cached is None or cached_date != str(today):
+            hours_remaining = max(1.0, (midnight_end - now_ts) / 3600.0 + 1.0)
+            try:
+                line1, line2  = _sgp4_fetch_tle()
+                tle           = _sgp4_parse_tle(line1, line2)
+                cached        = _sgp4_compute_passes(tle, lat, lon, n=10,
+                                                     hours_ahead=hours_remaining)
+                _iss_today_cache.clear()
+                _iss_today_cache.update({"data": cached, "date": str(today)})
+            except Exception as e:
+                logger.error("[ISS] Erreur calcul SGP4 : %s", e)
+                cached = []
+        passes_list = [p for p in cached
+                       if midnight_start <= p["risetime"] < midnight_end]
+        # Fallback : si aucun passage aujourd'hui (fin de soirée), prendre les 3 prochains
+        if not passes_list:
+            passes_list = [p for p in cached if p["risetime"] >= now_ts][:3]
+
+    result = []
+    for p in passes_list:
+        q = dict(p)
+        q["in_min"] = round((p["risetime"] - now_ts) / 60.0, 0)
+        result.append(q)
+
+    logger.debug("[ISS] %d passage(s) retournés (mode=%s)", len(result), range_mode)
+    return _j.dumps({"passes": result, "lat": lat, "lon": lon,
+                     "today": str(today), "range": range_mode}), 200, \
+           {'Content-Type': 'application/json'}
+
+
+@app.route('/iss_now')
+@_login_required
+def iss_now():
+    """Position ISS temps réel : lat, lon, alt, élévation, azimut, distance, Doppler 145.825 MHz."""
+    import json as _j, time as _t, math as _m
+    obs_lat, obs_lon = _iss_get_latlon()
+    if obs_lat is None:
+        return _j.dumps({"error": "Position non configurée"}), 200, \
+               {'Content-Type': 'application/json'}
+    try:
+        line1, line2 = _sgp4_fetch_tle()
+        tle          = _sgp4_parse_tle(line1, line2)
+        now          = _t.time()
+        lat, lon, alt = _sgp4_propagate(tle, now)
+        el           = _sgp4_elevation(lat, lon, alt, obs_lat, obs_lon)
+
+        # ── Azimut (direction depuis l'observateur vers l'ISS) ────────────────
+        slat = _m.radians(lat);       slon = _m.radians(lon)
+        olat = _m.radians(obs_lat);   olon = _m.radians(obs_lon)
+        dlon = slon - olon
+        y_az = _m.sin(dlon) * _m.cos(slat)
+        x_az = (_m.cos(olat) * _m.sin(slat)
+                - _m.sin(olat) * _m.cos(slat) * _m.cos(dlon))
+        az   = (_m.degrees(_m.atan2(y_az, x_az)) + 360) % 360
+
+        # ── Distance slant (km) ───────────────────────────────────────────────
+        r_sat = _SGP4_EARTH_R + alt
+        sx = r_sat * _m.cos(slat) * _m.cos(slon)
+        sy = r_sat * _m.cos(slat) * _m.sin(slon)
+        sz = r_sat * _m.sin(slat)
+        ox = _SGP4_EARTH_R * _m.cos(olat) * _m.cos(olon)
+        oy = _SGP4_EARTH_R * _m.cos(olat) * _m.sin(olon)
+        oz = _SGP4_EARTH_R * _m.sin(olat)
+        slant_km = _m.sqrt((sx-ox)**2 + (sy-oy)**2 + (sz-oz)**2)
+
+        # ── Doppler sur 145.825 MHz (vitesse radiale sur 2 s) ─────────────────
+        dt_dop         = 2.0
+        lat2, lon2, alt2 = _sgp4_propagate(tle, now + dt_dop)
+        r2    = _SGP4_EARTH_R + alt2
+        slat2 = _m.radians(lat2); slon2 = _m.radians(lon2)
+        sx2 = r2 * _m.cos(slat2) * _m.cos(slon2)
+        sy2 = r2 * _m.cos(slat2) * _m.sin(slon2)
+        sz2 = r2 * _m.sin(slat2)
+        slant2  = _m.sqrt((sx2-ox)**2 + (sy2-oy)**2 + (sz2-oz)**2)
+        v_rad   = (slant2 - slant_km) / dt_dop          # km/s (+ = s'éloigne)
+        C       = 299792.458                              # km/s
+        F0      = 145.825e6                               # Hz APRS ISS
+        doppler = -round(v_rad / C * F0)                 # Hz (négatif = approche)
+        freq_rx = round((F0 - v_rad / C * F0) / 1000, 3) # kHz corrigée
+
+        visible = el > 0.0
+
+        return _j.dumps({
+            "lat": round(lat, 4), "lon": round(lon, 4), "alt_km": round(alt, 1),
+            "elevation": round(el, 1), "azimuth": round(az, 1),
+            "slant_km":  round(slant_km, 1),
+            "doppler_hz": int(doppler), "freq_rx_khz": freq_rx,
+            "visible": visible, "obs_lat": obs_lat, "obs_lon": obs_lon,
+        }), 200, {'Content-Type': 'application/json'}
+    except Exception as _e:
+        return _j.dumps({"error": str(_e)}), 200, {'Content-Type': 'application/json'}
 
 
 @app.route('/iss_alert_config', methods=['GET', 'POST'])
@@ -7541,6 +12603,888 @@ def iss_alert_config():
     return _j.dumps(config_manager.data.get("iss_alert", {})), 200,            {'Content-Type': 'application/json'}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Alertes météo — WEATHER_ALERT_PATCH ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Worker thread interrogeant Open-Meteo toutes les N minutes et diffusant
+# un événement SSE "weather_alert" aux clients connectés en cas de dépassement
+# de seuil.  Modèle identique à _iss_pass_worker.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Codes WMO considérés comme sévères (pluie forte, orages…)
+_WX_SEVERE_CODES = {65, 75, 82, 95, 96, 99}
+
+# Timestamps des dernières alertes envoyées (évite le spam)
+_wx_last_alert: dict = {}     # clé = type d'alerte, valeur = timestamp float
+
+
+def _wx_should_alert(key: str, cooldown_s: float = 1800.0) -> bool:
+    """Retourne True si l'alerte (key) n'a pas encore été envoyée dans le délai cooldown."""
+    import time as _t
+    now = _t.time()
+    if now - _wx_last_alert.get(key, 0) >= cooldown_s:
+        _wx_last_alert[key] = now
+        return True
+    return False
+
+
+def _wx_check_and_broadcast(force_test: bool = False):
+    """
+    Interroge Open-Meteo, compare aux seuils configurés et diffuse les
+    alertes actives via la queue SSE et le bulletin APRS.
+    force_test=True : ignore l'état "enabled" et garantit au moins une
+    alerte (bouton "Tester les alertes maintenant"), même hors seuils.
+    """
+    import time as _t
+
+    cfg_alert = config_manager.data.get("weather_alert", {})
+    if not cfg_alert.get("enabled") and not force_test:
+        return
+
+    # Position station
+    from_locator = config_manager.data.get("geo_mode", "locator") == "locator"
+    if from_locator:
+        maidenhead = config_manager.data.get("maidenhead", "")
+        lat, lon = _grid_to_latlon(maidenhead) if maidenhead else (None, None)  # WX_FIX_MAIDENHEAD_v1
+    else:
+        lat = _safe_float(config_manager.data.get("lat_manual"))
+        lon = _safe_float(config_manager.data.get("lon_manual"))
+
+    if lat is None or lon is None:
+        if not force_test:
+            logger.warning("[WX-ALERT] Position non configurée — alerte ignorée")
+            return
+        wx = {}
+    else:
+        wx = _fetch_openmeteo(lat, lon) or {}
+        if not wx and not force_test:
+            return
+
+    alerts = []
+
+    # ── Température max ───────────────────────────────────────────────────────
+    temp = wx.get("temp_c")
+    t_max = float(cfg_alert.get("temp_max", 38.0))
+    if temp is not None and temp >= t_max and _wx_should_alert("temp_max"):
+        alerts.append({
+            "key": "temp_max",
+            "icon": "🌡️",
+            "title": f"Chaleur extreme : {temp:.1f} C",  # WX_ALERT_NO_ACCENT_v1
+            "detail": f"Seuil configuré : {t_max:.0f} °C",
+            "color_border": "#ef4444",
+            "color_bg": "#450a0a",
+            "color_text": "#fca5a5",
+        })
+
+    # ── Température min (gel) ─────────────────────────────────────────────────
+    t_min = float(cfg_alert.get("temp_min", -5.0))
+    if temp is not None and temp <= t_min and _wx_should_alert("temp_min"):
+        alerts.append({
+            "key": "temp_min",
+            "icon": "🧊",
+            "title": f"Gel : {temp:.1f} C",  # WX_ALERT_NO_ACCENT_v1
+            "detail": f"Seuil configuré : {t_min:.0f} °C",
+            "color_border": "#38bdf8",
+            "color_bg": "#0c2a3a",
+            "color_text": "#7dd3fc",
+        })
+
+    # ── Vent moyen ────────────────────────────────────────────────────────────
+    wind_ms = wx.get("wind_speed_ms")
+    w_max = float(cfg_alert.get("wind_max", 60.0))
+    if wind_ms is not None:
+        wind_kmh = wind_ms * 3.6
+        if wind_kmh >= w_max and _wx_should_alert("wind_max"):
+            alerts.append({
+                "key": "wind_max",
+                "icon": "💨",
+                "title": f"Vent fort : {wind_kmh:.0f} km/h",  # WX_ALERT_NO_ACCENT_v1
+                "detail": f"Seuil : {w_max:.0f} km/h",
+                "color_border": "#f59e0b",
+                "color_bg": "#2d1b00",
+                "color_text": "#fcd34d",
+            })
+
+    # ── Rafales ──────────────────────────────────────────────────────────────
+    gust_ms = wx.get("gust_ms")
+    g_max = float(cfg_alert.get("gust_max", 80.0))
+    if gust_ms is not None:
+        gust_kmh = gust_ms * 3.6
+        if gust_kmh >= g_max and _wx_should_alert("gust_max"):
+            alerts.append({
+                "key": "gust_max",
+                "icon": "🌪️",
+                "title": f"Rafales : {gust_kmh:.0f} km/h",  # WX_ALERT_NO_ACCENT_v1
+                "detail": f"Seuil : {g_max:.0f} km/h",
+                "color_border": "#fb923c",
+                "color_bg": "#3a1200",
+                "color_text": "#fdba74",
+            })
+
+    # ── Précipitations ───────────────────────────────────────────────────────
+    rain_mm = wx.get("rain_mm", 0) or 0
+    r_max = float(cfg_alert.get("rain_mm", 10.0))
+    if rain_mm >= r_max and _wx_should_alert("rain_mm"):
+        alerts.append({
+            "key": "rain_mm",
+            "icon": "🌧️",
+            "title": f"Pluie intense : {rain_mm:.1f} mm",  # WX_ALERT_NO_ACCENT_v1
+            "detail": f"Seuil : {r_max:.0f} mm",
+            "color_border": "#818cf8",
+            "color_bg": "#1e1b4b",
+            "color_text": "#c7d2fe",
+        })
+
+    # ── Code WMO sévère ──────────────────────────────────────────────────────
+    wmo = wx.get("wmo_code", 0)
+    if cfg_alert.get("wmo_severe", True) and wmo in _WX_SEVERE_CODES and _wx_should_alert(f"wmo_{wmo}"):
+        alerts.append({
+            "key": f"wmo_{wmo}",
+            "icon": "⛈️",
+            "title": f"Meteo severe : {wx.get('description', 'Alerte')}",  # WX_ALERT_NO_ACCENT_v1
+            "detail": f"Code WMO {wmo}",
+            "color_border": "#a21caf",
+            "color_bg": "#3b0764",
+            "color_text": "#e879f9",
+        })
+
+    # ── Test manuel — garantit un bulletin même hors seuils ────────────────────
+    if force_test and not alerts:
+        alerts.append({
+            "key": "test_manuel",
+            "icon": "🧪",
+            "title": "Test bulletin météo (déclenché manuellement)",
+            "detail": wx.get("description") or "Aucun seuil réel dépassé",
+            "color_border": "#38bdf8",
+            "color_bg": "#0c4a6e",
+            "color_text": "#bae6fd",
+        })
+
+    # ── Diffusion SSE ────────────────────────────────────────────────────────
+    for a in alerts:
+        frame = {
+            "type":         "weather_alert",
+            "key":          a["key"],
+            "icon":         a["icon"],
+            "title":        a["title"],
+            "detail":       a["detail"],
+            "color_border": a["color_border"],
+            "color_bg":     a["color_bg"],
+            "color_text":   a["color_text"],
+            "temp_c":       wx.get("temp_c"),
+            "wind_kmh":     round(wind_ms * 3.6, 1) if wind_ms else None,
+            "description":  wx.get("description"),
+        }
+        for _q in list(listeners):
+            try: _q.put_nowait(frame)
+            except: pass
+        logger.warning("[WX-ALERT] %s — %s", a["key"], a["title"])
+
+        # ── Bulletin APRS RF — WX_APRS_BULLETIN_PATCH_v1 ─────────────────
+        _wx_send_aprs_bulletin(a["icon"], a["title"], a["detail"], alerts.index(a))
+
+
+
+def _wx_send_aprs_bulletin(icon: str, title: str, detail: str, idx: int = 0):
+    """
+    Émet un bulletin APRS BLNWXn via Dire Wolf (KISS TCP).
+    Format AX.25 : dest=APRS, payload=:BLNWXn   :<texte>
+    WX_APRS_BULLETIN_PATCH_v1
+    """
+    try:
+        global modem
+        if modem is None:
+            logger.warning("[WX-BLN] modem non initialisé — bulletin non envoyé")
+            return
+
+        cfg_alert = config_manager.data.get("weather_alert", {})
+        if not cfg_alert.get("bulletin_aprs", True):
+            logger.info("[WX-BLN] Bulletin APRS désactivé dans la config — non envoyé")
+            return
+
+        # Identifiant bulletin : BLNWX0 … BLNWX9 (9 chars, padded avec espaces)
+        bln_id   = f"BLNWX{idx % 10}"
+        bln_addr = bln_id.ljust(9)          # 9 caractères exactement
+
+        # Texte : PAS d'emoji dans le payload RF — AX.25/KISS n'accepte que des
+        # octets 0-255, un emoji (code point > 255) fait planter l'encodage en
+        # bytes() et la trame est silencieusement perdue dans _tx_worker.
+        # WX_ALERT_NO_ACCENT_v1 : le detail (seuil configuré) n'est plus inclus
+        # dans le payload RF, uniquement le titre de l'alerte.
+        text = f"{title}"
+        # Sécurité supplémentaire : on retire tout caractère non Latin-1
+        # (emoji résiduel, etc.) pour ne jamais faire planter send_packet().
+        text = text.encode("latin-1", errors="ignore").decode("latin-1")
+        if len(text) > 67:
+            text = text[:67]
+
+        payload = f":{bln_addr}:{text}"
+
+        # Passe par tx_queue (thread dédié) pour éviter tout conflit de tx_lock
+        # WX_ALERT_NO_ACCENT_v1 : aprs_type="Meteo" pour affichage avec le
+        # badge/couleur météo dans le moniteur (au lieu du badge TX générique).
+        try:
+            tx_queue.put_nowait({
+                "dest":      "APRS",
+                "payload":   payload,
+                "path":      "WIDE1-1",
+                "aprs_type": "Meteo",
+                "extra":     {"comment": text},
+            })
+            logger.info("[WX-BLN] Bulletin APRS mis en queue TX : %s", payload)
+        except Exception as _qe:
+            logger.error("[WX-BLN] Erreur mise en queue TX : %s", _qe)
+
+    except Exception as _e:
+        logger.error("[WX-BLN] Erreur émission bulletin : %s", _e)
+
+
+def _weather_alert_worker():
+    """Thread daemon : vérifie périodiquement les conditions météo et déclenche les alertes."""
+    import time as _t
+    while True:
+        try:
+            interval_min = float(
+                config_manager.data.get("weather_alert", {}).get("interval_min", 30)
+            )
+            _t.sleep(max(5.0, interval_min) * 60)
+        except Exception:
+            _t.sleep(1800)
+        try:
+            _wx_check_and_broadcast()
+        except Exception as _e:
+            logger.error("[WX-ALERT] Erreur worker : %s", _e)
+
+
+threading.Thread(target=_weather_alert_worker, daemon=True, name="wx-alert-worker").start()
+logger.info("[WX-ALERT] Worker thread démarré")
+
+
+@app.route('/weather_alert_config', methods=['GET', 'POST'])
+@_login_required
+def weather_alert_config():
+    """GET → retourne la config alertes météo. POST → met à jour."""
+    import json as _j
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        wa = config_manager.data.get("weather_alert", {}).copy()
+        _bool_keys  = ("enabled", "wmo_severe", "bulletin_aprs")
+        _float_keys = ("temp_max", "temp_min", "wind_max", "gust_max", "rain_mm")
+        _int_keys   = ("interval_min",)
+        for k in _bool_keys:
+            if k in data: wa[k] = bool(data[k])
+        for k in _float_keys:
+            if k in data:
+                try: wa[k] = float(data[k])
+                except (TypeError, ValueError): pass
+        for k in _int_keys:
+            if k in data:
+                try: wa[k] = int(data[k])
+                except (TypeError, ValueError): pass
+        config_manager.data["weather_alert"] = wa
+        with open("config.json", "w") as _f:
+            _j.dump(config_manager.data, _f, ensure_ascii=False)
+        logger.info("[WX-ALERT] Config mise à jour : %s", wa)
+        return _j.dumps({"status": "ok", "weather_alert": wa}), 200,                {'Content-Type': 'application/json'}
+    return _j.dumps(config_manager.data.get("weather_alert", {})), 200,            {'Content-Type': 'application/json'}
+
+
+@app.route('/weather_alert_test', methods=['POST'])
+@_login_required
+def weather_alert_test():
+    """Force une vérification météo immédiate ET garantit un bulletin de test
+    (ignore l'état "enabled" et les seuils, pour vérifier la chaîne TX/APRS)."""
+    import json as _j
+    # Réinitialiser les cooldowns pour forcer le déclenchement
+    _wx_last_alert.clear()
+    try:
+        _wx_check_and_broadcast(force_test=True)
+        return _j.dumps({"status": "ok"}), 200, {'Content-Type': 'application/json'}
+    except Exception as e:
+        return _j.dumps({"status": "error", "error": str(e)}), 500,                {'Content-Type': 'application/json'}
+
+
+# ── FIN WEATHER_ALERT_PATCH ───────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Alertes propagation / blackout ── PROP_ALERT_PATCH ───────────────────────
+# Surveille SFI, Kp et éruptions X-ray GOES — SSE "prop_alert" aux clients
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Horodatages des dernières alertes émises (anti-spam par type)
+_prop_alerted_ts: dict = {}   # {"kp": float, "sfi": float, "xray": float}
+_PROP_ALERT_COOLDOWN = 3600   # 1 heure entre deux alertes du même type
+
+# Historique circulaire des alertes déclenchées (50 entrées max)
+_prop_alerts_log: list = []
+_prop_alerts_log_lock = threading.Lock()
+_PROP_ALERTS_LOG_MAX  = 50
+
+
+def _xray_class_value(label: str) -> float:
+    """Convertit "M1.5" → valeur numérique brute (mantisse * puissance)."""
+    label = label.strip().upper()
+    if not label:
+        return 0.0
+    letter = label[0]
+    try: mantissa = float(label[1:]) if len(label) > 1 else 1.0
+    except ValueError: mantissa = 1.0
+    exponents = {"A": 1e-8, "B": 1e-7, "C": 1e-6, "M": 1e-5, "X": 1e-4}
+    return exponents.get(letter, 0) * mantissa
+
+
+def _fetch_xray_latest():
+    """
+    Récupère la dernière mesure GOES X-ray 1-8 Å (flare) depuis NOAA SWPC.
+    Retourne (class_str, flux_w_m2) ou (None, None).
+    """
+    import urllib.request, json as _j
+    url = "https://services.swpc.noaa.gov/json/goes/primary/xrays-1-day.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Py-APRS/2.2"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = _j.loads(resp.read())
+        # Filtrer canal long 0.1-0.8 nm (champ "energy" contient "0.1-0.8")
+        longs = [e for e in data
+                 if isinstance(e, dict) and "0.1-0.8" in str(e.get("energy", ""))]
+        # Fallback : prendre uniquement la moitié haute du tableau (canal long en dernier)
+        if not longs and isinstance(data, list) and len(data) >= 2:
+            longs = data[len(data)//2:]
+        last = longs[-1] if longs else ({} if not isinstance(data, list) else (data[-1] if data else {}))
+        flux = last.get("flux") if isinstance(last, dict) else None
+        if flux is None:
+            return None, None
+        flux = float(flux)
+        if flux <= 0:
+            return None, None   # valeur invalide (capteur hors ligne ou repos plat)
+        # Convertir flux W/m² → classe
+        if   flux >= 1e-4: cl = "X%.1f" % (flux / 1e-4)
+        elif flux >= 1e-5: cl = "M%.1f" % (flux / 1e-5)
+        elif flux >= 1e-6: cl = "C%.1f" % (flux / 1e-6)
+        elif flux >= 1e-7: cl = "B%.1f" % (flux / 1e-7)
+        else:              cl = "A%.1f" % (flux / 1e-8)
+        return cl, flux
+    except Exception as _e:
+        logger.debug("[PROP-ALERT] X-ray fetch error: %s", _e)
+        return None, None
+
+
+def _prop_should_alert(key: str) -> bool:
+    """Retourne True si le cooldown est écoulé pour ce type d'alerte."""
+    import time as _t
+    now = _t.time()
+    last = _prop_alerted_ts.get(key, 0)
+    if now - last >= _PROP_ALERT_COOLDOWN:
+        _prop_alerted_ts[key] = now
+        return True
+    return False
+
+
+def _prop_check_and_broadcast():
+    """Évalue les indices et diffuse un SSE 'prop_alert' si seuil dépassé."""
+    cfg = config_manager.data.get("prop_alert", {})
+    if not cfg.get("enabled"):
+        return
+
+    data  = _fetch_solar_indices()
+    kp    = data.get("k_index")
+    sfi   = data.get("sfi")
+    alerts = []
+
+    # ── Tempête géomagnétique (Kp) ───────────────────────────────────────────
+    kp_max = float(cfg.get("kp_max", 5.0))
+    if kp is not None and kp >= kp_max and _prop_should_alert("kp"):
+        alerts.append({
+            "type":         "prop_alert",
+            "key":          "kp_storm",
+            "icon":         "🧲",
+            "title":        f"Tempête géomagnétique — Kp {kp:.1f}",
+            "detail":       f"Seuil : Kp ≥ {kp_max:.0f} · Aurora possible en VHF",
+            "color_border": "#f59e0b",
+            "color_bg":     "#2d1b00",
+            "color_text":   "#fcd34d",
+            "kp":           kp,
+            "sfi":          sfi,
+        })
+
+    # ── Blackout HF (SFI bas) ────────────────────────────────────────────────
+    sfi_min = float(cfg.get("sfi_min", 70.0))
+    if sfi is not None and sfi < sfi_min and _prop_should_alert("sfi_low"):
+        alerts.append({
+            "type":         "prop_alert",
+            "key":          "sfi_low",
+            "icon":         "📉",
+            "title":        f"Conditions HF dégradées — SFI {sfi:.0f}",
+            "detail":       f"Seuil : SFI < {sfi_min:.0f} · Propagation HF mauvaise",
+            "color_border": "#ef4444",
+            "color_bg":     "#450a0a",
+            "color_text":   "#fca5a5",
+            "kp":           kp,
+            "sfi":          sfi,
+        })
+
+    # ── Éruption solaire X-ray (GOES) ────────────────────────────────────────
+    xray_threshold = cfg.get("xray_class", "M1")
+    xray_cl, xray_flux = _fetch_xray_latest()
+    if xray_cl and xray_flux is not None:
+        threshold_val = _xray_class_value(xray_threshold)
+        if xray_flux >= threshold_val and _prop_should_alert("xray"):
+            alerts.append({
+                "type":         "prop_alert",
+                "key":          "xray_flare",
+                "icon":         "☀️",
+                "title":        f"Éruption solaire {xray_cl}",
+                "detail":       f"Seuil : {xray_threshold} · Risque blackout HF dayside",
+                "color_border": "#f97316",
+                "color_bg":     "#3a1200",
+                "color_text":   "#fdba74",
+                "kp":           kp,
+                "sfi":          sfi,
+                "xray_class":   xray_cl,
+            })
+
+    # ── Diffusion SSE ────────────────────────────────────────────────────────
+    for a in alerts:
+        # Enregistrer dans l'historique circulaire
+        import time as _ti
+        entry = dict(a)
+        entry["ts"] = _ti.time()
+        with _prop_alerts_log_lock:
+            _prop_alerts_log.append(entry)
+            if len(_prop_alerts_log) > _PROP_ALERTS_LOG_MAX:
+                del _prop_alerts_log[0]
+        for _q in list(listeners):
+            try: _q.put_nowait(a)
+            except: pass
+        logger.warning("[PROP-ALERT] %s — %s", a["key"], a["title"])
+
+
+def _prop_alert_worker():
+    """Thread daemon : vérifie périodiquement les indices de propagation."""
+    import time as _t
+    while True:
+        try:
+            interval_min = float(
+                config_manager.data.get("prop_alert", {}).get("interval_min", 15)
+            )
+            _t.sleep(max(5.0, interval_min) * 60)
+        except Exception:
+            _t.sleep(900)
+        try:
+            _prop_check_and_broadcast()
+        except Exception as _e:
+            logger.error("[PROP-ALERT] Erreur worker : %s", _e)
+
+
+threading.Thread(target=_prop_alert_worker, daemon=True, name="prop-alert-worker").start()
+logger.info("[PROP-ALERT] Worker thread démarré")
+
+
+@app.route('/prop_alert_config', methods=['GET', 'POST'])
+@_login_required
+def prop_alert_config():
+    """GET → config alertes propagation. POST → mise à jour."""
+    import json as _j
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        pa = config_manager.data.get("prop_alert", {}).copy()
+        if "enabled"      in data: pa["enabled"]      = bool(data["enabled"])
+        if "interval_min" in data:
+            try: pa["interval_min"] = int(data["interval_min"])
+            except (TypeError, ValueError): pass
+        if "kp_max"  in data:
+            try: pa["kp_max"]  = float(data["kp_max"])
+            except (TypeError, ValueError): pass
+        if "sfi_min" in data:
+            try: pa["sfi_min"] = float(data["sfi_min"])
+            except (TypeError, ValueError): pass
+        if "xray_class" in data: pa["xray_class"] = str(data["xray_class"])
+        config_manager.data["prop_alert"] = pa
+        with open("config.json", "w") as _f:
+            _j.dump(config_manager.data, _f, ensure_ascii=False)
+        logger.info("[PROP-ALERT] Config mise à jour : %s", pa)
+        return _j.dumps({"status": "ok", "prop_alert": pa}), 200, \
+               {'Content-Type': 'application/json'}
+    return _j.dumps(config_manager.data.get("prop_alert", {})), 200, \
+           {'Content-Type': 'application/json'}
+
+
+@app.route('/prop_alert_test', methods=['POST'])
+@_login_required
+def prop_alert_test():
+    """Force une vérification propagation immédiate (test des seuils)."""
+    import json as _j
+    # Réinitialiser les cooldowns pour forcer le déclenchement
+    _prop_alerted_ts.clear()
+    try:
+        _prop_check_and_broadcast()
+        return _j.dumps({"status": "ok"}), 200, {'Content-Type': 'application/json'}
+    except Exception as e:
+        return _j.dumps({"status": "error", "error": str(e)}), 500, \
+               {'Content-Type': 'application/json'}
+
+
+@app.route('/prop_alert_history')
+@_login_required
+def prop_alert_history():
+    """Retourne les dernières alertes propagation déclenchées (log circulaire)."""
+    import json as _j, time as _ti
+    now = _ti.time()
+    with _prop_alerts_log_lock:
+        entries = list(reversed(_prop_alerts_log))   # plus récent en premier
+    result = []
+    for e in entries:
+        result.append({
+            "ts":           e.get("ts", 0),
+            "ago_s":        int(now - e.get("ts", now)),
+            "key":          e.get("key", ""),
+            "icon":         e.get("icon", "📡"),
+            "title":        e.get("title", ""),
+            "detail":       e.get("detail", ""),
+            "color_text":   e.get("color_text", "#94a3b8"),
+            "color_border": e.get("color_border", "#475569"),
+            "kp":           e.get("kp"),
+            "sfi":          e.get("sfi"),
+            "xray_class":   e.get("xray_class"),
+        })
+    return _j.dumps({"alerts": result}), 200, {'Content-Type': 'application/json'}
+
+
+# ── FIN PROP_ALERT_PATCH ──────────────────────────────────────────────────────
+
+
+@app.route('/prop_status')
+@_login_required
+def prop_status():
+    """Retourne les indices de propagation courants + drapeaux d'alerte (sans cooldown)."""
+    import json as _j
+    cfg  = config_manager.data.get("prop_alert", {})
+    data = _fetch_solar_indices()
+    kp   = data.get("k_index")
+    sfi  = data.get("sfi")
+    xray_cl, xray_flux = _fetch_xray_latest()
+    kp_max  = float(cfg.get("kp_max",  5.0))
+    sfi_min = float(cfg.get("sfi_min", 70.0))
+    xray_threshold = cfg.get("xray_class", "M1")
+    threshold_val  = _xray_class_value(xray_threshold)
+    result = {
+        "kp":           round(kp,  2) if kp  is not None else None,
+        "sfi":          round(sfi, 1) if sfi is not None else None,
+        "xray_class":   xray_cl,
+        "kp_alert":     bool(kp  is not None and kp  >= kp_max),
+        "sfi_alert":    bool(sfi is not None and sfi <  sfi_min),
+        "xray_alert":   bool(xray_flux is not None and xray_flux >= threshold_val),
+        "kp_max":       kp_max,
+        "sfi_min":      sfi_min,
+        "xray_thr":     xray_threshold,
+        "enabled":      bool(cfg.get("enabled")),
+    }
+    return _j.dumps(result), 200, {"Content-Type": "application/json"}
+
+
+
+# ── WEATHER_HISTORY_PATCH_APPLIED ──
+# Route GET /weather_history — historique Open-Meteo 48h (hourly)
+
+@app.route('/weather_history')
+@_login_required
+def weather_history():
+    """
+    Retourne l'historique météo horaire des 48 dernières heures via Open-Meteo.
+    Utilise les coordonnées de la station (config maidenhead ou lat/lon manuel).
+    Réponse JSON : {temperature_2m, wind_speed_10m, precipitation, location}
+    """
+    import urllib.request, json as _j
+
+    # ── Coordonnées station ───────────────────────────────────────────────────
+    cfg = config_manager.data
+    lat, lon = None, None
+    geo_mode = cfg.get("geo_mode", "locator")
+    if geo_mode == "coords":
+        try:
+            lat = float(cfg.get("lat_manual", ""))
+            lon = float(cfg.get("lon_manual", ""))
+        except (TypeError, ValueError):
+            lat = lon = None
+    if lat is None or lon is None:
+        mh = cfg.get("maidenhead", "")
+        if mh and len(mh) >= 4:
+            try:
+                g = mh.upper()
+                lon = (ord(g[0]) - 65) * 20 - 180
+                lat = (ord(g[1]) - 65) * 10 - 90
+                lon += int(g[2]) * 2
+                lat += int(g[3]) * 1
+                if len(g) >= 6:
+                    lon += (ord(g[4]) - 65) * (2/24) + (1/24)
+                    lat += (ord(g[5]) - 65) * (1/24) + (0.5/24)
+                else:
+                    lon += 1; lat += 0.5
+            except Exception:
+                lat = lon = None
+
+    if lat is None or lon is None:
+        return _j.dumps({"error": "Coordonnées station non configurées"}), 400,                {'Content-Type': 'application/json'}
+
+    # ── Cache memoire 10 min ──────────────────────────────────────────────────
+    _hck = "%.4f,%.4f" % (lat, lon)
+    _hcached = _WX_HISTORY_CACHE.get(_hck)
+    if _hcached and (time.time() - _hcached["ts"]) < _WX_CACHE_TTL_S:
+        return _j.dumps(_hcached["payload"]), 200, {'Content-Type': 'application/json'}
+
+    from datetime import datetime
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    url_fc = (
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=%.5f&longitude=%.5f"
+        "&hourly=temperature_2m,wind_speed_10m,precipitation,wind_gusts_10m"
+        "&past_days=2&forecast_days=1&wind_speed_unit=ms&timezone=auto"
+    ) % (lat, lon)
+
+    url_dwd = (
+        "https://api.open-meteo.com/v1/dwd-icon"
+        "?latitude=%.5f&longitude=%.5f"
+        "&hourly=lightning_potential,cape"
+        "&past_days=2&forecast_days=1&timezone=auto&models=icon_seamless"
+    ) % (lat, lon)
+
+    def _fetch(u):
+        req = urllib.request.Request(u, headers={"User-Agent": "aprs_station/2.5"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return _j.loads(r.read())
+
+    raw = raw_dwd = None
+    try:
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            fut_fc  = _pool.submit(_fetch, url_fc)
+            fut_dwd = _pool.submit(_fetch, url_dwd)
+            try:
+                raw = fut_fc.result(timeout=7)
+            except Exception as _e:
+                logger.error("[WX-HIST] Open-Meteo forecast : %s", _e)
+                return _j.dumps({"error": str(_e)}), 500, {'Content-Type': 'application/json'}
+            try:
+                raw_dwd = fut_dwd.result(timeout=7)
+            except Exception as _e2:
+                logger.warning("[WX-HIST] DWD ICON indisponible : %s", _e2)
+
+        # ── Filtrage des 48 dernieres heures ──────────────────────────────────
+        hourly = raw.get("hourly", {})
+        times  = hourly.get("time", [])
+        temp   = hourly.get("temperature_2m", [])
+        wind   = hourly.get("wind_speed_10m", [])
+        rain   = hourly.get("precipitation", [])
+        gust   = hourly.get("wind_gusts_10m", [])
+        cutoff = datetime.now().timestamp() - 48 * 3600
+
+        t2, temp2, w2, r2, g2 = [], [], [], [], []
+        for i, ts in enumerate(times):
+            try:
+                dt = datetime.strptime(ts.replace("T", " ")[:16], "%Y-%m-%d %H:%M")
+                if dt.timestamp() >= cutoff:
+                    t2.append(ts)
+                    temp2.append(temp[i] if i < len(temp) else 0)
+                    w2.append(wind[i]    if i < len(wind) else 0)
+                    r2.append(rain[i]    if i < len(rain) else 0)
+                    g2.append(gust[i]    if i < len(gust) else 0)
+            except Exception:
+                continue
+
+        # ── DWD (facultatif) ──────────────────────────────────────────────────
+        lpi2, cape2 = [], []
+        if raw_dwd:
+            h_dwd  = raw_dwd.get("hourly", {})
+            times_d = h_dwd.get("time", [])
+            lpi_d   = h_dwd.get("lightning_potential", [])
+            cape_d  = h_dwd.get("cape", [])
+            for i2, ts2 in enumerate(times_d):
+                try:
+                    dt2 = datetime.strptime(ts2.replace("T", " ")[:16], "%Y-%m-%d %H:%M")
+                    if dt2.timestamp() >= cutoff:
+                        lpi2.append(lpi_d[i2]  if i2 < len(lpi_d)  else 0)
+                        cape2.append(cape_d[i2] if i2 < len(cape_d) else 0)
+                except Exception:
+                    continue
+            logger.debug("[WX-HIST] DWD LPI: %d points", len(lpi2))
+
+        tz_info  = raw.get("timezone_abbreviation", "")
+        location = "%.4f, %.4f %s" % (lat, lon, tz_info)
+        result = {
+            "temperature_2m": temp2, "wind_speed_10m": w2,
+            "precipitation": r2,     "wind_gusts_10m": g2,
+            "lightning_potential": lpi2, "cape": cape2,
+            "location": location, "lat": lat, "lon": lon,
+        }
+        _WX_HISTORY_CACHE[_hck] = {"payload": result, "ts": time.time()}
+        return _j.dumps(result), 200, {'Content-Type': 'application/json'}
+
+    except Exception as e:
+        logger.error("[WX-HIST] Erreur : %s", e)
+        if _hcached:
+            return _j.dumps(_hcached["payload"]), 200, {'Content-Type': 'application/json'}
+        return _j.dumps({"error": str(e)}), 500, {'Content-Type': 'application/json'}
+
+# ── SIGNAL_PATH_PATCH_APPLIED ──
+# ── APRSFI_CONFIG_PATCH_APPLIED ──
+# ── LIGHTNING_PATCH_APPLIED ──
+# ── FIN WEATHER_HISTORY_PATCH ─────────────────────────────────────────────────
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Route GET /signal_path — chemins réseau de ma station (RF + IS + aprs.fi)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route('/signal_path')
+@_login_required
+def signal_path():
+    """
+    Analyse les trames de MA station dans rx_history (RF + IS)
+    et interroge l'API aprs.fi si aprsfi_key est configurée.
+
+    Retourne :
+      callsign, last_path, digi_counts, history (20 dernières), rf_count, is_count
+    """
+    import json as _j, time as _t, urllib.request
+    from datetime import datetime
+
+    cfg      = config_manager.data
+    my_call  = cfg.get("callsign", "").upper().strip()
+    my_base  = my_call.split("-")[0]
+    api_key  = cfg.get("aprsfi_key", "").strip()
+
+    cutoff_24h = _t.time() - 86400   # 24 heures
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _ts_str(ts):
+        try:
+            return datetime.fromtimestamp(ts).strftime("%H:%M")
+        except Exception:
+            return "?"
+
+    def _parse_path_nodes(path_str, source):
+        """
+        Retourne la liste ordonnée des noeuds du chemin APRS.
+
+        RF  :  'F5ZKB*,WIDE2-1'           → ['F5ZKB*', 'WIDE2-1']
+        IS  :  'WIDE1-1,WIDE2-1,qAR,F5XAJ-10' → idem, y compris qAR et iGate
+        """
+        if not path_str:
+            return []
+        return [p.strip() for p in path_str.split(',') if p.strip()]
+
+    def _extract_digis(nodes):
+        """Retourne la liste des vrais digis (marques * ou nom de station, hors WIDE/qA*)."""
+        digis = []
+        for n in nodes:
+            upper = n.upper().rstrip('*')
+            if upper.startswith('WIDE') or upper.startswith('TRACE') or upper.startswith('Q'):
+                continue
+            if n.endswith('*') or (not upper.startswith('WIDE') and '-' in n):
+                digis.append(n.rstrip('*'))
+            elif not upper.startswith('WIDE') and upper not in ('RELAY', 'ECHO', 'GATE'):
+                # Callsign nu après qAR = iGate
+                digis.append(n)
+        return digis
+
+    # ── Scan rx_history ───────────────────────────────────────────────────────
+
+    paths_rf     = []   # {ts, nodes, source='RF'}
+    paths_is     = []   # {ts, nodes, source='IS'}
+
+    with rx_history_lock:
+        snapshot = list(rx_history)
+
+    for frame in snapshot:
+        if frame.get("type") == "rx_level":
+            continue
+        # tx_event = trame émise par MA station : incluse dans le scan
+        src = (frame.get("src") or "").upper().strip()
+        # Accepter indicatif complet ET base (ex: F1RIQ et F1RIQ-9)
+        if src not in (my_call, my_base) and not src.startswith(my_base + "-"):
+            continue
+        path_str = frame.get("path", "")
+        if not path_str:
+            continue
+
+        ts      = frame.get("_ts", _t.time())
+        source  = "IS" if frame.get("_source") == "IS" else "RF"
+        nodes   = _parse_path_nodes(path_str, source)
+        if not nodes:
+            continue
+
+        entry = {"ts": ts, "nodes": nodes, "source": source,
+                 "time_str": _ts_str(ts)}
+
+        if source == "IS":
+            paths_is.append(entry)
+        else:
+            paths_rf.append(entry)
+
+    # ── API aprs.fi (optionnel) ───────────────────────────────────────────────
+
+    paths_aprsfi = []
+    if api_key:
+        try:
+            url_fi = (
+                "https://api.aprs.fi/api/get"
+                "?name=%s&what=loc&apikey=%s&format=json&timerange=86400"
+            ) % (my_call, api_key)
+            req_fi = urllib.request.Request(
+                url_fi, headers={"User-Agent": "aprs_station/2.5"})
+            with urllib.request.urlopen(req_fi, timeout=8) as r:
+                fi_data = _j.loads(r.read())
+            for entry in fi_data.get("entries", []):
+                path_str = entry.get("path", "")
+                ts_fi    = int(entry.get("time", 0))
+                if not path_str or ts_fi < cutoff_24h:
+                    continue
+                nodes = _parse_path_nodes(path_str, "aprsfi")
+                if nodes:
+                    paths_aprsfi.append({
+                        "ts": ts_fi, "nodes": nodes, "source": "aprsfi",
+                        "time_str": _ts_str(ts_fi),
+                    })
+            logger.debug("[SIGPATH] aprs.fi : %d entrées récupérées", len(paths_aprsfi))
+        except Exception as e_fi:
+            logger.warning("[SIGPATH] aprs.fi indisponible : %s", e_fi)
+
+    # ── Fusion + tri chronologique ────────────────────────────────────────────
+
+    all_paths = sorted(paths_rf + paths_is + paths_aprsfi,
+                       key=lambda x: x["ts"], reverse=True)
+
+    # ── Comptage par digi ─────────────────────────────────────────────────────
+
+    digi_counts = {}   # digi_upper → {count, source, name}
+    for p in all_paths:
+        if p["ts"] < cutoff_24h:
+            continue
+        for digi in _extract_digis(p["nodes"]):
+            key = digi.upper()
+            if key not in digi_counts:
+                digi_counts[key] = {"digi": digi, "count": 0, "source": p["source"]}
+            digi_counts[key]["count"] += 1
+
+    digi_list = sorted(digi_counts.values(), key=lambda x: x["count"], reverse=True)
+
+    # ── Résultat ──────────────────────────────────────────────────────────────
+
+    result = {
+        "callsign":    my_call,
+        "last_path":   all_paths[0] if all_paths else None,
+        "digi_counts": digi_list,
+        "history":     all_paths[:20],
+        "rf_count":    len(paths_rf),
+        "is_count":    len(paths_is),
+        "aprsfi_count": len(paths_aprsfi),
+    }
+    return _j.dumps(result, default=str), 200, {'Content-Type': 'application/json'}
+
+# ── FIN SIGNAL_PATH_PATCH ─────────────────────────────────────────────────────
+
 def _safe_float(v):
     try:
         return float(v) if v not in (None, '', 'None') else None
@@ -7551,6 +13495,11 @@ def _safe_float(v):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [SSTV RX supprimé — voir patch_sstv_remove.py]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7682,4 +13631,8 @@ except (OSError, ValueError):
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=False)
+    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
+
+# PATCH_PROP_PILL_v1
+
+# PATCH_NOTES_TAB_v1
