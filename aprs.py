@@ -359,7 +359,38 @@ app.permanent_session_lifetime = _timedelta(days=30)
 APP_VERSION = "2.6.9"
 APP_VERSION_DATE = "2026-06-21"
 APP_CHANGELOG = [
-        {"version": "2.6.9", "date": "2026-06-21", "label": "current", "changes": [
+        {"version": "2.8.5", "date": "2026-07-08", "label": "current", "changes": [
+            "Onglet Stats : bloc Alertes Propagation & Blackout HF deplace au-dessus du graphique Trafic RX/TX/IS 24h",
+        ]},
+        {"version": "2.8.4", "date": "2026-07-08", "label": "", "changes": [
+            "Stats : plafond de plausibilite (1500 km) sur le calcul du Meilleur DX entendu (RF) — une position corrompue en reception ne peut plus fausser definitivement ce record",
+        ]},
+        {"version": "2.8.3", "date": "2026-07-08", "label": "", "changes": [
+            "Moniteur trafic : badge de position — coordonnees decimales retirees, seul le locator Maidenhead est affiche (reste cliquable vers OpenStreetMap)",
+        ]},
+        {"version": "2.8.2", "date": "2026-07-08", "label": "", "changes": [
+            "Moniteur trafic : locator Maidenhead (6 caracteres) affiche a cote des coordonnees decimales dans le badge de position",
+        ]},
+        {"version": "2.8.1", "date": "2026-07-08", "label": "", "changes": [
+            "Mic-E : vitesse aberrante (>500 km/h) ecartee de l'affichage — octets info[4..6] quasi certainement corrompus (signal faible/digipeat), position conservee",
+        ]},
+        {"version": "2.8.0", "date": "2026-07-08", "label": "", "changes": [
+            "Nouvelle balise automatique Lune : azimut, elevation, distance et phase lunaire calcules pour la position de la station (algorithme astronomique sans dependance externe), beacon APRS statut '>LUNE Az:.. El:.. Phase:..% (nom) Dist:..km {MOON}'",
+            "Bouton BEACON LUNE dans le tableau de bord, badge de statut et intervalle configurable dans les reglages comme les autres balises",
+        ]},
+        {"version": "2.7.1", "date": "2026-07-08", "label": "", "changes": [
+            "Direwolf : re-detection de la carte son ALSA et regeneration de direwolf.conf a CHAQUE redemarrage (watchdog ou crash) au lieu d'une detection unique figee au demarrage -- corrige un blocage definitif de la reception si le device USB se re-enumere (hw:X,Y qui change)",
+            "Direwolf : retrait du preexec_fn (PR_SET_PDEATHSIG) introduit en 2.7.0 -- dangereux dans une application multi-threadee (risque de deadlock fork/exec), cause probable d'un arret definitif de la reception",
+            "Direwolf : wait() final apres un kill() de secours pour eviter un process zombie",
+        ]},
+        {"version": "2.7.0", "date": "2026-07-07", "label": "", "changes": [
+            "Direwolf : decodage tolerant (errors=replace) et threads de lecture stdout/stderr blindes contre un pipe qui se remplit silencieusement et bloque le processus",
+            "Direwolf : SIGHUP intercepte en plus de SIGTERM/SIGINT pour l'arret propre (fermeture de session SSH/terminal sans nohup)",
+            "Messages APRS : support du format spec {msgno}reply-ack (piggyback ACK des radios Kenwood D7x/D700) — corrige les messages jamais acquittes et retransmis indefiniment par le correspondant",
+            "Mode jour : contraste corrige pour toutes les couleurs vives du moniteur trafic et du QSO (rouge, jaune, ambre, orange, ciel, indigo, rose, cyan, violet, fuchsia)",
+            "Mode jour : badge ville/region (geocoding inverse) et vent meteo assombris — invisibles auparavant sur fond clair",
+        ]},
+        {"version": "2.6.9", "date": "2026-06-21", "label": "", "changes": [
             "Bulletin APRS RF alerte meteo : titres sans accents (ex. 'Chaleur extreme' au lieu de 'Chaleur extrême') pour compatibilite TNC/terminaux",
             "Bulletin APRS RF alerte meteo : retrait du seuil configure du payload RF, conserve uniquement dans l'alerte SSE/web",
             "Bulletin APRS RF alerte meteo : affichage avec le badge et la couleur Meteo dans le moniteur de trafic au lieu du badge TX generique",
@@ -625,16 +656,33 @@ class APRSChat:
         return str(n)
 
     def add_incoming(self, src, text, msgno=None):
+        """Enregistre un message reçu. Si (src, msgno) a déjà été vu — cas d'une
+        retransmission du correspondant faute d'avoir reçu notre ACK — la bulle
+        n'est pas dupliquée, mais on renvoie quand même True pour que l'appelant
+        sache qu'il doit re-émettre l'ACK.
+        INCOMING_DEDUP_PATCH_v1
+        """
         with self._lock:
             src = src.upper().split(',')[0]
             if src not in self.conversations:
                 self.conversations[src] = []
-            self.conversations[src].append({
-                "dir": "rx", "from": src, "text": text,
-                "ts": time.strftime("%d/%m %H:%M"), "msgno": msgno, "read": False
-            })
-            self._save()
-        return msgno
+
+            is_duplicate = False
+            if msgno:
+                # On ne regarde que les derniers messages : un renvoi arrive
+                # typiquement dans les secondes/minutes qui suivent l'original.
+                for m in reversed(self.conversations[src][-15:]):
+                    if m.get("dir") == "rx" and m.get("msgno") == msgno:
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
+                self.conversations[src].append({
+                    "dir": "rx", "from": src, "text": text,
+                    "ts": time.strftime("%d/%m %H:%M"), "msgno": msgno, "read": False
+                })
+                self._save()
+        return not is_duplicate
 
     def add_outgoing(self, dest, text, msgno=None):
         with self._lock:
@@ -770,7 +818,16 @@ def _ack_retry_worker():
                 text   = job["text"]
                 msgno  = job["msgno"]
                 retry  = job["retry"]
-                payload = ":" + dest.ljust(9) + ":" + text + "{" + msgno + "}"
+                # APRS_MSGNO_SPEC_FIX_v1 : le n° de message va de "{" jusqu'à
+                # la fin du champ info, SANS accolade fermante (aprs101 §14).
+                # Une "}" finale n'est pas conforme et peut empêcher certains
+                # logiciels en face de générer un ACK correct (ou de le générer
+                # du tout), d'où des timeouts côté émission.
+                # PATCH_MSG_LEN_LIMIT_FIX_v1 : garde-fou defensif pour les
+                # messages deja en file (crees avant ce patch) qui
+                # pourraient encore depasser la limite de 67 car. totale.
+                text = text[:67 - len("{" + msgno)]
+                payload = ":" + dest.ljust(9) + ":" + text + "{" + msgno
                 logger.info("[MSG] Retry %d/%d msgno=%s -> %s",
                             retry + 1, APRSChat.MAX_RETRIES, msgno, dest)
                 try:
@@ -858,6 +915,19 @@ def _extract_phg(comment):
         comment = _re2.sub(r'RNG\d{4}', '', comment).strip()
 
     return (' '.join(comment.split()), phg if phg else None)
+
+
+# PATCH_DW_PDEATHSIG_269_REVERTED ────────────────────────────────────────────
+# Tentative initiale : PR_SET_PDEATHSIG via preexec_fn sur le Popen Direwolf,
+# pour libérer la carte son même si Python meurt brutalement (kill -9, crash).
+# ABANDONNÉ : preexec_fn n'est pas sûr dans une application multi-threadée
+# (app.run(threaded=True)) -- fork() ne duplique que le thread appelant, et si
+# un autre thread tient un verrou interne (logging, allocateur...) au moment du
+# fork, l'enfant peut rester bloqué en deadlock entre le fork et l'exec, donc
+# Direwolf ne démarre plus jamais. C'est ce qui causait la perte définitive de
+# réception au bout d'un certain temps (loterie à chaque redémarrage watchdog).
+# Le SIGHUP ajouté en même temps (voir plus bas) est conservé : il ne touche
+# pas au fork, donc aucun risque.
 
 
 class APRSModem:
@@ -1147,11 +1217,41 @@ class APRSModem:
                     extra['msg_ack']   = ack_match.group(1).upper()
                     extra['msg_ackno'] = ack_match.group(2)
                 else:
-                    # Numéro de message {alphanum} en fin de texte (ex: {Iy} ou {123})
-                    mn = _re.search(r'\{([A-Za-z0-9]+)\}', body)
+                    # APRS_MSGNO_SPEC_FIX_v1 : le n° de message va de "{" à la
+                    # fin du champ info (1-5 car. alphanum), SANS accolade
+                    # fermante obligatoire (aprs101 §14). L'ancien regex exigeait
+                    # un "}" final que les stations conformes au spec n'envoient
+                    # jamais -> leur msgno n'était jamais reconnu et on ne leur
+                    # renvoyait donc aucun ACK (d'où leurs propres retry/timeout).
+                    # La "}" reste tolérée (optionnelle) pour compat. ascendante.
+                    # PATCH_ACK_TRAILING_CTRL_FIX_v1 : certains équipements
+                    # (ex. Kenwood/Yaesu type D7xx) terminent la trame par un
+                    # octet de contrôle (CR 0x0D...), remplacé par '·' lors du
+                    # nettoyage du champ info. Le "$" du regex ne matchait
+                    # alors plus jamais -> msgno jamais détecté -> ACK jamais
+                    # renvoyé à ces stations. On nettoie la fin de chaîne
+                    # avant le test.
+                    # APRS_MSGNO_REPLYACK_FIX_v1 : le spec aprs101 §14 autorise
+                    # un format "{msgno}reply-ack" où reply-ack est le numéro
+                    # d'un message QUE NOUS avons envoyé, que la station distante
+                    # accuse au passage (piggyback ACK, ex. Kenwood D7x/D700).
+                    # L'ancien regex n'acceptait qu'un "}" isolé juste avant la
+                    # fin de chaîne -> tout message avec un reply-ack (ex.
+                    # "{0I}35") ne matchait plus DU TOUT -> msgno jamais extrait
+                    # -> aucun ACK renvoyé -> la station distante retransmet le
+                    # message indéfiniment, en boucle, sans jamais recevoir
+                    # notre accusé de réception.
+                    body_for_msgno = body.rstrip('·\r\n\t ')
+                    mn = _re.search(
+                        r'\{([A-Za-z0-9]{1,5})(?:\}([A-Za-z0-9]{1,5})?)?$',
+                        body_for_msgno)
                     if mn:
                         extra['msg_msgno'] = mn.group(1)
-                        extra['msg_text']  = body[:mn.start()].strip()
+                        extra['msg_text']  = body_for_msgno[:mn.start()].strip()
+                        if mn.group(2):
+                            # Numéro d'un de NOS messages que le correspondant
+                            # accuse au passage -> à traiter comme un ACK normal.
+                            extra['msg_replyack'] = mn.group(2)
 
         elif dti == '>':
             name = "Statut"
@@ -1271,9 +1371,22 @@ class APRSModem:
                     course   = (dc_raw % 10) * 100 + se_raw
                     if speed_kt >= 800: speed_kt -= 800
                     if course  >= 400: course   -= 400
-                    extra['speed_kt']  = speed_kt
-                    extra['speed_kmh'] = round(speed_kt * 1.852, 1)
-                    extra['course']    = course
+                    speed_kmh = round(speed_kt * 1.852, 1)
+                    # PATCH_MICE_SPEED_SANITY_v1 : au-delà de 500 km/h, la
+                    # valeur est quasi certainement due à des octets
+                    # info[4..6] corrompus (signal faible / digipeat) et non
+                    # a une vraie vitesse -- meme seuil que le filtre déjà
+                    # appliqué aux traces sur la carte. On garde la position
+                    # mais on écarte la vitesse/cap plutôt que d'afficher une
+                    # valeur physiquement impossible.
+                    if speed_kmh > 500:
+                        logger.warning(
+                            "[MIC-E] Vitesse aberrante ignorée (%.1f km/h) — "
+                            "octets info[4..6] probablement corrompus", speed_kmh)
+                    else:
+                        extra['speed_kt']  = speed_kt
+                        extra['speed_kmh'] = speed_kmh
+                        extra['course']    = course
 
                 # Symbole : octets info[7] et info[8]
                 if len(info) >= 9:
@@ -1755,11 +1868,7 @@ class APRSModem:
             APRSModem.rx_thread_alive = False
             return
 
-        alsa_dev  = self._find_alsa_device_name()
         conf_path = _os.path.join(tempfile.gettempdir(), 'aprs_direwolf.conf')
-        self._write_direwolf_conf(alsa_dev, conf_path)
-        logger.info("[RX] Démarrage Dire Wolf sur %s (KISS TCP :%d)",
-            alsa_dev, APRSModem.DIREWOLF_KISS_PORT)
 
         ALPHA = 0.15
 
@@ -1768,6 +1877,19 @@ class APRSModem:
             sock    = None
 
             try:
+                # PATCH_DW_STALE_ALSA_272 : re-détecter la carte son et
+                # régénérer direwolf.conf À CHAQUE tentative de démarrage, pas
+                # une seule fois avant la boucle. Si le device USB s'est
+                # ré-énuméré entre-temps (hw:1,0 -> hw:2,0 par ex.), l'ancienne
+                # référence figée faisait échouer indéfiniment tous les
+                # redémarrages du watchdog avec un device devenu invalide --
+                # c'était la cause du blocage définitif malgré les tentatives
+                # de relance.
+                alsa_dev = self._find_alsa_device_name()
+                self._write_direwolf_conf(alsa_dev, conf_path)
+                logger.info("[RX] Démarrage Dire Wolf sur %s (KISS TCP :%d)",
+                    alsa_dev, APRSModem.DIREWOLF_KISS_PORT)
+
                 # ── Lance Dire Wolf ───────────────────────────────────────────
                 # stdout capturé pour les logs de trames ; stderr pour les erreurs audio
                 dw_proc = subprocess.Popen(
@@ -1775,28 +1897,41 @@ class APRSModem:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    errors='replace',   # PATCH_DW_PIPE_DEADLOCK_268 : évite qu'un octet
+                                        # non-UTF8 casse le décodage et tue le thread lecteur
+                                        # (pipe plein -> write() bloquant -> Direwolf gelé)
                 )
                 # Exposer la référence pour la suspension SSTV
                 with APRSModem._dw_proc_lock:
                     APRSModem._current_dw_proc = dw_proc
                 # Thread de capture stderr (erreurs audio, init device…)
                 def _dw_stderr(proc):
-                    for line in proc.stderr:
-                        line = line.rstrip()
-                        APRSModem.dw_log_lines.append("[ERR] " + line)
-                        if line.strip():
-                            logger.debug("[DW] %s", line.rstrip())
+                    try:
+                        for line in proc.stderr:
+                            line = line.rstrip()
+                            APRSModem.dw_log_lines.append("[ERR] " + line)
+                            if line.strip():
+                                logger.debug("[DW] %s", line.rstrip())
+                    except Exception as ex:
+                        # PATCH_DW_PIPE_DEADLOCK_268 : si ce thread meurt sans loguer,
+                        # le pipe stderr ne se vide plus et Direwolf finit par se bloquer
+                        # en écriture -> on log au minimum pour le voir dans les logs.
+                        logger.error("[DW] Lecteur stderr interrompu (%s) -- risque de gel Direwolf", ex)
                 threading.Thread(target=_dw_stderr, args=(dw_proc,), daemon=True, name="dw-stderr").start()
                 # Thread de capture stdout (trames décodées, stats…)
                 def _dw_stdout(proc):
-                    for line in proc.stdout:
-                        line = line.rstrip()
-                        APRSModem.dw_log_lines.append(line)
-                        if line.strip():
-                            logger.debug("[DW] %s", line)
-                        if "[0]" in line or "audio" in line.lower():
-                            # Comptage des trames signalées par Dire Wolf
-                            APRSModem.dw_frames_decoded += 1
+                    try:
+                        for line in proc.stdout:
+                            line = line.rstrip()
+                            APRSModem.dw_log_lines.append(line)
+                            if line.strip():
+                                logger.debug("[DW] %s", line)
+                            if "[0]" in line or "audio" in line.lower():
+                                # Comptage des trames signalées par Dire Wolf
+                                APRSModem.dw_frames_decoded += 1
+                    except Exception as ex:
+                        # PATCH_DW_PIPE_DEADLOCK_268 : cf. _dw_stderr
+                        logger.error("[DW] Lecteur stdout interrompu (%s) -- risque de gel Direwolf", ex)
                 threading.Thread(target=_dw_stdout, args=(dw_proc,), daemon=True, name="dw-stdout").start()
                 # Attendre que le port KISS TCP soit prêt
                 for _ in range(20):
@@ -1896,9 +2031,12 @@ class APRSModem:
                 if dw_proc:
                     try: dw_proc.terminate()
                     except: pass
-                    try: dw_proc.wait(timeout=3)
-                    except:
-                        try: dw_proc.kill()
+                    try:
+                        dw_proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            dw_proc.kill()
+                            dw_proc.wait(timeout=3)  # PATCH_DW_STALE_ALSA_272 : évite un zombie
                         except: pass
                 # Effacer la référence process maintenant qu'il est mort
                 with APRSModem._dw_proc_lock:
@@ -2523,9 +2661,47 @@ def index():
         body.day-mode .text-slate-200 { color: #2e3850 !important; }
         /* Accents désaturés et froids */
         body.day-mode .text-blue-400  { color: #6a9acc !important; }
+        body.day-mode .text-blue-300  { color: #4a7fac !important; }
         body.day-mode .text-blue-500  { color: #5280b8 !important; }
         body.day-mode .text-emerald-400 { color: #5a9e78 !important; }
         body.day-mode .text-violet-400  { color: #8878b8 !important; }
+        body.day-mode .text-violet-300  { color: #6b5a9e !important; }
+        /* PATCH_DAYMODE_CONTRAST_270 ────────────────────────────────────────
+           Le moniteur TRAFIC/QSO utilise beaucoup de couleurs vives (jaune,
+           rouge, orange, cyan, indigo, rose, violet, fuchsia...) pensées pour
+           un fond sombre. Sans override, elles gardent leur teinte claire
+           d'origine -> contraste quasi nul sur le fond clair "Brume" ->
+           certaines lignes deviennent illisibles/invisibles. On leur donne
+           ici des équivalents assombris de la même teinte, sur le modèle des
+           accents bleu/emerald/violet déjà traités ci-dessus. */
+        body.day-mode .text-slate-100   { color: #242c3a !important; }
+        body.day-mode .text-red-300     { color: #c23e3e !important; }
+        body.day-mode .text-red-400     { color: #b83232 !important; }
+        body.day-mode .text-red-500     { color: #a82c2c !important; }
+        body.day-mode .text-yellow-300  { color: #906800 !important; }
+        body.day-mode .text-yellow-400  { color: #8a6a00 !important; }
+        body.day-mode .text-yellow-500  { color: #7a5800 !important; }
+        body.day-mode .text-amber-300   { color: #a06010 !important; }
+        body.day-mode .text-amber-400   { color: #8f5508 !important; }
+        body.day-mode .text-amber-500   { color: #7a4a06 !important; }
+        body.day-mode .text-orange-300  { color: #a25f15 !important; }
+        body.day-mode .text-orange-400  { color: #b86a1a !important; }
+        body.day-mode .text-emerald-300 { color: #4c8a66 !important; }
+        body.day-mode .text-sky-200     { color: #3a6f99 !important; }
+        body.day-mode .text-sky-300     { color: #4a7fac !important; }
+        body.day-mode .text-sky-400     { color: #2e6a95 !important; }
+        body.day-mode .text-indigo-200  { color: #5252a0 !important; }
+        body.day-mode .text-indigo-300  { color: #5a5aa0 !important; }
+        body.day-mode .text-indigo-400  { color: #52529c !important; }
+        body.day-mode .text-rose-200    { color: #a8455f !important; }
+        body.day-mode .text-rose-300    { color: #b8455f !important; }
+        body.day-mode .text-rose-400    { color: #a83a56 !important; }
+        body.day-mode .text-cyan-300    { color: #2a7888 !important; }
+        body.day-mode .text-cyan-400    { color: #1f6c7d !important; }
+        body.day-mode .text-purple-300  { color: #6b4a9e !important; }
+        body.day-mode .text-pink-300    { color: #b8508e !important; }
+        body.day-mode .text-pink-400    { color: #a8407e !important; }
+        body.day-mode .text-fuchsia-300 { color: #8e3f9e !important; }
         /* Bordures légères */
         body.day-mode .border-slate-800 { border-color: #d4d9e6 !important; }
         body.day-mode .border-slate-700 { border-color: #c8cedc !important; }
@@ -2622,6 +2798,48 @@ def index():
             background: #f4f6fa !important;
             border-color: #c8cedc !important;
         }
+        /* ── Tooltip survol courbes météo locale (wxhist) ──────────────────── */
+        .wxhist-svg-wrap { position: relative; }
+        .wxhist-svg-wrap svg { cursor: crosshair; }
+        .wxhist-tooltip {
+            position: absolute;
+            top: 4px;
+            pointer-events: none;
+            background: rgba(15,23,42,0.95);
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 3px 7px;
+            font-family: monospace;
+            font-size: 10px;
+            color: #e2e8f0;
+            white-space: nowrap;
+            transform: translateX(-50%);
+            z-index: 5;
+            display: none;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+        }
+        .wxhist-tooltip .wxhist-tt-time { color: #94a3b8; margin-right: 5px; }
+        .wxhist-cursor-line {
+            stroke: #64748b;
+            stroke-width: 1;
+            stroke-dasharray: 2,3;
+            pointer-events: none;
+        }
+        body.day-mode .wxhist-tooltip {
+            background: rgba(244,246,250,0.97) !important;
+            border-color: #c8cedc !important;
+            color: #2e3850 !important;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+        }
+        body.day-mode .wxhist-tooltip .wxhist-tt-time { color: #6a7490 !important; }
+        /* PATCH_DAYMODE_CITYTAG_271 ─────────────────────────────────────────
+           Badge "ville, région" (résultat /nearest_city, ex. "Naillat,
+           Nouvelle-Aquitaine") : couleur bleu ciel clair fixée en inline style
+           à plusieurs endroits (moniteur trafic, popup carte, liste stations)
+           -> invisible sur fond clair. Classe commune pour pouvoir l'assombrir
+           proprement en mode jour. */
+        .city-tag { color: #7dd3fc; }
+        body.day-mode .city-tag { color: #2e6a95 !important; }
     </style>
 <script>
     /* ── Mode Jour / Nuit ─────────────────────────────────────────────────── */
@@ -2704,7 +2922,7 @@ def index():
                 <i class="fas fa-broadcast-tower text-3xl text-white"></i>
             </a>
             <div>
-                <h1 class="text-3xl font-black tracking-tight text-white italic">Py-APRS <span id="app-version-badge" class="text-blue-500 text-sm not-italic font-medium ml-2 cursor-pointer hover:text-blue-300 transition-colors" onclick="document.getElementById('modal-aide').classList.remove('hidden');aideShowTab('changelog')" title="Voir le changelog">v2.6.9</span></h1>
+                <h1 class="text-3xl font-black tracking-tight text-white italic">Py-APRS <span id="app-version-badge" class="text-blue-500 text-sm not-italic font-medium ml-2 cursor-pointer hover:text-blue-300 transition-colors" onclick="document.getElementById('modal-aide').classList.remove('hidden');aideShowTab('changelog')" title="Voir le changelog">v2.8.5</span></h1>
                 <div class="flex items-center gap-2 mt-1">
                     <span class="relative flex h-2 w-2">
                         <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -2845,7 +3063,7 @@ def index():
         <span id="wx-sep1"  style="color:#334155">│</span>
         <span id="wx-desc"  style="color:#94a3b8;font-style:italic"></span>
         <span id="wx-sep2"  style="color:#334155">│</span>
-        <span id="wx-wind"  style="color:#7dd3fc"></span>
+        <span id="wx-wind"  class="city-tag"></span>
         <span id="wx-sep3"  style="color:#334155">│</span>
         <span id="wx-hum"   style="color:#86efac"></span>
         <span id="wx-sep4"  style="color:#334155">│</span>
@@ -2890,6 +3108,9 @@ def index():
                             </button>
                             <button onclick="sendPropagation(this)" class="bg-slate-800/50 hover:bg-violet-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
                                 📶 BEACON PROPAGATION
+                            </button>
+                            <button onclick="sendMoon(this)" class="bg-slate-800/50 hover:bg-indigo-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
+                                🌙 BEACON LUNE
                             </button>
                             <button onclick="sendStatus()" class="bg-slate-800/50 hover:bg-purple-600/30 border border-slate-700 p-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
                                 🛰️ ENVOYER STATUT
@@ -2945,6 +3166,14 @@ def index():
                                         <span class="text-[11px]">📶 Propagation</span>
                                     </div>
                                     <span id="countdown-propagation" class="text-[10px] font-mono tabular-nums"></span>
+                                </div>
+                                <!-- Lune -->
+                                <div id="badge-lune" class="flex items-center justify-between px-2.5 py-1.5 rounded-xl border transition-all bg-slate-800/40 border-slate-700/50 text-slate-600">
+                                    <div class="flex items-center gap-1.5">
+                                        <span id="led-lune" class="w-2 h-2 rounded-full bg-slate-700 flex-shrink-0"></span>
+                                        <span class="text-[11px]">🌙 Lune</span>
+                                    </div>
+                                    <span id="countdown-lune" class="text-[10px] font-mono tabular-nums"></span>
                                 </div>
                                 <!-- Texte 1 -->
                                 <div id="badge-text1" class="flex items-center justify-between px-2.5 py-1.5 rounded-xl border transition-all bg-slate-800/40 border-slate-700/50 text-slate-600">
@@ -3190,6 +3419,7 @@ def index():
                                                     ('iss',         '🛸 ISS'),
                                                     ('meteo',       '🌦️ Météo'),
                                                     ('propagation', '📶 Propagation'),
+                                                    ('lune',        '🌙 Lune'),
                                                 ]
                                             ]) + """
                                             <div class="mt-3 space-y-2">
@@ -3820,72 +4050,6 @@ def index():
                                 🗑️
                             </button>
                         </div>
-                        <!-- ── ISS EN VUE (visible uniquement pendant le passage) ── -->
-                        <div id="iss-live-panel" style="display:none;border-top:1px solid #7c3aed55;background:rgba(15,23,42,0.92);animation:issLivePulse 3s ease-in-out infinite">
-                            <!-- Header -->
-                            <div style="padding:8px 14px;background:rgba(124,58,237,.18);border-bottom:1px solid #7c3aed40;display:flex;align-items:center;justify-content:space-between">
-                                <div style="display:flex;align-items:center;gap:7px">
-                                    <span id="iss-live-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#a78bfa;box-shadow:0 0 7px #a78bfa;flex-shrink:0"></span>
-                                    <span style="font-size:10px;font-weight:900;color:#c4b5fd;text-transform:uppercase;letter-spacing:.1em">🛸 ISS EN VUE</span>
-                                </div>
-                                <span id="iss-live-timer" style="font-size:10px;font-weight:700;color:#a78bfa;font-family:monospace"></span>
-                            </div>
-                            <!-- Élévation + Azimut + Boussole -->
-                            <div style="padding:8px 14px 4px;display:grid;grid-template-columns:1fr 1fr 90px;gap:8px;align-items:center">
-                                <div style="background:rgba(124,58,237,.1);border:1px solid #7c3aed30;border-radius:10px;padding:6px 10px;text-align:center">
-                                    <div style="font-size:9px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1px">▲ Élévation</div>
-                                    <div id="iss-live-el" style="font-size:20px;font-weight:900;color:#c4b5fd;font-family:monospace;line-height:1">--°</div>
-                                </div>
-                                <div style="background:rgba(124,58,237,.1);border:1px solid #7c3aed30;border-radius:10px;padding:6px 10px;text-align:center">
-                                    <div style="font-size:9px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1px">➤ Azimut</div>
-                                    <div id="iss-live-az" style="font-size:20px;font-weight:900;color:#c4b5fd;font-family:monospace;line-height:1">--°</div>
-                                    <div id="iss-live-az-card" style="font-size:10px;font-weight:700;color:#a78bfa;margin-top:1px">--</div>
-                                </div>
-                                <svg id="iss-compass-svg" width="90" height="90" viewBox="0 0 90 90">
-                                    <circle cx="45" cy="45" r="42" fill="rgba(15,23,42,.7)" stroke="#3730a3" stroke-width="1.5"/>
-                                    <circle cx="45" cy="45" r="34" fill="none" stroke="#1e1b4b" stroke-width="0.5"/>
-                                    <text x="45" y="9"  text-anchor="middle" fill="#a78bfa" font-size="8" font-weight="700">N</text>
-                                    <text x="45" y="86" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">S</text>
-                                    <text x="85" y="49" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">E</text>
-                                    <text x="5"  y="49" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">O</text>
-                                    <circle cx="45" cy="45" r="22" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="2,3"/>
-                                    <circle cx="45" cy="45" r="11" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="2,3"/>
-                                    <g id="iss-compass-ptr" transform="rotate(0,45,45)">
-                                        <polygon points="45,8 42,45 45,42 48,45" fill="#a78bfa" opacity="0.9"/>
-                                        <polygon points="45,82 42,45 45,48 48,45" fill="#3730a3" opacity="0.6"/>
-                                    </g>
-                                    <circle id="iss-compass-dot" cx="45" cy="23" r="4" fill="#a78bfa" stroke="#7c3aed" stroke-width="1.5" style="filter:drop-shadow(0 0 4px #a78bfa)"/>
-                                    <text id="iss-compass-icon" x="45" y="26" text-anchor="middle" font-size="6" fill="white">🛸</text>
-                                </svg>
-                            </div>
-                            <!-- Télémétrie compacte -->
-                            <div style="padding:2px 14px 6px;display:grid;grid-template-columns:repeat(4,1fr);gap:5px;font-size:10px;font-family:monospace">
-                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
-                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Dist.</div>
-                                    <div id="iss-live-dist" style="color:#94a3b8;font-weight:700">-- km</div>
-                                </div>
-                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
-                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Alt.</div>
-                                    <div id="iss-live-alt" style="color:#94a3b8;font-weight:700">-- km</div>
-                                </div>
-                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
-                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Doppler</div>
-                                    <div id="iss-live-doppler" style="color:#fbbf24;font-weight:700">-- Hz</div>
-                                </div>
-                                <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
-                                    <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Fréq.</div>
-                                    <div id="iss-live-freq" style="color:#34d399;font-weight:700">-- kHz</div>
-                                </div>
-                            </div>
-                            <!-- Footer APRS params -->
-                            <div style="padding:2px 14px 8px">
-                                <div id="iss-live-az-footer" style="display:none;margin-bottom:4px;background:rgba(103,232,249,.06);border:1px solid rgba(103,232,249,.18);border-radius:8px;padding:4px 10px;font-size:9px;font-family:monospace;color:#67e8f9;text-align:center;font-weight:700;letter-spacing:.04em"></div>
-                                <div style="background:rgba(124,58,237,.08);border:1px solid #7c3aed25;border-radius:8px;padding:5px 10px;font-size:9px;font-family:monospace;color:#7c3aed;text-align:center;font-weight:700;letter-spacing:.03em">
-                                    APRS : 145.825 MHz FM · 1200 Bd AFSK
-                                    <br><span style="color:#a78bfa">Path : ARISS  ·  Appel : RS0ISS-4</span>
-                                </div>
-                            </div>
-                        </div>
                         <div id="chat-messages" class="flex-grow overflow-y-auto custom-scrollbar p-6 space-y-3 bg-slate-950/30">
                             <div class="text-center text-slate-600 text-xs italic mt-20">👆 Choisissez un contact pour demarrer</div>
                         </div>
@@ -4000,6 +4164,75 @@ def index():
         <!-- ── Onglet ISS ───────────────────────────────────────────────── -->
         <div id="tab-iss" class="hidden">
             <div class="grid grid-cols-1 gap-6">
+
+                <!-- ── Suivi ISS permanent (état "en vue" / "hors de vue") ── -->
+                <div class="glass rounded-[2rem] overflow-hidden shadow-2xl">
+                    <div id="iss-live-panel" style="border-top:1px solid #33415555;background:rgba(15,23,42,0.92);transition:border-color .4s,background .4s">
+                        <!-- Header -->
+                        <div style="padding:8px 14px;background:rgba(51,65,85,.18);border-bottom:1px solid #33415540;display:flex;align-items:center;justify-content:space-between;transition:background .4s,border-color .4s" id="iss-live-header">
+                            <div style="display:flex;align-items:center;gap:7px">
+                                <span id="iss-live-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b;box-shadow:0 0 7px #64748b;flex-shrink:0;transition:background .4s,box-shadow .4s"></span>
+                                <span id="iss-live-label" style="font-size:10px;font-weight:900;color:#94a3b8;text-transform:uppercase;letter-spacing:.1em;transition:color .4s">🛰️ ISS — hors de vue</span>
+                            </div>
+                            <span id="iss-live-timer" style="font-size:10px;font-weight:700;color:#94a3b8;font-family:monospace"></span>
+                        </div>
+                        <!-- Élévation + Azimut + Boussole -->
+                        <div style="padding:8px 14px 4px;display:grid;grid-template-columns:1fr 1fr 90px;gap:8px;align-items:center">
+                            <div style="background:rgba(124,58,237,.1);border:1px solid #7c3aed30;border-radius:10px;padding:6px 10px;text-align:center">
+                                <div style="font-size:9px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1px">▲ Élévation</div>
+                                <div id="iss-live-el" style="font-size:20px;font-weight:900;color:#c4b5fd;font-family:monospace;line-height:1">--°</div>
+                            </div>
+                            <div style="background:rgba(124,58,237,.1);border:1px solid #7c3aed30;border-radius:10px;padding:6px 10px;text-align:center">
+                                <div style="font-size:9px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1px">➤ Azimut</div>
+                                <div id="iss-live-az" style="font-size:20px;font-weight:900;color:#c4b5fd;font-family:monospace;line-height:1">--°</div>
+                                <div id="iss-live-az-card" style="font-size:10px;font-weight:700;color:#a78bfa;margin-top:1px">--</div>
+                            </div>
+                            <svg id="iss-compass-svg" width="90" height="90" viewBox="0 0 90 90">
+                                <circle cx="45" cy="45" r="42" fill="rgba(15,23,42,.7)" stroke="#3730a3" stroke-width="1.5"/>
+                                <circle cx="45" cy="45" r="34" fill="none" stroke="#1e1b4b" stroke-width="0.5"/>
+                                <text x="45" y="9"  text-anchor="middle" fill="#a78bfa" font-size="8" font-weight="700">N</text>
+                                <text x="45" y="86" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">S</text>
+                                <text x="85" y="49" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">E</text>
+                                <text x="5"  y="49" text-anchor="middle" fill="#64748b" font-size="8" font-weight="700">O</text>
+                                <circle cx="45" cy="45" r="22" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="2,3"/>
+                                <circle cx="45" cy="45" r="11" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="2,3"/>
+                                <g id="iss-compass-ptr" transform="rotate(0,45,45)">
+                                    <polygon points="45,8 42,45 45,42 48,45" fill="#a78bfa" opacity="0.9"/>
+                                    <polygon points="45,82 42,45 45,48 48,45" fill="#3730a3" opacity="0.6"/>
+                                </g>
+                                <circle id="iss-compass-dot" cx="45" cy="23" r="4" fill="#a78bfa" stroke="#7c3aed" stroke-width="1.5" style="filter:drop-shadow(0 0 4px #a78bfa)"/>
+                                <text id="iss-compass-icon" x="45" y="26" text-anchor="middle" font-size="6" fill="white">🛸</text>
+                            </svg>
+                        </div>
+                        <!-- Télémétrie compacte -->
+                        <div style="padding:2px 14px 6px;display:grid;grid-template-columns:repeat(4,1fr);gap:5px;font-size:10px;font-family:monospace">
+                            <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Dist.</div>
+                                <div id="iss-live-dist" style="color:#94a3b8;font-weight:700">-- km</div>
+                            </div>
+                            <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Alt.</div>
+                                <div id="iss-live-alt" style="color:#94a3b8;font-weight:700">-- km</div>
+                            </div>
+                            <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Doppler</div>
+                                <div id="iss-live-doppler" style="color:#fbbf24;font-weight:700">-- Hz</div>
+                            </div>
+                            <div style="background:rgba(15,23,42,.6);border:1px solid #1e293b;border-radius:8px;padding:4px 8px">
+                                <div style="color:#475569;font-size:9px;font-weight:700;text-transform:uppercase;margin-bottom:1px">Fréq.</div>
+                                <div id="iss-live-freq" style="color:#34d399;font-weight:700">-- kHz</div>
+                            </div>
+                        </div>
+                        <!-- Footer APRS params -->
+                        <div style="padding:2px 14px 8px">
+                            <div id="iss-live-az-footer" style="display:none;margin-bottom:4px;background:rgba(103,232,249,.06);border:1px solid rgba(103,232,249,.18);border-radius:8px;padding:4px 10px;font-size:9px;font-family:monospace;color:#67e8f9;text-align:center;font-weight:700;letter-spacing:.04em"></div>
+                            <div style="background:rgba(124,58,237,.08);border:1px solid #7c3aed25;border-radius:8px;padding:5px 10px;font-size:9px;font-family:monospace;color:#7c3aed;text-align:center;font-weight:700;letter-spacing:.03em">
+                                APRS : 145.825 MHz FM · 1200 Bd AFSK
+                                <br><span style="color:#a78bfa">Path : ARISS  ·  Appel : RS0ISS-4</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
 
                 <!-- ── Passages 24h ── -->
                 <div class="glass rounded-[2rem] overflow-hidden shadow-2xl">
@@ -4168,6 +4401,22 @@ def index():
         <div id="tab-stats" class="hidden">
             <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
 
+                <!-- Alertes Propagation & Blackout HF -->
+                <div class="xl:col-span-3 glass rounded-[2rem] overflow-hidden shadow-2xl" id="propalert-hist-panel">
+                    <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
+                        <span class="text-[10px] font-black text-orange-400 uppercase tracking-widest">☀️ Alertes Propagation &amp; Blackout HF</span>
+                        <div class="flex items-center gap-3">
+                            <button onclick="loadPropAlertHistory()" class="text-[9px] font-mono text-slate-500 hover:text-orange-400 transition-colors px-2 py-0.5 rounded border border-slate-700 hover:border-orange-700">↺ rafraîchir</button>
+                            <span id="propalert-hist-status" class="text-[9px] font-mono text-slate-600">–</span>
+                        </div>
+                    </div>
+                    <div class="p-4">
+                        <div id="propalert-hist-list" class="space-y-2">
+                            <p class="text-slate-600 text-[10px] italic text-center py-4">Aucune alerte enregistrée depuis le démarrage.</p>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Courbe trafic 24h -->
                 <div class="xl:col-span-2 glass rounded-[2rem] overflow-hidden shadow-2xl">
                     <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
@@ -4273,23 +4522,32 @@ def index():
                         <!-- Graphe température -->
                         <div>
                             <div class="text-[9px] font-mono text-orange-400 uppercase tracking-widest mb-1">🌡️ Température (°C)</div>
-                            <svg id="wxhist-temp" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
-                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
-                            </svg>
+                            <div class="wxhist-svg-wrap">
+                                <svg id="wxhist-temp" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                    <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                                </svg>
+                                <div class="wxhist-tooltip" id="wxhist-temp-tip"></div>
+                            </div>
                         </div>
                         <!-- Graphe vent -->
                         <div>
                             <div class="text-[9px] font-mono text-sky-400 uppercase tracking-widest mb-1">💨 Vent (km/h)</div>
-                            <svg id="wxhist-wind" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
-                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
-                            </svg>
+                            <div class="wxhist-svg-wrap">
+                                <svg id="wxhist-wind" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                    <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                                </svg>
+                                <div class="wxhist-tooltip" id="wxhist-wind-tip"></div>
+                            </div>
                         </div>
                         <!-- Graphe précipitations -->
                         <div>
                             <div class="text-[9px] font-mono text-blue-400 uppercase tracking-widest mb-1">🌧️ Précipitations (mm)</div>
-                            <svg id="wxhist-rain" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
-                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
-                            </svg>
+                            <div class="wxhist-svg-wrap">
+                                <svg id="wxhist-rain" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                    <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                                </svg>
+                                <div class="wxhist-tooltip" id="wxhist-rain-tip"></div>
+                            </div>
                         </div>
                         <!-- Graphe orage LPI + CAPE -->
                         <div>
@@ -4297,9 +4555,12 @@ def index():
                                 <span class="text-[9px] font-mono text-yellow-400 uppercase tracking-widest">⚡ Potentiel orage — LPI (J/kg) &amp; CAPE (J/kg)</span>
                                 <span id="wxhist-lightning-max" class="text-[9px] font-mono text-yellow-300 opacity-70"></span>
                             </div>
-                            <svg id="wxhist-lightning" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
-                                <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
-                            </svg>
+                            <div class="wxhist-svg-wrap">
+                                <svg id="wxhist-lightning" viewBox="0 0 800 90" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+                                    <text x="400" y="50" text-anchor="middle" font-size="10" fill="#475569">Chargement…</text>
+                                </svg>
+                                <div class="wxhist-tooltip" id="wxhist-lightning-tip"></div>
+                            </div>
                             <div class="flex gap-4 mt-1">
                                 <span class="text-[9px] font-mono flex items-center gap-1">
                                     <span style="display:inline-block;width:10px;height:10px;background:#facc15;border-radius:2px"></span>LPI (axe gauche)
@@ -4308,22 +4569,6 @@ def index():
                                     <span style="display:inline-block;width:14px;height:2px;background:#f97316"></span>CAPE (axe droit)
                                 </span>
                             </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Alertes Propagation & Blackout HF -->
-                <div class="xl:col-span-3 glass rounded-[2rem] overflow-hidden shadow-2xl" id="propalert-hist-panel">
-                    <div class="px-5 py-3 bg-slate-900/50 border-b border-slate-800 flex items-center justify-between">
-                        <span class="text-[10px] font-black text-orange-400 uppercase tracking-widest">☀️ Alertes Propagation &amp; Blackout HF</span>
-                        <div class="flex items-center gap-3">
-                            <button onclick="loadPropAlertHistory()" class="text-[9px] font-mono text-slate-500 hover:text-orange-400 transition-colors px-2 py-0.5 rounded border border-slate-700 hover:border-orange-700">↺ rafraîchir</button>
-                            <span id="propalert-hist-status" class="text-[9px] font-mono text-slate-600">–</span>
-                        </div>
-                    </div>
-                    <div class="p-4">
-                        <div id="propalert-hist-list" class="space-y-2">
-                            <p class="text-slate-600 text-[10px] italic text-center py-4">Aucune alerte enregistrée depuis le démarrage.</p>
                         </div>
                     </div>
                 </div>
@@ -4448,6 +4693,21 @@ def index():
         return '<a href="https://www.openstreetmap.org/?mlat=' + la + '&mlon=' + lo + '&zoom=14" target="_blank" class="text-blue-400 hover:text-blue-300 underline font-mono text-[11px]">' + la + ', ' + lo + '</a>';
     }
 
+    // PATCH_POS_LOCATOR_273 : locator Maidenhead 6 caractères depuis lat/lon,
+    // pour affichage à côté des coordonnées décimales dans le moniteur.
+    function latLonToGrid6(lat, lon) {
+        try {
+            var lon0 = lon + 180, lat0 = lat + 90;
+            var fLon = Math.floor(lon0 / 20),      fLat = Math.floor(lat0 / 10);
+            var sLon = Math.floor((lon0 - fLon * 20) / 2), sLat = Math.floor(lat0 - fLat * 10);
+            var subLon = Math.floor((lon0 - fLon * 20 - sLon * 2) / (2 / 24));
+            var subLat = Math.floor((lat0 - fLat * 10 - sLat) / (1 / 24));
+            return String.fromCharCode(65 + fLon) + String.fromCharCode(65 + fLat)
+                 + sLon + sLat
+                 + String.fromCharCode(97 + subLon) + String.fromCharCode(97 + subLat);
+        } catch(e) { return null; }
+    }
+
     // # MONITOR_UI_PATCH_APPLIED
     function badge(label, value, cls, bgCls) {
         cls   = cls   || 'text-slate-300';
@@ -4525,11 +4785,15 @@ def index():
         if (e.lat !== undefined && e.lon !== undefined) {
             var _posBadgeId = 'city-' + (frame.src || 'x').replace(/[^a-z0-9]/gi,'_')
                               + '_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+            var _locator = latLonToGrid6(e.lat, e.lon);
+            var _locTxt  = _locator || (e.lat.toFixed(5) + ', ' + e.lon.toFixed(5));
+            var _osmUrl  = 'https://www.openstreetmap.org/?mlat=' + e.lat.toFixed(5) + '&mlon=' + e.lon.toFixed(5) + '&zoom=14';
             parts.push('<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:2px 7px;font-family:monospace;font-size:10px">'
                      + '<span style="color:#10b981;font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.08em">📍pos</span>'
-                     + coordLink(e.lat, e.lon) + '</span>');
+                     + '<a href="' + _osmUrl + '" target="_blank" class="text-emerald-300 hover:text-emerald-400 underline font-mono text-[11px]" style="font-weight:700" title="Locator Maidenhead">' + esc(_locTxt) + '</a>'
+                     + '</span>');
             // Badge ville (injecté de façon asynchrone après geocoding)
-            parts.push('<span id="' + _posBadgeId + '" style="display:inline-flex;align-items:center;gap:4px;background:rgba(14,165,233,0.08);border:1px solid rgba(14,165,233,0.18);border-radius:6px;padding:2px 7px;font-size:10px;color:#7dd3fc;font-style:italic">🏙️&nbsp;<span style="opacity:.5">…</span></span>');
+            parts.push('<span id="' + _posBadgeId + '" class="city-tag" style="display:inline-flex;align-items:center;gap:4px;background:rgba(14,165,233,0.08);border:1px solid rgba(14,165,233,0.18);border-radius:6px;padding:2px 7px;font-size:10px;font-style:italic">🏙️&nbsp;<span style="opacity:.5">…</span></span>');
             // Requête asynchrone vers /nearest_city (via proxy serveur → Nominatim)
             (function(badgeId, lat, lon) {
                 fetch('/nearest_city?lat=' + lat + '&lon=' + lon)
@@ -4538,7 +4802,7 @@ def index():
                         var el = document.getElementById(badgeId);
                         if (!el) return;
                         if (d && d.display) {
-                            el.innerHTML = '🏙️&nbsp;<span style="color:#bae6fd;font-style:normal">' + esc(d.display) + '</span>';
+                            el.innerHTML = '🏙️&nbsp;<span class="city-tag" style="font-style:normal">' + esc(d.display) + '</span>';
                             el.title = d.city + (d.state ? ', ' + d.state : '') + (d.country ? ' (' + d.country + ')' : '');
                         } else {
                             el.style.display = 'none';
@@ -4766,6 +5030,7 @@ def index():
             'Position+TS+Msg': '📍🕐💬', 'Message': '💬', 'Statut': '📢',
             'Objet': '🎯', 'Mic-E': '📱', 'NMEA': '🛰️', 'Telemetrie': '📊',
             'Meteo': '🌦️', 'Meteo Peet': '🌧️', 'Beacon': '📡', 'Beacon ISS': '🛸',
+            'Beacon Lune': '🌙',
             'TX': '📤', 'ACK': '✅', 'Raw': '📄'
         };
         for (var k in map) { if (t && t.indexOf(k) !== -1) return map[k]; }
@@ -4816,7 +5081,7 @@ def index():
             'Meteo':'rgba(14,165,233,0.12)', 'Meteo Peet':'rgba(14,165,233,0.12)',
             'Objet':'rgba(245,158,11,0.12)', 'Mic-E':'rgba(236,72,153,0.10)',
             'Telemetrie':'rgba(168,85,247,0.10)', 'Statut':'rgba(251,191,36,0.08)',
-            'Beacon ISS':'rgba(139,92,246,0.15)'
+            'Beacon ISS':'rgba(139,92,246,0.15)', 'Beacon Lune':'rgba(99,102,241,0.15)'
         };
         var typeBg = 'rgba(30,41,59,0.8)';
         for (var tk in typeColors) {
@@ -4970,16 +5235,27 @@ def index():
             var uniq = Object.keys(_stations).length;
             _setTxt('stats-total-stations', uniq);
             // ── Best DX (RF uniquement — exclut IS/Internet) ─────────────────
+            // PATCH_BESTDX_SANITY_274 : une trame RF avec une position
+            // corrompue (bits erronés en réception, cf. le même problème déjà
+            // rencontré sur la vitesse Mic-E) peut produire un lat/lon
+            // n'importe où sur le globe et fausser DÉFINITIVEMENT ce record
+            // (il ne peut ensuite qu'augmenter). Plafond généreux à 1500 km :
+            // large marge au-dessus des DX VHF/UHF exceptionnels documentés
+            // (tropo/Es), mais qui écarte les distances physiquement
+            // impossibles en direct RF terrestre (ex. 5626 km).
+            var DX_MAX_PLAUSIBLE_KM = 1500;
             if (type === 'RX' && _stationLat !== null && _stationLon !== null && frame && frame.extra) {
                 var _ex = frame.extra;
                 if (_ex.lat !== undefined && _ex.lon !== undefined && frame.aprs_type !== 'Objet') {
                     var _d = haversineKm(_stationLat, _stationLon, _ex.lat, _ex.lon);
-                    if (_d !== null && _d > 0) {
+                    if (_d !== null && _d > 0 && _d <= DX_MAX_PLAUSIBLE_KM) {
                         if (_bestDx === null || _d > _bestDx.distKm) {
                             var _br = bearingDeg(_stationLat, _stationLon, _ex.lat, _ex.lon);
                             _bestDx = {cs: frame.src || '?', distKm: _d, brng: Math.round(_br), ts: Date.now()};
                             _renderBestDx();
                         }
+                    } else if (_d !== null && _d > DX_MAX_PLAUSIBLE_KM) {
+                        console.warn('[DX] Distance aberrante ignorée pour', frame.src, ':', Math.round(_d), 'km — position probablement corrompue');
                     }
                 }
             }
@@ -5362,6 +5638,84 @@ def index():
     (function() {
         var _wxHistLoaded = false;
 
+        // ── Tooltip survol — affiche heure + valeur(s) au point le plus proche ──
+        // series: [{ label, values, unit, decimals, color }]
+        function _wxAttachTooltip(svgId, n, W, H, PL, PR, PT, PB, series) {
+            var svg = document.getElementById(svgId);
+            var tip = document.getElementById(svgId + '-tip');
+            if (!svg || !tip || n < 2) return;
+            var cW = W - PL - PR, cH = H - PT - PB;
+
+            // Ligne de curseur verticale (créée une fois, réutilisée)
+            var cursor = svg.querySelector('.wxhist-cursor-line');
+            if (!cursor) {
+                cursor = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                cursor.setAttribute('class', 'wxhist-cursor-line');
+                svg.appendChild(cursor);
+            }
+            cursor.setAttribute('y1', PT);
+            cursor.setAttribute('y2', PT + cH);
+            cursor.style.display = 'none';
+
+            var now = new Date();
+
+            function indexFromClientX(clientX) {
+                var rect = svg.getBoundingClientRect();
+                var relX = (clientX - rect.left) / rect.width * W;
+                var ratio = (relX - PL) / cW;
+                ratio = Math.max(0, Math.min(1, ratio));
+                return Math.round(ratio * (n - 1));
+            }
+
+            function show(clientX, clientY) {
+                var i = indexFromClientX(clientX);
+                var x = PL + (i / (n - 1)) * cW;
+
+                cursor.setAttribute('x1', x.toFixed(1));
+                cursor.setAttribute('x2', x.toFixed(1));
+                cursor.style.display = 'block';
+
+                // Heure du point i (n points = n heures, point i = (n-1-i)h avant maintenant)
+                var msBack = (n - 1 - i) * 3600 * 1000;
+                var d = new Date(now.getTime() - msBack);
+                var hLabel = String(d.getHours()).padStart(2, '0') + 'h';
+                var dayLabel = (d.getDate() !== now.getDate()) ? (d.getDate() + '/' + (d.getMonth() + 1) + ' ') : '';
+
+                var html = '<span class="wxhist-tt-time">' + dayLabel + hLabel + '</span>';
+                for (var s = 0; s < series.length; s++) {
+                    var ser = series[s];
+                    var v = ser.values[i];
+                    if (v === null || v === undefined) continue;
+                    if (s > 0) html += ' · ';
+                    html += '<span style="color:' + ser.color + '">' + (+v).toFixed(ser.decimals) + ' ' + ser.unit + '</span>';
+                    if (ser.label) html += ' <span style="opacity:.6">' + ser.label + '</span>';
+                }
+                tip.innerHTML = html;
+                tip.style.display = 'block';
+
+                // Positionnement horizontal (en % du conteneur, borné pour rester visible)
+                var pct = (x / W) * 100;
+                pct = Math.max(6, Math.min(94, pct));
+                tip.style.left = pct + '%';
+            }
+
+            function hide() {
+                cursor.style.display = 'none';
+                tip.style.display = 'none';
+            }
+
+            svg.onmousemove = function(ev) { show(ev.clientX, ev.clientY); };
+            svg.onmouseleave = hide;
+            // Support tactile (tap + glisser)
+            svg.ontouchmove = function(ev) {
+                if (ev.touches && ev.touches.length) {
+                    show(ev.touches[0].clientX, ev.touches[0].clientY);
+                    ev.preventDefault();
+                }
+            };
+            svg.ontouchend = hide;
+        }
+
         function _wxLinePath(values, minV, maxV, W, H, PL, PR, PT, PB) {
             var cW = W - PL - PR, cH = H - PT - PB;
             var n = values.length;
@@ -5448,6 +5802,9 @@ def index():
                  + '" stroke="#334155" stroke-width="1"/>';
 
             svg.innerHTML = out;
+
+            _wxAttachTooltip(svgId, n, W, H, PL, PR, PT, PB,
+                [{ label: '', values: values, unit: unit, decimals: decimals, color: color }]);
         }
 
         function _wxRenderBars(svgId, values, color, areaColor) {
@@ -5503,6 +5860,9 @@ def index():
                  + '" stroke="#334155" stroke-width="1"/>';
 
             svg.innerHTML = out;
+
+            _wxAttachTooltip(svgId, n, W, H, PL, PR, PT, PB,
+                [{ label: '', values: values, unit: 'mm', decimals: 1, color: color }]);
         }
 
         // ── Graphe LPI + CAPE dual-axis ────────────────────────────────────────
@@ -5590,6 +5950,11 @@ def index():
                  + '" stroke="#334155" stroke-width="1"/>';
 
             svg.innerHTML = out;
+
+            _wxAttachTooltip(svgId, n, W, H, PL, PR, PT, PB, [
+                { label: 'LPI',  values: lpiClean,  unit: 'J/kg', decimals: 2, color: '#facc15' },
+                { label: 'CAPE', values: capeClean, unit: 'J/kg', decimals: 0, color: '#f97316' }
+            ]);
         }
 
         window._loadWeatherHistory = function() {
@@ -7374,6 +7739,27 @@ def index():
         setTimeout(function(){ btn.textContent = orig; btn.disabled = false; }, 5000);
     }
 
+    async function sendMoon(btn) {
+        var orig = btn.textContent;
+        btn.textContent = '⏳ Calcul position lunaire...';
+        btn.disabled = true;
+        try {
+            var r = await fetch('/send_moon', { method: 'POST' });
+            var d = await r.json();
+            if (d.error) {
+                btn.textContent = '❌ ' + d.error;
+            } else if (d.data) {
+                var m = d.data;
+                btn.textContent = '✅ ' + m.phase_emoji + ' ' + m.phase_pct + '% Az:' + Math.round(m.azimuth_deg) + '° El:' + Math.round(m.elevation_deg) + '°';
+            } else {
+                btn.textContent = '✅ Envoyé';
+            }
+        } catch(e) {
+            btn.textContent = '❌ Erreur réseau';
+        }
+        setTimeout(function(){ btn.textContent = orig; btn.disabled = false; }, 5000);
+    }
+
     async function sendStatus() {
         await fetch('/send_status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}) });
     }
@@ -7449,7 +7835,7 @@ def index():
             // d.schedules = {station:{interval,next_in}, meteo:{...}, ...}
             var schedules = d.schedules || {};
 
-            var TYPES = ['station', 'iss', 'meteo', 'propagation', 'text1', 'text2'];
+            var TYPES = ['station', 'iss', 'meteo', 'propagation', 'lune', 'text1', 'text2'];
             var anyActive = false;
 
             TYPES.forEach(function(btype) {
@@ -7536,7 +7922,7 @@ def index():
             ? parseFloat(data.lon_manual) : '';
         // Construire beacon_schedules depuis les selects sched_*
         var schedules = {};
-        ['station','iss','meteo','propagation','text1','text2'].forEach(function(t) {
+        ['station','iss','meteo','propagation','lune','text1','text2'].forEach(function(t) {
             var v = parseInt(data['sched_' + t]) || 0;
             if (v > 0) schedules[t] = v;
             delete data['sched_' + t];
@@ -8062,7 +8448,7 @@ def index():
     var _TYPE_EMOJI = {
         'Position': '📍', 'Position+Msg': '📍', 'Position+TS': '📍', 'Position+TS+Msg': '📍',
         'Message': '💬', 'Statut': '📻', 'Meteo': '🌤️', 'Objet': '🎯',
-        'Mic-E': '📟', 'Beacon': '📡', 'Beacon ISS': '🛸', 'DIGI': '🔁',
+        'Mic-E': '📟', 'Beacon': '📡', 'Beacon ISS': '🛸', 'Beacon Lune': '🌙', 'DIGI': '🔁',
     };
     function _typeEmoji(t) {
         if (!t) return '📦';
@@ -8248,7 +8634,7 @@ def index():
 
         popup += '<div style="font-size:9px;color:#475569;margin-top:5px">'
                + new Date().toLocaleTimeString('fr-FR') + '</div>'
-               + '<div id="mapcity-' + cs.replace(/[^a-z0-9]/gi,'_') + '" style="font-size:10px;color:#7dd3fc;margin-top:3px;font-style:italic">🏙️ …</div>'
+               + '<div id="mapcity-' + cs.replace(/[^a-z0-9]/gi,'_') + '" class="city-tag" style="font-size:10px;margin-top:3px;font-style:italic">🏙️ …</div>'
                + '</div>';
 
         // Injection asynchrone de la ville dans le popup Leaflet
@@ -8258,7 +8644,7 @@ def index():
                 .then(function(d) {
                     var el = document.getElementById('mapcity-' + _cs.replace(/[^a-z0-9]/gi,'_'));
                     if (el && d && d.display) {
-                        el.innerHTML = '🏙️ <b style="color:#bae6fd">' + esc(d.display) + '</b>';
+                        el.innerHTML = '🏙️ <b class="city-tag">' + esc(d.display) + '</b>';
                         el.style.fontStyle = 'normal';
                     } else if (el) { el.style.display = 'none'; }
                 })
@@ -8361,7 +8747,7 @@ def index():
             }
             var cityId   = 'stlist-city-' + cs.replace(/[^a-z0-9]/gi,'_');
             var cityHtml = m.city
-                ? '<span style="font-size:9px;color:#7dd3fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px" title="' + esc(m.city) + '">🏙️ ' + esc(m.city) + '</span>'
+                ? '<span class="city-tag" style="font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px" title="' + esc(m.city) + '">🏙️ ' + esc(m.city) + '</span>'
                 : '<span id="' + cityId + '" style="font-size:9px;color:#475569;font-style:italic">🏙️…</span>';
             return '<div class="px-4 py-2.5 flex flex-col gap-0.5 cursor-pointer hover:bg-slate-800/40 transition-colors"'
                  + ' data-cs="' + cs + '" onclick="(function(el){var c=el.dataset.cs;if(_map&&_mapMarkers[c]&&_mapMarkers[c].marker){_map.setView(_mapMarkers[c].marker.getLatLng(),13);_mapMarkers[c].marker.openPopup();switchTab(&quot;map&quot;)}})(this)">'
@@ -8388,7 +8774,7 @@ def index():
                     var el = document.getElementById('stlist-city-' + cs.replace(/[^a-z0-9]/gi,'_'));
                     if (el) {
                         el.removeAttribute('id');
-                        el.style.color = '#7dd3fc';
+                        el.classList.add('city-tag');
                         el.style.fontStyle = 'normal';
                         el.title = d.display;
                         el.innerHTML = '🏙️ ' + esc(d.display);
@@ -9141,6 +9527,7 @@ def index():
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📡 Beacon Station</span><span>Émet la balise de position standard avec commentaire et locator.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🌦️ Beacon Météo</span><span>Récupère les données Open-Meteo (lat/lon depuis locator) et émet un beacon APRS météo format <span class="text-emerald-400">@…_</span>.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">📶 Beacon Propagation</span><span>Interroge NOAA SWPC (SFI, Kp, A-index) et émet un beacon statut <span class="text-emerald-400">&gt;SFI:NNN K:N.N HF:xxx VHF:yyy {NOAA}</span>.</span></div>
+                    <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🌙 Beacon Lune</span><span>Calcule azimut, élévation, distance et phase lunaire pour la position de la station (lat/lon depuis locator) et émet un beacon statut <span class="text-emerald-400">&gt;LUNE Az:NNN El:NN Phase:NN% (nom) Dist:NNNNNNkm {MOON}</span>. Calcul astronomique approché (précision ~1 arcmin), non destiné au pointage d'antenne EME précis.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛰️ Envoyer statut</span><span>Émet le statut texte libre configuré dans les réglages (trame <span class="text-emerald-400">&gt;</span>).</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">Console</span><span>Affiche les trames TX/RX. Clic sur un indicatif → fiche QRZ.com. Clic sur les coordonnées → onglet MAP. Le flux SSE se reconnecte automatiquement avec backoff exponentiel (3 s → 30 s) en cas de coupure réseau ou redémarrage du serveur.</span></div>
                     <div class="flex gap-3"><span class="text-slate-500 w-36 shrink-0">🛸 Passages ISS (jour)</span><span>Widget affichant <b>tous les passages de l'ISS du jour courant</b> (minuit → minuit heure locale) avec durée et <span class="text-white font-mono">élév. max</span>. Calculés localement par SGP4 — fonctionne hors-ligne. Passages passés grisés, prochain surligné. Mis à jour toutes les 15 min.</span></div>
@@ -9246,7 +9633,7 @@ def index():
                 </div>
             </section>
 
-            <div class="text-center pt-2 pb-1 text-slate-700 text-[9px]">Py-APRS v2.6.8 · Direwolf + SGP4 · 73 de F1RIQ</div>
+            <div class="text-center pt-2 pb-1 text-slate-700 text-[9px]">Py-APRS v2.8.5 · Direwolf + SGP4 · 73 de F1RIQ</div>
         </div><!-- /aide-panel-guide -->
 
         <!-- ── CHANGELOG ── -->
@@ -9578,21 +9965,69 @@ if ('serviceWorker' in navigator && typeof Notification !== 'undefined' && Notif
         if (el) el.textContent = val;
     }
 
-    function _startCountdown(endTs) {
+    function _startCountdown(endTs, isNextPass) {
         _issPassEnd = endTs;
         if (_issCountdown) clearInterval(_issCountdown);
-        _issCountdown = setInterval(function() {
+        var tick = function() {
             var rem = Math.round(_issPassEnd - Date.now() / 1000);
             if (rem <= 0) {
                 clearInterval(_issCountdown);
-                _setText("iss-live-timer", "00:00");
-            } else {
-                var m = Math.floor(rem / 60);
-                var s = rem % 60;
-                _setText("iss-live-timer",
-                    (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s);
+                _issCountdown = null;
+                _setText("iss-live-timer", isNextPass ? "" : "00:00");
+                return;
             }
-        }, 1000);
+            var h = Math.floor(rem / 3600);
+            var m = Math.floor((rem % 3600) / 60);
+            var s = rem % 60;
+            var label;
+            if (isNextPass) {
+                label = "dans " + (h > 0 ? h + "h" + (m < 10 ? "0" : "") + m : m + "min" + (s < 10 ? "0" : "") + s);
+            } else {
+                label = (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+            }
+            _setText("iss-live-timer", label);
+        };
+        tick();
+        _issCountdown = setInterval(tick, 1000);
+    }
+
+    function _setPanelState(inView) {
+        var panel  = document.getElementById("iss-live-panel");
+        var header = document.getElementById("iss-live-header");
+        var dot    = document.getElementById("iss-live-dot");
+        var label  = document.getElementById("iss-live-label");
+        var timer  = document.getElementById("iss-live-timer");
+        if (!panel) return;
+        if (inView) {
+            panel.style.borderTopColor  = "#7c3aed55";
+            panel.style.background      = "rgba(15,23,42,0.92)";
+            panel.style.animation       = "issLivePulse 3s ease-in-out infinite";
+            if (header) { header.style.background = "rgba(124,58,237,.18)"; header.style.borderBottomColor = "#7c3aed40"; }
+            if (dot)    { dot.style.background = "#a78bfa"; dot.style.boxShadow = "0 0 7px #a78bfa"; }
+            if (label)  { label.textContent = "🛸 ISS EN VUE"; label.style.color = "#c4b5fd"; }
+            if (timer)  timer.style.color = "#a78bfa";
+        } else {
+            panel.style.borderTopColor  = "#33415555";
+            panel.style.background      = "rgba(15,23,42,0.92)";
+            panel.style.animation       = "none";
+            if (header) { header.style.background = "rgba(51,65,85,.18)"; header.style.borderBottomColor = "#33415540"; }
+            if (dot)    { dot.style.background = "#64748b"; dot.style.boxShadow = "0 0 7px #64748b"; }
+            if (label)  { label.textContent = "🛰️ ISS — hors de vue"; label.style.color = "#94a3b8"; }
+            if (timer)  timer.style.color = "#94a3b8";
+        }
+    }
+
+    function _fetchNextPass() {
+        fetch("/iss_passes?range=24h")
+            .then(function(r2){ return r2.json(); })
+            .then(function(d2) {
+                var now  = Date.now() / 1000;
+                var next = (d2.passes || []).find(function(p) {
+                    return (p.risetime + p.duration) > now;
+                });
+                if (next) _startCountdown(next.risetime, true);
+                else _setText("iss-live-timer", "");
+            }).catch(function(){});
     }
 
     function _poll() {
@@ -9601,26 +10036,33 @@ if ('serviceWorker' in navigator && typeof Notification !== 'undefined' && Notif
             if (!panel) return;
 
             var issBtn = document.getElementById("btn-iss-send");
-            if (d.error || !d.visible) {
-                panel.style.display = "none";
+            if (d.error) {
+                // Position non configurée : le panneau reste affiché en état neutre
+                _setPanelState(false);
+                _setText("iss-live-timer", "");
+                if (issBtn) { issBtn.disabled = true; issBtn.title = "Position station non configurée"; }
+                return;
+            }
+
+            if (!d.visible) {
+                _setPanelState(false);
                 if (_issCountdown) { clearInterval(_issCountdown); _issCountdown = null; }
                 if (issBtn) {
                     issBtn.disabled = false;
                     issBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-slate-800/50 border border-slate-700 text-slate-400 hover:bg-indigo-700/40 hover:border-indigo-500 hover:text-indigo-200";
                     issBtn.title = "ISS hors de portée — le beacon sera refusé";
                 }
-                return;
+            } else {
+                _setPanelState(true);
+                if (issBtn) {
+                    issBtn.disabled = false;
+                    issBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-indigo-700/60 hover:bg-indigo-600/80 border border-indigo-500 text-white animate-pulse cursor-pointer";
+                    issBtn.title = "ISS EN VUE — Envoyer un beacon ARISS maintenant !";
+                }
             }
 
-            panel.style.display = "";
-            if (issBtn) {
-                issBtn.disabled = false;
-                issBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black transition-all active:scale-95 bg-indigo-700/60 hover:bg-indigo-600/80 border border-indigo-500 text-white animate-pulse cursor-pointer";
-                issBtn.title = "ISS EN VUE — Envoyer un beacon ARISS maintenant !";
-            }
-
-            // Élévation
-            var elColor = d.elevation > 45 ? "#a78bfa" : d.elevation > 20 ? "#c4b5fd" : "#7c3aed";
+            // Élévation (affichée même hors de vue, valeur négative sous l'horizon)
+            var elColor = !d.visible ? "#64748b" : d.elevation > 45 ? "#a78bfa" : d.elevation > 20 ? "#c4b5fd" : "#7c3aed";
             var elEl = document.getElementById("iss-live-el");
             if (elEl) { elEl.textContent = d.elevation.toFixed(1) + "°"; elEl.style.color = elColor; }
 
@@ -9640,21 +10082,25 @@ if ('serviceWorker' in navigator && typeof Notification !== 'undefined' && Notif
             var dopEl = document.getElementById("iss-live-doppler");
             if (dopEl) {
                 dopEl.textContent = (dop > 0 ? "+" : "") + dop + " Hz";
-                dopEl.style.color = dop < -200 ? "#34d399" : dop > 200 ? "#f87171" : "#fbbf24";
+                dopEl.style.color = !d.visible ? "#64748b" : dop < -200 ? "#34d399" : dop > 200 ? "#f87171" : "#fbbf24";
             }
             _setText("iss-live-freq", d.freq_rx_khz.toFixed(3) + " kHz");
 
-            // Compte à rebours fin de passage
-            if (!_issCountdown || _issPassEnd <= Date.now() / 1000) {
-                fetch("/iss_passes?range=24h")
-                    .then(function(r2){ return r2.json(); })
-                    .then(function(d2) {
-                        var now = Date.now() / 1000;
-                        var cur = (d2.passes || []).find(function(p) {
-                            return p.risetime <= now && (p.risetime + p.duration) >= now;
-                        });
-                        if (cur) _startCountdown(cur.risetime + cur.duration);
-                    }).catch(function(){});
+            // Compte à rebours : fin de passage en cours, ou prochain passage sinon
+            if (d.visible) {
+                if (!_issCountdown || _issPassEnd <= Date.now() / 1000) {
+                    fetch("/iss_passes?range=24h")
+                        .then(function(r2){ return r2.json(); })
+                        .then(function(d2) {
+                            var now = Date.now() / 1000;
+                            var cur = (d2.passes || []).find(function(p) {
+                                return p.risetime <= now && (p.risetime + p.duration) >= now;
+                            });
+                            if (cur) _startCountdown(cur.risetime + cur.duration, false);
+                        }).catch(function(){});
+                }
+            } else if (!_issCountdown || _issPassEnd <= Date.now() / 1000) {
+                _fetchNextPass();
             }
         }).catch(function(){});
     }
@@ -9664,24 +10110,21 @@ if ('serviceWorker' in navigator && typeof Notification !== 'undefined' && Notif
         _poll();
         _issLiveTimer = setInterval(_poll, 2000);
     }
-    function _stopPoll() {
-        if (_issLiveTimer) { clearInterval(_issLiveTimer); _issLiveTimer = null; }
-    }
-
-    // Terminal est l'onglet par défaut
+    // ISS_PERMANENT_PATCH_v1 : le panneau ISS reste affiché en permanence
+    // (état "en vue" / "hors de vue"), donc le poll ne doit plus s'arrêter
+    // en changeant d'onglet — seul le comportement mobile (scroll console)
+    // reste spécifique à l'onglet "terminal".
     _startPoll();
 
     document.addEventListener("aprs-switchtab", function(e) {
         if (e.detail === "terminal") {
-            _startPoll();
             // Sur mobile : remonter la console pour afficher les dernieres trames
             if (window.innerWidth < 768) {
                 var con = document.getElementById("console");
                 if (con) setTimeout(function(){ con.scrollTop = 0; }, 80);
             }
-        } else {
-            _stopPoll();
         }
+        _startPoll();
     });
 })();
 /* ── fin ISS Live Tracking ── */
@@ -9767,6 +10210,15 @@ def send_weather():
 def send_propagation():
     """Récupère les indices NOAA et émet un beacon APRS propagation (>SFI:… A:… K:…)."""
     result = _do_send_propagation()
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
+
+@app.route('/send_moon', methods=['POST'])
+@_login_required
+def send_moon():
+    """Calcule la position lunaire (az/el/phase/distance) et émet un beacon APRS (>LUNE …)."""
+    result = _do_send_moon()
     if "error" in result:
         return jsonify(result), 400
     return jsonify(result)
@@ -10163,11 +10615,19 @@ def chat_history(callsign):
 def chat_send():
     data  = request.json
     dest  = data.get('dest', '').upper().strip()
-    text  = data.get('text', '').strip()[:67]
+    text  = data.get('text', '').strip()
     if not dest or not text:
         return jsonify({"error": "dest/text requis"}), 400
     msgno   = chat_manager._next_msgno()
-    payload = ":" + dest.ljust(9) + ":" + text + "{" + msgno + "}"
+    # APRS_MSGNO_SPEC_FIX_v1 : pas d'accolade fermante — cf. _ack_retry_worker.
+    # PATCH_MSG_LEN_LIMIT_FIX_v1 : la limite APRS de 67 car. (aprs101 §14)
+    # porte sur texte + "{msgno}" au total. L'ancien code tronquait le
+    # texte a 67 car. AVANT d'ajouter "{msgno}", d'ou des messages jusqu'a
+    # 6 car. trop longs (ex: 65 + "{28" = 68 car.) -> rejetes/tronques par
+    # certains materiels stricts (portatifs), qui ne renvoyaient alors
+    # jamais d'ACK.
+    text = text[:67 - len("{" + msgno)]
+    payload = ":" + dest.ljust(9) + ":" + text + "{" + msgno
     chat_manager.add_outgoing(dest, text, msgno)
     # custom_path : permet de forcer ARISS pour les messages ISS
     custom_path = (data.get('custom_path') or '').strip() or None
@@ -10277,7 +10737,11 @@ class APRSISClient:
 
         try:
             self._sock = socket.create_connection((server, port), timeout=20)
-            self._fobj = self._sock.makefile('r', encoding='utf-8', errors='replace')
+            # IGATE_LATIN1_FIX_v1 : APRS-IS véhicule les octets du champ info
+            # tels quels (convention Latin-1/8-bit, pas UTF-8). Décoder/encoder
+            # en UTF-8 provoquait un double encodage (accents, "·" de
+            # substitution -> "Â·") sur les trames gatées RF -> IS.
+            self._fobj = self._sock.makefile('r', encoding='latin-1', errors='replace')
             # Lire la bannière du serveur
             banner = self._fobj.readline()
             logger.info("[IGATE] Connecté à %s:%d — %s", server, port, banner.strip())
@@ -10312,7 +10776,9 @@ class APRSISClient:
     def _send_raw(self, line):
         try:
             with self._lock:
-                self._sock.sendall((line + "\r\n").encode('utf-8', errors='replace'))
+                # IGATE_LATIN1_FIX_v1 : cf. connect() — même octet-pour-octet
+                # requis en émission pour ne pas doubler les caractères >0x7F.
+                self._sock.sendall((line + "\r\n").encode('latin-1', errors='replace'))
         except Exception as e:
             logger.error("[IGATE] Erreur envoi : %s", e)
             self.connected = False
@@ -10735,9 +11201,28 @@ def _rx_broadcaster():
                             try: _q.put_nowait(ack_event)
                             except queue.Full: pass
                 elif dest and dest in my_calls():
-                    chat_manager.add_incoming(src, text, msgno)
+                    is_new = chat_manager.add_incoming(src, text, msgno)
                     frame["_chat"] = True
-                    logger.info("[MSG] Message recu de %s : %s (msgno=%s)", src, text[:40], msgno)
+                    if is_new:
+                        logger.info("[MSG] Message recu de %s : %s (msgno=%s)", src, text[:40], msgno)
+                    else:
+                        logger.info("[MSG] Retransmission (doublon ignoré) de %s : msgno=%s — ACK renvoyé", src, msgno)
+                    # APRS_MSGNO_REPLYACK_FIX_v1 : reply-ack piggybacké dans le
+                    # msgno de leur message ("{msgno}reply-ack") -> ils accusent
+                    # au passage un de NOS messages sortants. On le traite comme
+                    # un ACK normal, en plus de l'ACK qu'on va leur renvoyer.
+                    replyack = extra.get("msg_replyack")
+                    if replyack:
+                        ra_dest, ra_msgno = chat_manager.mark_ack(replyack)
+                        logger.info("[MSG] Reply-ack piggybacké recu pour msgno=%s de %s", replyack, src)
+                        if ra_dest:
+                            ack_event = {
+                                "type": "msg_ack", "msgno": ra_msgno,
+                                "dest": ra_dest, "src": src,
+                            }
+                            for _q in list(listeners):
+                                try: _q.put_nowait(ack_event)
+                                except queue.Full: pass
                     if msgno:
                         ack_payload = ":" + src.ljust(9) + ":ack" + msgno
                         try:
@@ -10929,6 +11414,7 @@ def _make_beacon_worker(btype):
             "iss":         _do_send_iss_beacon,
             "meteo":       _do_send_weather,
             "propagation": _do_send_propagation,
+            "lune":        _do_send_moon,
             "text1":       _do_send_text1,
             "text2":       _do_send_text2,
         }
@@ -10974,7 +11460,7 @@ def _make_beacon_worker(btype):
 
 def _beacon_scheduler():
     """Superviseur : lance/relance les threads de balise selon la config."""
-    _ALL_TYPES = ["station", "iss", "meteo", "propagation", "text1", "text2"]
+    _ALL_TYPES = ["station", "iss", "meteo", "propagation", "lune", "text1", "text2"]
     while True:
         with _beacon_workers_lock:
             for btype in _ALL_TYPES:
@@ -11049,6 +11535,158 @@ def _do_send_beacon():
         logger.debug("[TX] Beacon queued : %s", payload[:60])
     except Exception as e:
         logger.error("[TX] Beacon queue erreur : %s", e)
+
+
+# ── Position lunaire (azimut/élévation/phase) ─────────────────────────────────
+# Algorithme classique à précision "amateur" (formules de P. Schlyter,
+# https://stjarnhimlen.se/comp/ppcomp.html), sans dépendance externe
+# (pas de ephem/skyfield). Précision de l'ordre de l'arcminute sur plusieurs
+# décennies -- largement suffisant pour un beacon informatif ; PAS destiné au
+# pointage d'antenne EME de précision.
+def _moon_position(lat, lon, dt_utc=None):
+    """
+    Calcule la position lunaire pour un observateur (lat, lon en degrés).
+    Retourne un dict : azimuth_deg, elevation_deg, distance_km, phase_pct,
+    phase_name, phase_emoji, illumination_pct (alias de phase_pct).
+    """
+    import math as _m
+    from datetime import datetime as _dt, timezone as _tz
+
+    if dt_utc is None:
+        dt_utc = _dt.now(_tz.utc)
+
+    def _sind(x): return _m.sin(_m.radians(x))
+    def _cosd(x): return _m.cos(_m.radians(x))
+    def _atan2d(y, x): return _m.degrees(_m.atan2(y, x))
+    def _norm360(x): return x % 360.0
+
+    # Jours écoulés depuis le 2000-01-00.0 UT (epoch Schlyter)
+    y, mo, da = dt_utc.year, dt_utc.month, dt_utc.day
+    ut_hours  = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
+    d = (367 * y - 7 * (y + (mo + 9) // 12) // 4 + 275 * mo // 9
+         + da - 730530 + ut_hours / 24.0)
+
+    # ── Soleil (nécessaire pour l'élongation / phase) ────────────────────────
+    w_sun = _norm360(282.9404 + 4.70935e-5 * d)
+    M_sun = _norm360(356.0470 + 0.9856002585 * d)
+    e_sun = 0.016709 - 1.151e-9 * d
+    E_sun = M_sun + _m.degrees(e_sun) * _sind(M_sun) * (1 + e_sun * _cosd(M_sun))
+    xv_s  = _cosd(E_sun) - e_sun
+    yv_s  = _m.sqrt(1 - e_sun * e_sun) * _sind(E_sun)
+    v_sun = _atan2d(yv_s, xv_s)
+    lon_sun = _norm360(v_sun + w_sun)
+
+    # ── Lune : éléments orbitaux ──────────────────────────────────────────────
+    N_moon = _norm360(125.1228 - 0.0529538083 * d)
+    i_moon = 5.1454
+    w_moon = _norm360(318.0634 + 0.1643573223 * d)
+    a_moon = 60.2666   # rayons terrestres
+    e_moon = 0.054900
+    M_moon = _norm360(115.3654 + 13.0649929509 * d)
+
+    E_moon = M_moon + _m.degrees(e_moon) * _sind(M_moon) * (1 + e_moon * _cosd(M_moon))
+    for _ in range(3):  # affinage itératif de l'anomalie excentrique
+        E_moon = E_moon - (E_moon - _m.degrees(e_moon) * _sind(E_moon) - M_moon) / \
+                 (1 - e_moon * _cosd(E_moon))
+
+    xv = a_moon * (_cosd(E_moon) - e_moon)
+    yv = a_moon * (_m.sqrt(1 - e_moon * e_moon) * _sind(E_moon))
+    v_moon = _atan2d(yv, xv)
+    r_moon = _m.sqrt(xv * xv + yv * yv)   # distance en rayons terrestres
+
+    vw = v_moon + w_moon
+    xh = r_moon * (_cosd(N_moon) * _cosd(vw) - _sind(N_moon) * _sind(vw) * _cosd(i_moon))
+    yh = r_moon * (_sind(N_moon) * _cosd(vw) + _cosd(N_moon) * _sind(vw) * _cosd(i_moon))
+    zh = r_moon * (_sind(vw) * _sind(i_moon))
+
+    lon_ecl = _norm360(_atan2d(yh, xh))
+    lat_ecl = _atan2d(zh, _m.sqrt(xh * xh + yh * yh))
+    dist_er = _m.sqrt(xh * xh + yh * yh + zh * zh)  # rayons terrestres
+
+    # ── Perturbations (améliore la précision à ~1 arcmin) ────────────────────
+    Lm = _norm360(N_moon + w_moon + M_moon)
+    Ls = _norm360(w_sun + M_sun)
+    Dm = _norm360(Lm - Ls)
+    F  = _norm360(Lm - N_moon)
+
+    lon_ecl += (-1.274 * _sind(M_moon - 2 * Dm)
+                + 0.658 * _sind(2 * Dm)
+                - 0.186 * _sind(M_sun)
+                - 0.059 * _sind(2 * M_moon - 2 * Dm)
+                - 0.057 * _sind(M_moon - 2 * Dm + M_sun)
+                + 0.053 * _sind(M_moon + 2 * Dm)
+                + 0.046 * _sind(2 * Dm - M_sun)
+                + 0.041 * _sind(M_moon - M_sun)
+                - 0.035 * _sind(Dm)
+                - 0.031 * _sind(M_moon + M_sun)
+                - 0.015 * _sind(2 * F - 2 * Dm)
+                + 0.011 * _sind(M_moon - 4 * Dm))
+    lat_ecl += (-0.173 * _sind(F - 2 * Dm)
+                - 0.055 * _sind(M_moon - F - 2 * Dm)
+                - 0.046 * _sind(M_moon + F - 2 * Dm)
+                + 0.033 * _sind(F + 2 * Dm)
+                + 0.017 * _sind(2 * M_moon + F))
+    dist_er += (-0.58 * _cosd(M_moon - 2 * Dm)
+                - 0.46 * _cosd(2 * Dm))
+    lon_ecl = _norm360(lon_ecl)
+
+    EARTH_RADIUS_KM = 6378.14
+    distance_km = dist_er * EARTH_RADIUS_KM
+
+    # ── Écliptique → équatorial (RA/Dec) ─────────────────────────────────────
+    obliq = 23.4393 - 3.563e-7 * d
+    xeq = _cosd(lon_ecl) * _cosd(lat_ecl)
+    yeq = _sind(lon_ecl) * _cosd(lat_ecl) * _cosd(obliq) - _sind(lat_ecl) * _sind(obliq)
+    zeq = _sind(lon_ecl) * _cosd(lat_ecl) * _sind(obliq) + _sind(lat_ecl) * _cosd(obliq)
+    ra  = _norm360(_atan2d(yeq, xeq))
+    dec = _atan2d(zeq, _m.sqrt(xeq * xeq + yeq * yeq))
+
+    # ── Temps sidéral local → azimut/élévation ────────────────────────────────
+    gmst0 = _norm360(lon_sun + 180.0)           # degrés
+    lst   = _norm360(gmst0 + ut_hours * 15.041069 + lon)  # lon : est positif
+    ha    = _norm360(lst - ra)
+
+    x = _cosd(ha) * _cosd(dec)
+    y = _sind(ha) * _cosd(dec)
+    z = _sind(dec)
+    xhor = x * _sind(lat) - z * _cosd(lat)
+    yhor = y
+    zhor = x * _cosd(lat) + z * _sind(lat)
+
+    azimuth   = _norm360(_atan2d(yhor, xhor) + 180.0)
+    elevation = _atan2d(zhor, _m.sqrt(xhor * xhor + yhor * yhor))
+
+    # ── Phase (élongation géocentrique Lune-Soleil) ──────────────────────────
+    elong = _norm360(lon_ecl - lon_sun)
+    illumination_pct = round((1 - _cosd(elong)) / 2 * 100, 1)
+
+    if elong < 1 or elong > 359:
+        phase_name, phase_emoji = "Nouvelle lune", "🌑"
+    elif elong < 90:
+        phase_name, phase_emoji = "Premier croissant", "🌒"
+    elif abs(elong - 90) < 1:
+        phase_name, phase_emoji = "Premier quartier", "🌓"
+    elif elong < 180:
+        phase_name, phase_emoji = "Gibbeuse croissante", "🌔"
+    elif abs(elong - 180) < 1:
+        phase_name, phase_emoji = "Pleine lune", "🌕"
+    elif elong < 270:
+        phase_name, phase_emoji = "Gibbeuse decroissante", "🌖"
+    elif abs(elong - 270) < 1:
+        phase_name, phase_emoji = "Dernier quartier", "🌗"
+    else:
+        phase_name, phase_emoji = "Dernier croissant", "🌘"
+
+    return {
+        "azimuth_deg":      round(azimuth, 1),
+        "elevation_deg":    round(elevation, 1),
+        "distance_km":      round(distance_km, 0),
+        "illumination_pct": illumination_pct,
+        "phase_pct":        illumination_pct,
+        "phase_name":       phase_name,
+        "phase_emoji":      phase_emoji,
+        "visible":          elevation > 0,
+    }
 
 
 def _grid_to_latlon(grid):
@@ -11251,6 +11889,67 @@ def _do_send_propagation():
         })
         logger.debug("[PROP] Beacon propagation queued : %s", payload)
         return {"status": "queued", "payload": payload, "data": data}
+    except queue.Full:
+        return {"error": "File TX pleine"}
+
+
+def _do_send_moon():
+    """
+    Construit et émet un beacon APRS de type '>' (Status) avec les
+    informations lunaires pour la position de la station : azimut,
+    élévation, distance, phase.
+    Format : >LUNE Az:NNN El:NN Phase:NN% (nom) Dist:NNNNNNkm {MOON}
+    """
+    cfg      = config_manager.data
+    geo_mode = cfg.get('geo_mode', 'locator')
+
+    if geo_mode == 'coords':
+        try:
+            lat = float(cfg.get('lat_manual', '') or '')
+            lon = float(cfg.get('lon_manual', '') or '')
+        except (ValueError, TypeError):
+            lat = lon = None
+        if lat is None or lon is None:
+            logger.warning("[MOON] Coordonnées manuelles absentes ou invalides — beacon lune annulé")
+            return {"error": "Latitude et longitude requises dans les réglages"}
+    else:
+        grid = cfg.get('maidenhead', '')
+        lat, lon = _grid_to_latlon(grid)
+        if lat is None:
+            logger.warning("[MOON] Locator Maidenhead absent ou invalide — beacon lune annulé")
+            return {"error": "Locator Maidenhead requis dans les réglages"}
+
+    moon = _moon_position(lat, lon)
+
+    az   = int(round(moon["azimuth_deg"]))
+    el   = int(round(moon["elevation_deg"]))
+    pha  = moon["phase_pct"]
+    name = moon["phase_name"]
+    dist = int(moon["distance_km"])
+
+    payload = ">LUNE Az:%d El:%d Phase:%s%% (%s) Dist:%dkm {MOON}" % (
+        az, el, ("%.0f" % pha), name, dist
+    )
+
+    try:
+        tx_queue.put_nowait({
+            "dest":      "APRS",
+            "payload":   payload,
+            "path":      None,
+            "aprs_type": "Beacon Lune",
+            "extra": {
+                "moon_az":     moon["azimuth_deg"],
+                "moon_el":     moon["elevation_deg"],
+                "moon_phase":  pha,
+                "moon_name":   name,
+                "moon_emoji":  moon["phase_emoji"],
+                "moon_dist":   dist,
+                "moon_visible": moon["visible"],
+                "comment":     payload[1:],
+            }
+        })
+        logger.debug("[MOON] Beacon lune queued : %s", payload)
+        return {"status": "queued", "payload": payload, "data": moon}
     except queue.Full:
         return {"error": "File TX pleine"}
 
@@ -11599,7 +12298,7 @@ def nearby_stations():
 @_login_required
 def beacon_status():
     """Retourne l'état de chaque type de balise : interval + next_in."""
-    _ALL_TYPES = ["station", "iss", "meteo", "propagation", "text1", "text2"]
+    _ALL_TYPES = ["station", "iss", "meteo", "propagation", "lune", "text1", "text2"]
     schedules = config_manager.data.get('beacon_schedules', {})
     result = {}
     with _beacon_workers_lock:
@@ -13615,7 +14314,8 @@ _atexit.register(_graceful_shutdown)
 
 # ── Handlers POSIX (SIGTERM = systemctl stop | SIGINT = Ctrl-C) ───────────────
 def _signal_handler(signum, frame):
-    sig_name = "SIGTERM" if signum == _signal.SIGTERM else "SIGINT"
+    sig_name = {_signal.SIGTERM: "SIGTERM", _signal.SIGINT: "SIGINT",
+                _signal.SIGHUP: "SIGHUP"}.get(signum, str(signum))
     logger.info("[SHUTDOWN] Signal %s reçu — déclenchement de l'arrêt propre", sig_name)
     _graceful_shutdown()
     # Sortie propre après nettoyage
@@ -13625,6 +14325,11 @@ def _signal_handler(signum, frame):
 try:
     _signal.signal(_signal.SIGTERM, _signal_handler)
     _signal.signal(_signal.SIGINT,  _signal_handler)
+    # PATCH_DW_PDEATHSIG_269 : SIGHUP (fermeture de session SSH/terminal sans
+    # nohup) n'était pas intercepté -> arrêt brutal du process Python sans
+    # passer par le graceful shutdown, laissant Direwolf orphelin sur la
+    # carte son. On le capture aussi.
+    _signal.signal(_signal.SIGHUP,  _signal_handler)
 except (OSError, ValueError):
     # Signal ne peut pas être intercepté dans certains contextes (thread non-principal)
     pass
